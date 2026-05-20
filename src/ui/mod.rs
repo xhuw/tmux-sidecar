@@ -118,14 +118,15 @@ fn header_line(state: &AppState, glyphs: Glyphs, theme: Theme) -> Line<'static> 
     Line::from(vec![
         Span::styled(
             format!(" {} tmux-sidecar ", glyphs.app_icon),
-            theme.header_title(),
+            theme.header_highlight(),
         ),
-        Span::styled(format!("{} ", glyphs.separator), theme.header_label()),
-        Span::styled("target ", theme.header_label()),
-        Span::styled(target, theme.header_value()),
-        Span::styled(format!(" {} ", glyphs.separator), theme.header_label()),
-        Span::styled("active ", theme.header_label()),
-        Span::styled(active, theme.header_value()),
+        Span::styled(
+            format!(
+                "{} target {} {} active {}",
+                glyphs.separator, target, glyphs.separator, active
+            ),
+            theme.header_text(),
+        ),
     ])
 }
 

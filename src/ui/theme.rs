@@ -23,15 +23,13 @@ impl Theme {
         Style::default().add_modifier(Modifier::REVERSED)
     }
 
-    pub fn header_title(self) -> Style {
-        Style::default().add_modifier(Modifier::BOLD)
+    pub fn header_highlight(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
     }
 
-    pub fn header_label(self) -> Style {
-        Style::default().fg(self.muted)
-    }
-
-    pub fn header_value(self) -> Style {
+    pub fn header_text(self) -> Style {
         Style::default()
     }
 
@@ -136,9 +134,13 @@ mod tests {
         assert_eq!(theme.app(), Style::default());
         assert_eq!(theme.header(), reversed);
         assert_eq!(theme.footer(), reversed);
-        assert_eq!(theme.header_title(), bold);
-        assert_eq!(theme.header_label(), Style::default().fg(Color::DarkGray));
-        assert_eq!(theme.header_value(), Style::default());
+        assert_eq!(
+            theme.header_highlight(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        );
+        assert_eq!(theme.header_text(), Style::default());
         assert_eq!(theme.row_focused(), bold);
         assert_eq!(theme.modal(), reversed);
         assert_eq!(theme.marker_focus(), bold);
