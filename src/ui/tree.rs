@@ -104,7 +104,7 @@ impl TreeView {
             if is_inline_edit {
                 row_style = theme.row_inline_edit();
                 if is_focused {
-                    row_style = row_style.bg(theme.surface_high);
+                    row_style = theme.row_inline_edit_focused();
                 }
             }
 

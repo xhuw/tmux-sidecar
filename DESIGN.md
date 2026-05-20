@@ -64,35 +64,44 @@ Powerline glyphs should be used as subtle separators, not large blocks. The defa
 
 ## Visual system
 
-Use a dark graphite palette with one bright accent. Prefer semantic style names in code rather than hard-coded colors in widgets.
+Use the terminal's native foreground/background and ANSI palette slots instead of a tmux-sidecar-owned RGB palette. Prefer semantic style names in code rather than hard-coded colors in widgets, and prefer terminal-native attributes such as reverse video and bold when separating surfaces or focus.
 
-| Token | True-color value | 16-color fallback | Usage |
-| --- | --- | --- | --- |
-| `bg` | `#0b0f14` | black | App background. |
-| `surface` | `#111820` | black | Header, footer, modal. |
-| `surface_high` | `#1b2633` | bright black | Focused row background. |
-| `text` | `#d6deeb` | white | Primary labels. |
-| `muted` | `#7d8590` | bright black | Secondary metadata and inactive markers. |
-| `accent` | `#7dd3fc` | cyan | Focus marker, selected text, primary affordances. |
-| `active` | `#a7f3d0` | green | tmux's active window. |
-| `warning` | `#facc15` | yellow | Pending rename/create hint. |
-| `alert` | `#fbbf24` | yellow | tmux window activity, bell, silence, or notification state. |
-| `danger` | `#f87171` | red | Fatal or transient failed action indicator. |
+| Token | Terminal-native mapping | Usage |
+| --- | --- | --- |
+| `bg` | terminal default background | App background and tree body. |
+| `surface` | reverse video on terminal defaults | Header, footer, and modal surface treatment. |
+| `surface_high` | reverse video with stronger emphasis | Focused row treatment when a full-row highlight is needed. |
+| `text` | terminal default foreground | Primary labels. |
+| `muted` | bright black / dim secondary text | Secondary metadata and inactive markers. |
+| `accent` | cyan | Focus marker, selected text, primary affordances. |
+| `active` | green | tmux's active window. |
+| `warning` | yellow | Pending rename/create hint. |
+| `alert` | yellow | tmux window activity, bell, silence, or notification state. |
+| `danger` | red | Fatal or transient failed action indicator. |
+
+The UI should not assume a dark background. Light and dark terminal themes must both inherit cleanly from the host terminal without introducing custom fill colors that clash with the rest of the session.
 
 ## Row states
 
 | State | Marker | Styling |
 | --- | --- | --- |
-| Focused row | `>` | Accent marker and `surface_high` background. |
+| Focused row | `>` | Accent marker and reverse-video row emphasis. |
 | Active tmux window | `*` | `active` foreground; label remains readable if also focused. |
 | Creation row | `[+]` | Muted label, accent plus sign. |
 | Alerted window | `!` | `alert` foreground badge on the right side of the window row. |
-| Inline edit | `[...]` | Warning border or prompt prefix; footer switches to `Enter accept  Esc keep/revert`. |
+| Inline edit | `[...]` | Warning prompt text; if also focused, combine with reverse-video emphasis. |
 | Disabled action | none | Muted foreground only. |
 
 The table shows ASCII markers for clarity; the default rendered UI should use the glyph system above.
 
 Focus, active tmux state, and alert/notification state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, and alert owns the next right-side badge. An active window with an alert must show both states.
+
+## Implementation plan
+
+1. Replace the hard-coded RGB palette in `ui::theme` with terminal-default foreground/background handling and ANSI palette colors for semantic states.
+2. Render header, footer, help modal, and focused rows with terminal-native attributes such as reverse video and bold instead of custom surface fills.
+3. Keep semantic theme helpers in `ui::theme` so tree, header, and help rendering remain decoupled from palette choices.
+4. Add or update theme-focused tests and run the existing formatting, check, and test commands after the migration.
 
 ## Alerts and notifications
 

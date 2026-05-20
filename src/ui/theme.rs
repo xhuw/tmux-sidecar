@@ -2,10 +2,6 @@ use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
-    pub bg: Color,
-    pub surface: Color,
-    pub surface_high: Color,
-    pub text: Color,
     pub muted: Color,
     pub accent: Color,
     pub active: Color,
@@ -16,23 +12,35 @@ pub struct Theme {
 
 impl Theme {
     pub fn app(self) -> Style {
-        Style::default().bg(self.bg).fg(self.text)
+        Style::default()
     }
 
     pub fn header(self) -> Style {
-        Style::default().bg(self.surface).fg(self.text)
+        Style::default().add_modifier(Modifier::REVERSED)
     }
 
     pub fn footer(self) -> Style {
-        Style::default().bg(self.surface).fg(self.muted)
+        Style::default().add_modifier(Modifier::REVERSED)
+    }
+
+    pub fn header_title(self) -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    pub fn header_label(self) -> Style {
+        Style::default().fg(self.muted)
+    }
+
+    pub fn header_value(self) -> Style {
+        Style::default()
     }
 
     pub fn row_base(self) -> Style {
-        Style::default().bg(self.bg).fg(self.text)
+        Style::default()
     }
 
     pub fn row_focused(self) -> Style {
-        self.row_base().bg(self.surface_high)
+        self.row_base().add_modifier(Modifier::BOLD)
     }
 
     pub fn row_disabled(self) -> Style {
@@ -45,8 +53,12 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    pub fn row_inline_edit_focused(self) -> Style {
+        self.row_inline_edit()
+    }
+
     pub fn modal(self) -> Style {
-        Style::default().bg(self.surface).fg(self.text)
+        Style::default().add_modifier(Modifier::REVERSED)
     }
 
     pub fn modal_border(self) -> Style {
@@ -54,9 +66,7 @@ impl Theme {
     }
 
     pub fn marker_focus(self) -> Style {
-        Style::default()
-            .fg(self.accent)
-            .add_modifier(Modifier::BOLD)
+        Style::default().add_modifier(Modifier::BOLD)
     }
 
     pub fn marker_idle(self) -> Style {
@@ -89,16 +99,54 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            bg: Color::Rgb(0x0b, 0x0f, 0x14),
-            surface: Color::Rgb(0x11, 0x18, 0x20),
-            surface_high: Color::Rgb(0x1b, 0x26, 0x33),
-            text: Color::Rgb(0xd6, 0xde, 0xeb),
-            muted: Color::Rgb(0x7d, 0x85, 0x90),
-            accent: Color::Rgb(0x7d, 0xd3, 0xfc),
-            active: Color::Rgb(0xa7, 0xf3, 0xd0),
-            warning: Color::Rgb(0xfa, 0xcc, 0x15),
-            alert: Color::Rgb(0xfb, 0xbf, 0x24),
-            danger: Color::Rgb(0xf8, 0x71, 0x71),
+            muted: Color::DarkGray,
+            accent: Color::Cyan,
+            active: Color::Green,
+            warning: Color::Yellow,
+            alert: Color::Yellow,
+            danger: Color::Red,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::{Color, Modifier, Style};
+
+    use super::Theme;
+
+    #[test]
+    fn semantic_colors_use_terminal_palette_slots() {
+        let theme = Theme::default();
+
+        assert_eq!(theme.muted, Color::DarkGray);
+        assert_eq!(theme.accent, Color::Cyan);
+        assert_eq!(theme.active, Color::Green);
+        assert_eq!(theme.warning, Color::Yellow);
+        assert_eq!(theme.alert, Color::Yellow);
+        assert_eq!(theme.danger, Color::Red);
+    }
+
+    #[test]
+    fn surface_styles_use_terminal_attributes_instead_of_fixed_backgrounds() {
+        let theme = Theme::default();
+        let reversed = Style::default().add_modifier(Modifier::REVERSED);
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+
+        assert_eq!(theme.app(), Style::default());
+        assert_eq!(theme.header(), reversed);
+        assert_eq!(theme.footer(), reversed);
+        assert_eq!(theme.header_title(), bold);
+        assert_eq!(theme.header_label(), Style::default().fg(Color::DarkGray));
+        assert_eq!(theme.header_value(), Style::default());
+        assert_eq!(theme.row_focused(), bold);
+        assert_eq!(theme.modal(), reversed);
+        assert_eq!(theme.marker_focus(), bold);
+        assert_eq!(
+            theme.row_inline_edit_focused(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        );
     }
 }
