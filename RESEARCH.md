@@ -79,7 +79,7 @@ Recommended snapshot commands use a control-character field separator supplied a
 ```text
 list-sessions -F "#{session_id}<US>#{session_name}<US>#{session_attached}<US>#{session_windows}<US>#{session_activity}"
 list-windows -a -F "#{session_id}<US>#{session_name}<US>#{window_id}<US>#{window_index}<US>#{window_name}<US>#{window_active}<US>#{window_flags}"
-list-clients -F "#{client_name}<US>#{client_session}<US>#{client_activity}<US>#{client_tty}"
+list-clients -F "#{client_name}<US>#{session_id}<US>#{window_id}<US>#{client_activity}<US>#{client_tty}"
 ```
 
 Use ASCII unit separator (`0x1f`) for fields and parse line-by-line. tmux names should not normally contain control characters; if they do, the parser should return a typed parse error rather than guessing.

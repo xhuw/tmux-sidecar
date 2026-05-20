@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{ClientName, Session, TmuxState, Window, WindowAlert};
+use crate::model::{Client, ClientName, Session, TmuxState, Window, WindowAlert};
 
 use super::{
     TmuxError,
@@ -61,6 +61,17 @@ impl SnapshotData {
                             }
                         })
                         .collect(),
+                })
+                .collect(),
+            clients: self
+                .clients
+                .into_iter()
+                .map(|client| Client {
+                    name: client.name,
+                    session_id: client.session_id,
+                    current_window_id: client.current_window_id,
+                    activity: client.activity,
+                    tty: client.tty,
                 })
                 .collect(),
         }

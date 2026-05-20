@@ -19,15 +19,15 @@ Use the alternate screen with a single full-screen view:
 ```text
   tmux-sidecar   target /dev/pts/7   active work:2.editor
  ────────────────────────────────────────────────────────
- 󰐕 new session
- ▶ work                                  ●
+   work
  ├─ 0 shell
  ├─ 2 editor                            ● active
  ├─ 3 tests                             󰂞 alert
  └─ 󰐕 new window
-   notes
+ ▶ notes
    ├─ 0 scratch
    └─ 󰐕 new window
+ 󰐕 new session
 
  ────────────────────────────────────────────────────────
  Enter switch  r rename  ? help  q quit
@@ -74,7 +74,7 @@ Use a dark graphite palette with one bright accent. Prefer semantic style names 
 | `text` | `#d6deeb` | white | Primary labels. |
 | `muted` | `#7d8590` | bright black | Secondary metadata and inactive markers. |
 | `accent` | `#7dd3fc` | cyan | Focus marker, selected text, primary affordances. |
-| `active` | `#a7f3d0` | green | tmux's active session/window. |
+| `active` | `#a7f3d0` | green | tmux's active window. |
 | `warning` | `#facc15` | yellow | Pending rename/create hint. |
 | `alert` | `#fbbf24` | yellow | tmux window activity, bell, silence, or notification state. |
 | `danger` | `#f87171` | red | Fatal or transient failed action indicator. |

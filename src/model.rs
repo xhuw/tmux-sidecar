@@ -8,24 +8,75 @@ pub type WindowId = String;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxState {
     pub sessions: Vec<Session>,
+    pub clients: Vec<Client>,
 }
 
 impl TmuxState {
     pub fn tree_rows(&self) -> Vec<TreeRow> {
+        self.tree_rows_for_client(None)
+    }
+
+    pub fn tree_rows_for_client(&self, target_client: Option<&ClientName>) -> Vec<TreeRow> {
+        let visible_window_id = self
+            .visible_window(target_client)
+            .map(|(_, window)| window.id.as_str());
         let mut rows = Vec::new();
-        rows.push(TreeRow::create_session());
 
         for session in &self.sessions {
             rows.push(TreeRow::session(session));
 
             for window in &session.windows {
-                rows.push(TreeRow::window(session.id.clone(), window));
+                rows.push(TreeRow::window(
+                    session.id.clone(),
+                    window,
+                    visible_window_id == Some(window.id.as_str()),
+                ));
             }
 
             rows.push(TreeRow::create_window(session.id.clone()));
         }
 
+        rows.push(TreeRow::create_session());
         rows
+    }
+
+    pub fn visible_window(
+        &self,
+        target_client: Option<&ClientName>,
+    ) -> Option<(&Session, &Window)> {
+        let client = self.visible_client(target_client)?;
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| session.id == client.session_id)?;
+        let window_id = client
+            .current_window_id
+            .as_deref()
+            .or(session.active_window_id.as_deref())?;
+        let window = session
+            .windows
+            .iter()
+            .find(|window| window.id == window_id)?;
+
+        Some((session, window))
+    }
+
+    pub fn visible_session(&self, target_client: Option<&ClientName>) -> Option<&Session> {
+        if let Some((session, _)) = self.visible_window(target_client) {
+            return Some(session);
+        }
+
+        let client = self.visible_client(target_client)?;
+        self.sessions
+            .iter()
+            .find(|session| session.id == client.session_id)
+    }
+
+    fn visible_client(&self, target_client: Option<&ClientName>) -> Option<&Client> {
+        match target_client {
+            Some(name) => self.clients.iter().find(|client| &client.name == name),
+            None => self.clients.iter().max_by_key(|client| client.activity),
+        }
     }
 }
 
@@ -36,12 +87,6 @@ pub struct Session {
     pub attached_count: u32,
     pub active_window_id: Option<WindowId>,
     pub windows: Vec<Window>,
-}
-
-impl Session {
-    pub fn is_active(&self) -> bool {
-        self.active_window_id.is_some() || self.windows.iter().any(|window| window.active)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -94,6 +139,15 @@ impl Window {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientName(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Client {
+    pub name: ClientName,
+    pub session_id: SessionId,
+    pub current_window_id: Option<WindowId>,
+    pub activity: u64,
+    pub tty: String,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Focus {
@@ -200,7 +254,6 @@ pub enum TreeRowKind {
         id: SessionId,
         name: String,
         attached_count: u32,
-        active: bool,
     },
     Window {
         session_id: SessionId,
@@ -239,12 +292,11 @@ impl TreeRow {
                 id: session.id.clone(),
                 name: session.name.clone(),
                 attached_count: session.attached_count,
-                active: session.is_active(),
             },
         }
     }
 
-    fn window(session_id: SessionId, window: &Window) -> Self {
+    fn window(session_id: SessionId, window: &Window, active: bool) -> Self {
         Self {
             focus: Focus::Window(window.id.clone()),
             depth: 1,
@@ -253,7 +305,7 @@ impl TreeRow {
                 id: window.id.clone(),
                 index: window.index,
                 name: window.name.clone(),
-                active: window.active,
+                active,
                 alert: window.alert,
             },
         }
@@ -269,8 +321,10 @@ impl TreeRow {
 
     pub fn active(&self) -> bool {
         match &self.kind {
-            TreeRowKind::Session { active, .. } | TreeRowKind::Window { active, .. } => *active,
-            TreeRowKind::CreateSession | TreeRowKind::CreateWindow { .. } => false,
+            TreeRowKind::Window { active, .. } => *active,
+            TreeRowKind::CreateSession
+            | TreeRowKind::Session { .. }
+            | TreeRowKind::CreateWindow { .. } => false,
         }
     }
 
@@ -314,7 +368,7 @@ impl AppState {
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {
-        self.tmux.tree_rows()
+        self.tmux.tree_rows_for_client(self.target_client.as_ref())
     }
 
     pub fn focused_row_index(&self) -> Option<usize> {

@@ -47,7 +47,7 @@ Goal: implement behavior as pure state transitions wherever possible.
 Tasks:
 
 - Define `AppState`, `TmuxState`, `Session`, `Window`, `Focus`, `Mode`, `TreeRow`, and action types.
-- Build tree rows from snapshots, including top-level new-session row and per-session new-window rows.
+- Build tree rows from snapshots, including a bottom-level new-session row and per-session new-window rows.
 - Implement focus movement, nearest-row focus recovery, and ID-preserving reconciliation after refresh.
 - Implement the single-line input buffer for create/rename modes.
 - Model alert/notification state separately from active and focused state.
@@ -102,7 +102,7 @@ Goal: complete every user workflow in the README.
 Tasks:
 
 - Switch to focused session/window from keyboard and mouse activation.
-- Create a new session from the top creation row and auto-switch to it.
+- Create a new session from the bottom creation row and auto-switch to it.
 - Create a new window from a session creation row and auto-switch to it.
 - Enter inline naming immediately after create.
 - Rename focused sessions/windows with `r`.

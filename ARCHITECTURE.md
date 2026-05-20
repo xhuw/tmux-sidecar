@@ -64,6 +64,14 @@ AppState
 
 TmuxState
   sessions: Vec<Session>
+  clients: Vec<Client>
+
+Client
+  name: ClientName
+  session_id: SessionId
+  current_window_id: Option<WindowId>
+  activity: u64
+  tty: String
 
 Session
   id: SessionId
@@ -76,7 +84,7 @@ Window
   id: WindowId
   index: u32
   name: String
-  active: bool
+  active: bool  // tmux session-local current window
   flags: String
 ```
 
@@ -210,6 +218,6 @@ End-to-end workflows:
 | Create window, `Esc` | new window exists, active, default name kept. |
 | Create window, rename | new window exists, active, requested name applied. |
 | Rename session/window failure | UI refreshes to tmux's actual name. |
-| External tmux change | next poll updates active marker and tree contents. |
+| External tmux change | next poll updates the target client's active marker and tree contents. |
 
 The CLI binary can also expose a test-only or hidden `--print-snapshot` command if parser and tmux integration need stable black-box coverage without driving the full TUI.

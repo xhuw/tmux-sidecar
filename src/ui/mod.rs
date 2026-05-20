@@ -130,28 +130,12 @@ fn header_line(state: &AppState, glyphs: Glyphs, theme: Theme) -> Line<'static> 
 }
 
 fn active_target_label(state: &AppState) -> String {
-    for session in &state.tmux.sessions {
-        if let Some(window) = session.windows.iter().find(|window| window.active) {
-            return format!("{}:{}.{}", session.name, window.index, window.name);
-        }
+    if let Some((session, window)) = state.tmux.visible_window(state.target_client.as_ref()) {
+        return format!("{}:{}.{}", session.name, window.index, window.name);
     }
 
-    for session in &state.tmux.sessions {
-        if let Some(active_window_id) = &session.active_window_id {
-            if let Some(window) = session
-                .windows
-                .iter()
-                .find(|window| &window.id == active_window_id)
-            {
-                return format!("{}:{}.{}", session.name, window.index, window.name);
-            }
-        }
-    }
-
-    for session in &state.tmux.sessions {
-        if session.active_window_id.is_some() {
-            return session.name.clone();
-        }
+    if let Some(session) = state.tmux.visible_session(state.target_client.as_ref()) {
+        return session.name.clone();
     }
 
     "none".to_string()
@@ -163,7 +147,9 @@ mod tests {
 
     use crate::{
         input::InputBuffer,
-        model::{AppState, Focus, Mode, Session, TmuxState, Window, WindowAlert},
+        model::{
+            AppState, Client, ClientName, Focus, Mode, Session, TmuxState, Window, WindowAlert,
+        },
     };
 
     use super::{RenderOptions, render_with_options};
@@ -177,6 +163,23 @@ mod tests {
         assert!(output.contains("> [+] new session"));
         assert!(output.contains("* active ! alert"));
         assert!(output.contains("Enter switch/create  r rename  ? help  q quit"));
+    }
+
+    #[test]
+    fn new_session_renders_after_session_rows() {
+        let output = render_ascii(&sample_state(), 96, 16);
+        let lines: Vec<_> = output.lines().collect();
+        let new_window = lines
+            .iter()
+            .position(|line| line.contains("+-- [+] new window"))
+            .expect("expected new window row");
+        let new_session = lines
+            .iter()
+            .position(|line| line.contains("[+] new session"))
+            .expect("expected new session row");
+
+        assert!(new_window < new_session);
+        assert_eq!(lines[new_session].trim(), "> [+] new session");
     }
 
     #[test]
@@ -209,6 +212,18 @@ mod tests {
     }
 
     #[test]
+    fn session_rows_do_not_render_active_badges() {
+        let output = render_ascii(&sample_state(), 96, 16);
+        let session_line = output
+            .lines()
+            .find(|line| line.contains("work (1 attached)"))
+            .expect("expected session row");
+
+        assert!(!session_line.contains("* active"));
+        assert!(!session_line.contains("! alert"));
+    }
+
+    #[test]
     fn alerted_window_snapshot_shows_active_and_alert_badges_together() {
         let mut state = sample_state();
         state.focus = Focus::Window("@11".to_string());
@@ -221,6 +236,57 @@ mod tests {
 
         assert!(alert_line.contains("* active"));
         assert!(alert_line.contains("! alert"));
+    }
+
+    #[test]
+    fn render_marks_only_target_clients_visible_window_active() {
+        let mut state = sample_state();
+        state.tmux.sessions.push(Session {
+            id: "$2".to_string(),
+            name: "notes".to_string(),
+            attached_count: 1,
+            active_window_id: Some("@20".to_string()),
+            windows: vec![Window {
+                id: "@20".to_string(),
+                index: 0,
+                name: "scratch".to_string(),
+                active: true,
+                flags: String::new(),
+                alert: WindowAlert::None,
+            }],
+        });
+        state.tmux.clients = vec![Client {
+            name: ClientName("client-2".to_string()),
+            session_id: "$2".to_string(),
+            current_window_id: Some("@20".to_string()),
+            activity: 99,
+            tty: "/dev/pts/2".to_string(),
+        }];
+        state.target_client = Some(ClientName("client-2".to_string()));
+
+        let output = render_ascii(&state, 96, 16);
+        let work_line = output
+            .lines()
+            .find(|line| line.contains("work (1 attached)"))
+            .expect("expected work session row");
+        let editor_line = output
+            .lines()
+            .find(|line| line.contains("|-- 1 editor"))
+            .expect("expected editor row");
+        let notes_line = output
+            .lines()
+            .find(|line| line.contains("notes (1 attached)"))
+            .expect("expected notes session row");
+        let scratch_line = output
+            .lines()
+            .find(|line| line.contains("|-- 0 scratch"))
+            .expect("expected scratch row");
+
+        assert!(!work_line.contains("* active"));
+        assert!(!editor_line.contains("* active"));
+        assert!(!notes_line.contains("* active"));
+        assert!(scratch_line.contains("* active"));
+        assert!(output.contains("active notes:0.scratch"));
     }
 
     fn render_ascii(state: &AppState, width: u16, height: u16) -> String {
@@ -270,7 +336,15 @@ mod tests {
                         },
                     ],
                 }],
+                clients: vec![Client {
+                    name: ClientName("client-1".to_string()),
+                    session_id: "$1".to_string(),
+                    current_window_id: Some("@11".to_string()),
+                    activity: 42,
+                    tty: "/dev/pts/1".to_string(),
+                }],
             },
+            target_client: Some(ClientName("client-1".to_string())),
             ..AppState::default()
         }
     }

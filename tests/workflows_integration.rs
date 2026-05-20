@@ -178,6 +178,81 @@ fn type_text(app: &mut App, text: &str) -> Result<(), Box<dyn std::error::Error>
 
 #[test]
 #[serial]
+fn snapshot_tracks_target_client_visible_window_for_active_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let app = server.app()?;
+
+    let snapshot = tmux.snapshot()?;
+    let main_session_id = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-main session in snapshot")?;
+    let main_window_id = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == main_session_id)
+        .and_then(|session| session.active_window_id.clone())
+        .ok_or("missing active it-main window in snapshot")?;
+    let second_session_id = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-second session in snapshot")?;
+    let second_window_id = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id == second_session_id)
+        .and_then(|session| session.windows.first().map(|window| window.id.clone()))
+        .ok_or("missing it-second window in snapshot")?;
+    let client = snapshot
+        .clients
+        .iter()
+        .find(|client| client.name.0 == server.client_name)
+        .ok_or("missing control-mode client in snapshot")?;
+    assert_eq!(client.session_id, main_session_id);
+    assert_eq!(
+        client.current_window_id.as_deref(),
+        Some(main_window_id.as_str())
+    );
+
+    let rows = app.state().tree_rows();
+    let main_session = rows
+        .iter()
+        .find(|row| row.focus == Focus::Session(main_session_id.clone()))
+        .ok_or("missing it-main session row")?;
+    let main_window = rows
+        .iter()
+        .find(|row| row.focus == Focus::Window(main_window_id.clone()))
+        .ok_or("missing it-main window row")?;
+    let second_session = rows
+        .iter()
+        .find(|row| row.focus == Focus::Session(second_session_id.clone()))
+        .ok_or("missing it-second session row")?;
+    let second_window = rows
+        .iter()
+        .find(|row| row.focus == Focus::Window(second_window_id.clone()))
+        .ok_or("missing it-second window row")?;
+
+    assert!(!main_session.active());
+    assert!(main_window.active());
+    assert!(!second_session.active());
+    assert!(!second_window.active());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn refresh_syncs_external_create_rename_close_reindex_and_active_changes()
 -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {

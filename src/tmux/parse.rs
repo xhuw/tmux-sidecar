@@ -27,6 +27,7 @@ pub struct WindowRecord {
 pub struct ClientRecord {
     pub name: ClientName,
     pub session_id: String,
+    pub current_window_id: Option<String>,
     pub activity: u64,
     pub tty: String,
 }
@@ -100,6 +101,7 @@ pub fn client_format() -> String {
     join_with_separator(&[
         "#{client_name}",
         "#{session_id}",
+        "#{window_id}",
         "#{client_activity}",
         "#{client_tty}",
     ])
@@ -164,11 +166,13 @@ fn parse_window_line(line: &str) -> Result<WindowRecord, ParseError> {
 
 fn parse_client_line(line: &str) -> Result<ClientRecord, ParseError> {
     let fields = split_fields(line);
-    let [name, session_id, activity, tty] = expect_fields::<4>("client", fields, line)?;
+    let [name, session_id, current_window_id, activity, tty] =
+        expect_fields::<5>("client", fields, line)?;
 
     Ok(ClientRecord {
         name: ClientName(required("client_name", name)?),
         session_id: required("client_session", session_id)?,
+        current_window_id: optional_id(current_window_id),
         activity: parse_u64("client_activity", activity)?,
         tty: tty.to_owned(),
     })
@@ -316,7 +320,7 @@ mod tests {
     #[test]
     fn rejects_client_with_invalid_activity() {
         let raw = format!(
-            "client-1{sep}$1{sep}not-a-number{sep}/dev/pts/2\n",
+            "client-1{sep}$1{sep}@9{sep}not-a-number{sep}/dev/pts/2\n",
             sep = FIELD_SEPARATOR
         );
 
@@ -329,5 +333,21 @@ mod tests {
                 value
             } if value == "not-a-number"
         ));
+    }
+
+    #[test]
+    fn parses_clients_with_current_window() {
+        let raw = format!(
+            "client-1{sep}$1{sep}@9{sep}42{sep}/dev/pts/2\n",
+            sep = FIELD_SEPARATOR
+        );
+
+        let clients = parse_clients(&raw).expect("clients should parse");
+
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].name.0, "client-1");
+        assert_eq!(clients[0].session_id, "$1");
+        assert_eq!(clients[0].current_window_id.as_deref(), Some("@9"));
+        assert_eq!(clients[0].activity, 42);
     }
 }
