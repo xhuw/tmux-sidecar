@@ -570,6 +570,61 @@ fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn s
 
 #[test]
 #[serial]
+fn closes_focused_window_with_x_without_confirmation() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let doomed_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+    let initial_window_count = main_session.windows.len();
+
+    app.state_mut().focus = Focus::Window(doomed_window_id.clone());
+    app.on_key_event(key(KeyCode::Char('x')))?;
+
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(app.state().last_error.is_none());
+    assert_ne!(app.state().focus, Focus::Window(doomed_window_id.clone()));
+    assert!(
+        app.state()
+            .tree_rows()
+            .iter()
+            .any(|row| row.focus == app.state().focus)
+    );
+
+    let refreshed_main = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session.id)
+        .ok_or("missing it-main session after close")?;
+    assert_eq!(refreshed_main.windows.len(), initial_window_count - 1);
+    assert!(
+        !refreshed_main
+            .windows
+            .iter()
+            .any(|window| window.id == doomed_window_id)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn renames_with_r_and_refreshes_on_failed_rename() -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {
         eprintln!("skipping integration test: tmux is unavailable");

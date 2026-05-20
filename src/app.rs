@@ -192,6 +192,9 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.move_focus(FocusMove::Down);
             }
+            KeyCode::Char('x') => {
+                self.close_focused_window()?;
+            }
             KeyCode::Char('r') => {
                 self.start_rename();
             }
@@ -367,6 +370,18 @@ impl App {
         };
 
         Ok(())
+    }
+
+    fn close_focused_window(&mut self) -> Result<()> {
+        let Focus::Window(window_id) = self.state.focus.clone() else {
+            return Ok(());
+        };
+
+        let Some(()) = self.try_tmux_action(|tmux| tmux.close_window(&window_id))? else {
+            return Ok(());
+        };
+
+        self.refresh_snapshot()
     }
 
     fn start_rename(&mut self) {

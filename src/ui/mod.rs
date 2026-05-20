@@ -162,7 +162,7 @@ mod tests {
         assert!(output.contains("tmux-sidecar"));
         assert!(output.contains("> [+] new session"));
         assert!(output.contains("* active ! alert"));
-        assert!(output.contains("Enter switch/create  r rename  ? help  q quit"));
+        assert!(output.contains("Enter switch/create  r rename  x close window  ? help  q quit"));
     }
 
     #[test]

@@ -9,7 +9,7 @@ use super::{
 
 pub fn key_hints(mode: &Mode) -> &'static str {
     match mode {
-        Mode::Normal => "Enter switch/create  r rename  ? help  q quit",
+        Mode::Normal => "Enter switch/create  r rename  x close window  ? help  q quit",
         Mode::Help => "Esc close help  ? close help  q quit",
         Mode::RenameSession { .. } | Mode::RenameWindow { .. } => {
             "Enter accept  Esc revert  Ctrl+u clear"
@@ -28,6 +28,7 @@ pub fn modal_lines(glyph_mode: GlyphMode, theme: Theme) -> Vec<Line<'static>> {
         Line::from("Up/Down or j/k  move focus"),
         Line::from("Enter           switch or create"),
         Line::from("r               rename focused session/window"),
+        Line::from("x               close focused window"),
         Line::from("?               toggle help"),
         Line::from("q               quit"),
         Line::from(""),

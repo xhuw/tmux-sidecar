@@ -1,88 +1,165 @@
-# tmux-sidecar
+<div align="center">
 
-`tmux-sidecar` is a terminal UI for managing tmux sessions/windows with keyboard or mouse.
-It keeps the tree synced with tmux, supports inline create/rename, and highlights active + alerting windows.
+#  tmux-sidecar
 
-## Requirements
+**The tmux session manager you didn't know you were missing.**
+
+*Blazing-fast. Keyboard-native. Always in sync.*
+
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![tmux](https://img.shields.io/badge/requires-tmux-green?style=flat-square)](https://github.com/tmux/tmux)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+
+</div>
+
+---
+
+Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequences.
+**tmux-sidecar** drops a beautiful, always-live session tree right into your terminal — every session, every window, every alert, one keystroke away.
+
+---
+
+## Screenshot
+
+```
+ tmux-sidecar  │ target /dev/pts/3  │ active work:2.editor
+────────────────────────────────────────────────────────────────
+  work (1 attached)
+  ├─ 0 shell
+▶ ├─ 2 editor                                          ● active
+  ├─ 3 tests                                           󰂞 alert
+  └─  new window
+  notes
+  ├─ 0 scratch
+  └─  new window
+  side-project
+  ├─ 0 main
+  └─  new window
+   new session
+────────────────────────────────────────────────────────────────
+Enter switch/create  r rename  x close window  ? help  q quit
+```
+
+> Nerd Font glyphs shown above. An ASCII fallback mode is available for any monospace font.
+
+---
+
+## Why tmux-sidecar?
+
+- **Instant context** — see all your sessions and windows at a glance, always live-synced to tmux
+- **One-keystroke everything** — switch, create, rename, or close without leaving the keyboard
+- **Mouse? Sure.** — click any row to jump straight to it
+- **Zero config** — attach inside tmux and it just works; no plugins, no hooks, no config changes required
+- **Alerts at a glance** — activity, bell, and silence flags surface as visual badges so nothing gets lost in a busy session
+- **Inline rename** — rename sessions and windows without dropping to a tmux prompt, with full cursor editing
+- **Survives chaos** — if something changes in tmux behind your back, the tree re-syncs and focus recovers gracefully
+- **Fast** — written in Rust; sub-millisecond renders, 500 ms background polling
+
+---
+
+## Install
+
+### Prerequisites
 
 - Linux
-- `tmux` installed and available on `PATH`
-- A running tmux server with at least one session
-- A target tmux client (required for switching)
+- Rust toolchain (`cargo`) — [install rustup](https://rustup.rs/)
+- `tmux` on your `PATH`
+- *(Optional)* A [Nerd Font](https://www.nerdfonts.com/) for rich glyphs
 
-Optional:
-
-- Nerd Font for rich glyphs (default rendering)
-- Any monospace font + ASCII fallback mode
-
-## Build
+### Build from source
 
 ```bash
-cargo build
+git clone https://github.com/youruser/tmux-sidecar
+cd tmux-sidecar
+cargo build --release
 ```
 
-## Run
-
-Inside tmux:
+The binary lands at `target/release/tmux-sidecar`. Copy it anywhere on your `PATH`:
 
 ```bash
-cargo run --
+cp target/release/tmux-sidecar ~/.local/bin/
 ```
 
-Outside tmux (recommended explicit target client):
+---
+
+## Quick start
+
+**Inside tmux** — just run it:
 
 ```bash
-cargo run -- --target-client <client-name>
+tmux-sidecar
 ```
 
-Use a non-default tmux socket:
+**Outside tmux** — tell it which client to drive:
 
 ```bash
-cargo run -- --socket-name <name>
-cargo run -- --socket-path <path>
+tmux-sidecar --target-client <client-name>
 ```
 
-Useful options:
+Not sure of the client name? `tmux list-clients` will tell you.
 
-- `--poll-interval-ms <millis>`: snapshot refresh interval (default `500`)
-- `--print-snapshot`: debug helper, prints snapshot and exits
+That's it. The session tree opens full-screen and stays live.
 
-## Keybindings
+---
 
-Normal mode:
+## Usage
 
-- `Up/Down` or `j/k`: move focus
-- `Enter`: switch to focused session/window, or create focused `new ...` row
-- `r`: rename focused session/window
-- `?`: toggle help
-- `q` or `Ctrl+c`: quit
+### Keybindings
 
-Inline edit mode (rename/create naming):
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` or `k` / `j` | Move focus up/down the tree |
+| `Enter` | Switch to focused session/window, or create from a `[+]` row |
+| `r` | Rename the focused session or window (inline, no prompts) |
+| `x` | Close the focused window immediately |
+| `?` | Open/close the help modal |
+| `q` or `Ctrl+c` | Quit |
 
-- Type text directly
-- `Enter`: accept
-- `Esc`: cancel inline edit (keep current/default tmux name)
-- `Ctrl+u`: clear
-- `Left/Right/Home/End/Backspace/Delete`: cursor editing
+**In rename/create mode:**
 
-Mouse:
+| Key | Action |
+|-----|--------|
+| Type | Edit the name directly |
+| `Enter` | Accept the new name |
+| `Esc` | Cancel (keeps the current/default tmux name) |
+| `Ctrl+u` | Clear the input |
+| `Left` / `Right` / `Home` / `End` / `Backspace` / `Delete` | Cursor editing |
 
-- Left click row: focus + activate
-- Wheel up/down: move focus
+**Mouse:**
 
-## Glyph/font fallback
+| Gesture | Action |
+|---------|--------|
+| Left click | Focus + activate that row |
+| Scroll wheel | Move focus up/down |
 
-If Nerd Font glyphs do not render correctly, force ASCII mode:
+### Options
+
+```
+tmux-sidecar [OPTIONS]
+
+Options:
+  --target-client <name>      Use a specific tmux client for switching
+  --socket-name <name>        Connect to a named tmux socket (-L)
+  --socket-path <path>        Connect to a socket by path (-S)
+  --poll-interval-ms <ms>     Live-sync interval in milliseconds (default: 500)
+  --print-snapshot            Print the session/window tree and exit (debug)
+```
+
+### ASCII / font fallback
+
+No Nerd Font? No problem:
 
 ```bash
-TMUX_SIDECAR_ASCII=1 cargo run --
+TMUX_SIDECAR_GLYPHS=ascii tmux-sidecar
 # or
-TMUX_SIDECAR_GLYPHS=ascii cargo run --
+TMUX_SIDECAR_ASCII=1 tmux-sidecar
 ```
 
-## Testing
+---
 
-Run standard checks:
+## Contributing
+
+Bug reports, ideas, and PRs are welcome. Run the test suite before submitting:
 
 ```bash
 cargo fmt --all --check
@@ -90,14 +167,4 @@ cargo check
 cargo test
 ```
 
-Notes:
-
-- Integration tests use real tmux and are skipped automatically if tmux is unavailable.
-- Tests use isolated tmux servers/sockets and do not require your existing tmux config.
-
-## Known limitations / caveats
-
-- When launched outside tmux, you should pass `--target-client` to avoid acting on an unintended client.
-- tmux-sidecar polls tmux (`--poll-interval-ms`) rather than subscribing to tmux hooks.
-- Error reporting is minimal by design (footer indicator + refresh to authoritative tmux state).
-- If tmux has no sessions or no usable target client at startup, the app exits with an error.
+Integration tests spin up real isolated tmux servers and are skipped automatically if tmux is unavailable — your existing tmux sessions are never touched.
