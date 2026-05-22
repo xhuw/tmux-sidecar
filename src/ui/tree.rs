@@ -184,13 +184,13 @@ fn inline_edit_target(mode: &Mode) -> Option<InlineEdit<'_>> {
             input,
             create: false,
         }),
-        Mode::CreateSessionName { id, input } => Some(InlineEdit {
-            focus: Focus::Session(id.clone()),
+        Mode::CreateSessionName { input } => Some(InlineEdit {
+            focus: Focus::CreateSession,
             input,
             create: true,
         }),
-        Mode::CreateWindowName { id, input } => Some(InlineEdit {
-            focus: Focus::Window(id.clone()),
+        Mode::CreateWindowName { session_id, input } => Some(InlineEdit {
+            focus: Focus::CreateWindow(session_id.clone()),
             input,
             create: true,
         }),
@@ -246,12 +246,16 @@ fn inline_label(
         TreeRowKind::CreateSession => "session",
         TreeRowKind::CreateWindow { .. } => "window",
     };
-    let action = if inline_edit.create { "name" } else { "rename" };
+    let action = if inline_edit.create {
+        format!("new {noun} name")
+    } else {
+        format!("rename {noun}")
+    };
     let cursor_text = render_with_cursor(inline_edit.input);
 
     vec![
         Span::styled(glyphs.inline_prefix, theme.marker_create()),
-        Span::styled(format!(" {action} {noun}: "), row_style),
+        Span::styled(format!(" {action}: "), row_style),
         Span::styled(cursor_text, row_style.fg(theme.warning)),
     ]
 }

@@ -213,6 +213,20 @@ mod tests {
     }
 
     #[test]
+    fn create_session_snapshot_shows_precreate_prompt_and_footer_hints() {
+        let mut state = sample_state();
+        state.focus = Focus::CreateSession;
+        state.mode = Mode::CreateSessionName {
+            input: InputBuffer::new(),
+        };
+
+        let output = render_ascii(&state, 96, 16);
+
+        assert!(output.contains("[...] new session name: |"));
+        assert!(output.contains("Enter create  Esc cancel  Ctrl+u clear"));
+    }
+
+    #[test]
     fn session_rows_do_not_render_active_badges() {
         let output = render_ascii(&sample_state(), 96, 16);
         let session_line = output

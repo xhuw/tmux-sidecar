@@ -72,6 +72,11 @@ impl App {
         &mut self.state
     }
 
+    #[allow(dead_code)]
+    pub fn should_quit(&self) -> bool {
+        self.should_quit
+    }
+
     pub fn apply_snapshot(&mut self, tmux: TmuxState) -> FocusReconcile {
         self.state.reconcile_tmux(tmux)
     }
@@ -120,7 +125,9 @@ impl App {
         let target_client = self.tmux.check_startup(self.cli.target_client.as_deref())?;
 
         self.state.target_client = Some(target_client);
-        self.refresh_snapshot()
+        self.refresh_snapshot()?;
+        self.state.focus_visible_target();
+        Ok(())
     }
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
@@ -296,21 +303,21 @@ impl App {
     }
 
     fn activate_focused_target(&mut self) -> Result<()> {
-        let Some(client) = self.state.target_client.clone() else {
-            return Ok(());
-        };
-
         match self.state.focus.clone() {
             Focus::Session(session_id) => {
+                let Some(client) = self.state.target_client.clone() else {
+                    return Ok(());
+                };
                 self.switch_to_target(client, WindowTarget::Session(session_id))
             }
             Focus::Window(window_id) => {
+                let Some(client) = self.state.target_client.clone() else {
+                    return Ok(());
+                };
                 self.switch_to_target(client, WindowTarget::Window(window_id))
             }
-            Focus::CreateSession => self.create_session_and_begin_naming(client),
-            Focus::CreateWindow(session_id) => {
-                self.create_window_and_begin_naming(client, session_id)
-            }
+            Focus::CreateSession => self.begin_create_session_naming(),
+            Focus::CreateWindow(session_id) => self.begin_create_window_naming(session_id),
         }
     }
 
@@ -319,56 +326,26 @@ impl App {
             return Ok(());
         };
 
+        if self.cli.auto_quit {
+            self.should_quit = true;
+            return Ok(());
+        }
+
         self.refresh_snapshot()
     }
 
-    fn create_session_and_begin_naming(&mut self, client: ClientName) -> Result<()> {
-        let Some(session_id) = self.try_tmux_action(|tmux| tmux.create_session())? else {
-            return Ok(());
-        };
-        let Some(()) = self.try_tmux_action(|tmux| {
-            tmux.switch_to(&client, WindowTarget::Session(session_id.clone()))
-        })?
-        else {
-            return Ok(());
-        };
-
-        self.refresh_snapshot()?;
-        self.state.focus = Focus::Session(session_id.clone());
-
-        let input = InputBuffer::from_text(self.session_name(&session_id).unwrap_or_default());
+    fn begin_create_session_naming(&mut self) -> Result<()> {
         self.state.mode = Mode::CreateSessionName {
-            id: session_id,
-            input,
+            input: InputBuffer::new(),
         };
-
         Ok(())
     }
 
-    fn create_window_and_begin_naming(
-        &mut self,
-        client: ClientName,
-        session_id: String,
-    ) -> Result<()> {
-        let Some(window_id) = self.try_tmux_action(|tmux| tmux.create_window(&session_id))? else {
-            return Ok(());
-        };
-        let Some(()) = self.try_tmux_action(|tmux| {
-            tmux.switch_to(&client, WindowTarget::Window(window_id.clone()))
-        })?
-        else {
-            return Ok(());
-        };
-
-        self.refresh_snapshot()?;
-        self.state.focus = Focus::Window(window_id.clone());
-
-        let input = InputBuffer::from_text(self.window_name(&window_id).unwrap_or_default());
+    fn begin_create_window_naming(&mut self, session_id: String) -> Result<()> {
         self.state.mode = Mode::CreateWindowName {
-            id: window_id,
-            input,
+            session_id,
+            input: InputBuffer::new(),
         };
-
         Ok(())
     }
 
@@ -417,7 +394,7 @@ impl App {
         self.state.mode = Mode::Normal;
 
         match mode {
-            Mode::RenameSession { id, input, .. } | Mode::CreateSessionName { id, input } => {
+            Mode::RenameSession { id, input, .. } => {
                 let Some(()) =
                     self.try_tmux_action(|tmux| tmux.rename_session(&id, input.as_str()))?
                 else {
@@ -427,7 +404,7 @@ impl App {
                 self.refresh_snapshot()?;
                 self.state.focus = Focus::Session(id);
             }
-            Mode::RenameWindow { id, input, .. } | Mode::CreateWindowName { id, input } => {
+            Mode::RenameWindow { id, input, .. } => {
                 let Some(()) =
                     self.try_tmux_action(|tmux| tmux.rename_window(&id, input.as_str()))?
                 else {
@@ -436,6 +413,37 @@ impl App {
 
                 self.refresh_snapshot()?;
                 self.state.focus = Focus::Window(id);
+            }
+            Mode::CreateSessionName { input } => {
+                let Some(client) = self.state.target_client.clone() else {
+                    return Ok(());
+                };
+                let name = (!input.is_empty()).then_some(input.as_str());
+                let Some(session_id) = self.try_tmux_action(|tmux| tmux.create_session(name))?
+                else {
+                    return Ok(());
+                };
+
+                self.switch_to_target(client, WindowTarget::Session(session_id.clone()))?;
+                if !self.should_quit {
+                    self.state.focus = Focus::Session(session_id);
+                }
+            }
+            Mode::CreateWindowName { session_id, input } => {
+                let Some(client) = self.state.target_client.clone() else {
+                    return Ok(());
+                };
+                let name = (!input.is_empty()).then_some(input.as_str());
+                let Some(window_id) =
+                    self.try_tmux_action(|tmux| tmux.create_window(&session_id, name))?
+                else {
+                    return Ok(());
+                };
+
+                self.switch_to_target(client, WindowTarget::Window(window_id.clone()))?;
+                if !self.should_quit {
+                    self.state.focus = Focus::Window(window_id);
+                }
             }
             Mode::Normal | Mode::Help => {}
         }

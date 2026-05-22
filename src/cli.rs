@@ -30,6 +30,10 @@ pub struct Cli {
     )]
     pub poll_interval_ms: u64,
 
+    /// Exit immediately after selecting a session or window.
+    #[arg(long = "auto-quit")]
+    pub auto_quit: bool,
+
     /// Test-only helper to print a snapshot and exit.
     #[arg(long = "print-snapshot", hide = true)]
     pub print_snapshot: bool,

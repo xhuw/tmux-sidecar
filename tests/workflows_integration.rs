@@ -86,17 +86,23 @@ impl IsolatedServer {
     }
 
     fn app(&self) -> Result<App, Box<dyn std::error::Error>> {
+        self.app_with_auto_quit(false)
+    }
+
+    fn app_with_auto_quit(&self, auto_quit: bool) -> Result<App, Box<dyn std::error::Error>> {
         let cli = Cli {
             socket_name: Some(self.socket_name.clone()),
             socket_path: None,
             target_client: Some(self.client_name.clone()),
             poll_interval_ms: 500,
+            auto_quit,
             print_snapshot: false,
         };
         let mut app = App::new(cli);
         let tmux = self.tmux_cli();
-        app.apply_snapshot(tmux.snapshot()?);
         app.state_mut().target_client = Some(ClientName(self.client_name.clone()));
+        app.apply_snapshot(tmux.snapshot()?);
+        app.state_mut().focus_visible_target();
         Ok(app)
     }
 
@@ -114,6 +120,22 @@ impl IsolatedServer {
                 (name == self.client_name).then(|| session.to_owned())
             })
             .ok_or_else(|| "failed to resolve client session".into())
+    }
+
+    fn client_window_id(&self) -> Result<String, Box<dyn std::error::Error>> {
+        let output = run_tmux(
+            &self.socket_name,
+            &["list-clients", "-F", "#{client_name}\t#{window_id}"],
+        )?;
+        output
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split('\t');
+                let name = fields.next()?;
+                let window = fields.next()?;
+                (name == self.client_name).then(|| window.to_owned())
+            })
+            .ok_or_else(|| "failed to resolve client window".into())
     }
 }
 
@@ -247,6 +269,23 @@ fn snapshot_tracks_target_client_visible_window_for_active_rows()
     assert!(main_window.active());
     assert!(!second_session.active());
     assert!(!second_window.active());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn startup_focuses_target_clients_active_window() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let app = server.app()?;
+    let focused_window_id = server.client_window_id()?;
+
+    assert_eq!(app.state().focus, Focus::Window(focused_window_id));
 
     Ok(())
 }
@@ -424,6 +463,55 @@ fn switches_session_from_keyboard_and_mouse_activation() -> Result<(), Box<dyn s
 
 #[test]
 #[serial]
+fn auto_quit_exits_after_keyboard_and_mouse_window_selection()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let snapshot = server.tmux_cli().snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-win")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-win window")?;
+    let extra_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+
+    let mut keyboard_app = server.app_with_auto_quit(true)?;
+    keyboard_app.state_mut().focus = Focus::Window(extra_window_id.clone());
+    keyboard_app.on_key_event(key(KeyCode::Enter))?;
+    assert_eq!(server.client_window_id()?, extra_window_id);
+    assert!(keyboard_app.should_quit());
+
+    let mut mouse_app = server.app_with_auto_quit(true)?;
+    let rows = mouse_app.state().tree_rows();
+    let row_index = rows
+        .iter()
+        .position(|row| row.focus == Focus::Window(main_window_id.clone()))
+        .ok_or("missing row for it-win")?;
+    let row = TREE_START_ROW + u16::try_from(row_index)?;
+    mouse_app.on_mouse_event(mouse_left(row))?;
+
+    assert_eq!(server.client_window_id()?, main_window_id);
+    assert!(mouse_app.should_quit());
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn creates_session_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn std::error::Error>>
 {
     if !tmux_available() {
@@ -434,52 +522,50 @@ fn creates_session_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn 
     let server = IsolatedServer::start()?;
     let tmux = server.tmux_cli();
     let mut app = server.app()?;
+    let initial_client_session_id = server.client_session_id()?;
+    let initial_session_ids: Vec<_> = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .map(|session| session.id)
+        .collect();
 
     app.state_mut().focus = Focus::CreateSession;
     app.on_key_event(key(KeyCode::Enter))?;
 
-    let first_session_id = match app.state().mode.clone() {
-        Mode::CreateSessionName { id, .. } => id,
+    match app.state().mode.clone() {
+        Mode::CreateSessionName { .. } => {}
         other => return Err(format!("unexpected mode after create session: {other:?}").into()),
-    };
-    assert_eq!(server.client_session_id()?, first_session_id);
+    }
+    assert_eq!(server.client_session_id()?, initial_client_session_id);
+    assert_eq!(tmux.snapshot()?.sessions.len(), initial_session_ids.len());
 
     app.on_key_event(ctrl(KeyCode::Char('u')))?;
     type_text(&mut app, "created-session")?;
     app.on_key_event(key(KeyCode::Enter))?;
     assert_eq!(app.state().mode, Mode::Normal);
     let snapshot = tmux.snapshot()?;
-    let created_name = snapshot
+    let created_session = snapshot
         .sessions
         .iter()
-        .find(|session| session.id == first_session_id)
-        .map(|session| session.name.as_str());
-    assert_eq!(created_name, Some("created-session"));
+        .find(|session| !initial_session_ids.contains(&session.id))
+        .ok_or("missing created session after confirm")?;
+    let first_session_id = created_session.id.clone();
+    assert_eq!(created_session.name, "created-session");
+    assert_eq!(server.client_session_id()?, first_session_id);
 
+    let session_count_before_cancel = tmux.snapshot()?.sessions.len();
     app.state_mut().focus = Focus::CreateSession;
     app.on_key_event(key(KeyCode::Enter))?;
-    let second_session_id = match app.state().mode.clone() {
-        Mode::CreateSessionName { id, .. } => id,
+    match app.state().mode.clone() {
+        Mode::CreateSessionName { .. } => {}
         other => return Err(format!("unexpected mode after second create: {other:?}").into()),
-    };
-    let default_name = tmux
-        .snapshot()?
-        .sessions
-        .into_iter()
-        .find(|session| session.id == second_session_id)
-        .map(|session| session.name)
-        .ok_or("missing second created session")?;
+    }
 
     app.on_key_event(key(KeyCode::Esc))?;
     assert_eq!(app.state().mode, Mode::Normal);
-
-    let retained_name = tmux
-        .snapshot()?
-        .sessions
-        .into_iter()
-        .find(|session| session.id == second_session_id)
-        .map(|session| session.name);
-    assert_eq!(retained_name.as_deref(), Some(default_name.as_str()));
+    assert_eq!(tmux.snapshot()?.sessions.len(), session_count_before_cancel);
+    assert_eq!(server.client_session_id()?, first_session_id);
 
     Ok(())
 }
@@ -495,6 +581,7 @@ fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn s
     let server = IsolatedServer::start()?;
     let tmux = server.tmux_cli();
     let mut app = server.app()?;
+    let initial_client_window_id = server.client_window_id()?;
 
     let main_session_id = app
         .state()
@@ -507,20 +594,23 @@ fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn s
 
     app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
     app.on_key_event(key(KeyCode::Enter))?;
-    let first_window_id = match app.state().mode.clone() {
-        Mode::CreateWindowName { id, .. } => id,
+    match app.state().mode.clone() {
+        Mode::CreateWindowName { session_id, .. } => {
+            assert_eq!(session_id, main_session_id);
+        }
         other => return Err(format!("unexpected mode after create window: {other:?}").into()),
-    };
-
-    let created_window_active = tmux
+    }
+    assert_eq!(server.client_window_id()?, initial_client_window_id);
+    let initial_window_ids: Vec<_> = tmux
         .snapshot()?
         .sessions
         .into_iter()
         .find(|session| session.id == main_session_id)
-        .and_then(|session| session.active_window_id)
-        .map(|id| id == first_window_id)
-        .unwrap_or(false);
-    assert!(created_window_active);
+        .ok_or("missing it-main session before create")?
+        .windows
+        .into_iter()
+        .map(|window| window.id)
+        .collect();
 
     app.on_key_event(ctrl(KeyCode::Char('u')))?;
     type_text(&mut app, "created-window")?;
@@ -531,39 +621,117 @@ fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn s
         .snapshot()?
         .sessions
         .into_iter()
-        .flat_map(|session| session.windows.into_iter())
-        .find(|window| window.id == first_window_id)
-        .map(|window| window.name);
-    assert_eq!(renamed_window.as_deref(), Some("created-window"));
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after create")?
+        .windows
+        .into_iter()
+        .find(|window| !initial_window_ids.contains(&window.id))
+        .ok_or("missing created window after confirm")?;
+    let first_window_id = renamed_window.id.clone();
+    assert_eq!(renamed_window.name, "created-window");
+    assert_eq!(server.client_window_id()?, first_window_id);
 
+    let window_count_before_cancel = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .map(|session| session.windows.len())
+        .ok_or("missing it-main before cancel")?;
     app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
     app.on_key_event(key(KeyCode::Enter))?;
-    let second_window_id = match app.state().mode.clone() {
-        Mode::CreateWindowName { id, .. } => id,
+    match app.state().mode.clone() {
+        Mode::CreateWindowName { session_id, .. } => {
+            assert_eq!(session_id, main_session_id);
+        }
         other => {
             return Err(format!("unexpected mode after second create window: {other:?}").into());
         }
-    };
-    let default_name = tmux
-        .snapshot()?
-        .sessions
-        .into_iter()
-        .flat_map(|session| session.windows.into_iter())
-        .find(|window| window.id == second_window_id)
-        .map(|window| window.name)
-        .ok_or("missing second created window")?;
+    }
 
     app.on_key_event(key(KeyCode::Esc))?;
     assert_eq!(app.state().mode, Mode::Normal);
-
-    let retained_name = tmux
+    let retained_window_count = tmux
         .snapshot()?
         .sessions
         .into_iter()
-        .flat_map(|session| session.windows.into_iter())
-        .find(|window| window.id == second_window_id)
-        .map(|window| window.name);
-    assert_eq!(retained_name.as_deref(), Some(default_name.as_str()));
+        .find(|session| session.id == main_session_id)
+        .map(|session| session.windows.len())
+        .ok_or("missing it-main after cancel")?;
+    assert_eq!(retained_window_count, window_count_before_cancel);
+    assert_eq!(server.client_window_id()?, first_window_id);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn auto_quit_waits_for_second_enter_before_create_switch() -> Result<(), Box<dyn std::error::Error>>
+{
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let main_session_id = tmux
+        .snapshot()?
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-main session")?;
+
+    let mut session_app = server.app_with_auto_quit(true)?;
+    let initial_client_session_id = server.client_session_id()?;
+    session_app.state_mut().focus = Focus::CreateSession;
+    session_app.on_key_event(key(KeyCode::Enter))?;
+    assert!(matches!(
+        session_app.state().mode,
+        Mode::CreateSessionName { .. }
+    ));
+    assert!(!session_app.should_quit());
+    assert_eq!(server.client_session_id()?, initial_client_session_id);
+
+    type_text(&mut session_app, "auto-session")?;
+    session_app.on_key_event(key(KeyCode::Enter))?;
+    assert!(session_app.should_quit());
+    let created_session_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.name == "auto-session")
+        .map(|session| session.id)
+        .ok_or("missing auto-created session")?;
+    assert_eq!(server.client_session_id()?, created_session_id);
+
+    let mut window_app = server.app_with_auto_quit(true)?;
+    let initial_client_window_id = server.client_window_id()?;
+    window_app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
+    window_app.on_key_event(key(KeyCode::Enter))?;
+    assert!(matches!(
+        window_app.state().mode,
+        Mode::CreateWindowName { .. }
+    ));
+    assert!(!window_app.should_quit());
+    assert_eq!(server.client_window_id()?, initial_client_window_id);
+
+    type_text(&mut window_app, "auto-window")?;
+    window_app.on_key_event(key(KeyCode::Enter))?;
+    assert!(window_app.should_quit());
+    let created_window_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after auto window create")?
+        .windows
+        .into_iter()
+        .find(|window| window.name == "auto-window")
+        .map(|window| window.id)
+        .ok_or("missing auto-created window")?;
+    assert_eq!(server.client_window_id()?, created_window_id);
 
     Ok(())
 }

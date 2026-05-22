@@ -36,8 +36,9 @@ pub trait Tmux {
     fn snapshot(&self) -> Result<TmuxState, TmuxError>;
     fn resolve_target_client(&self, cli_override: Option<&str>) -> Result<ClientName, TmuxError>;
     fn switch_to(&self, client: &ClientName, target: WindowTarget) -> Result<(), TmuxError>;
-    fn create_session(&self) -> Result<SessionId, TmuxError>;
-    fn create_window(&self, session: &SessionId) -> Result<WindowId, TmuxError>;
+    fn create_session(&self, name: Option<&str>) -> Result<SessionId, TmuxError>;
+    fn create_window(&self, session: &SessionId, name: Option<&str>)
+    -> Result<WindowId, TmuxError>;
     fn close_window(&self, window: &WindowId) -> Result<(), TmuxError>;
     fn rename_session(&self, session: &SessionId, name: &str) -> Result<(), TmuxError>;
     fn rename_window(&self, window: &WindowId, name: &str) -> Result<(), TmuxError>;
@@ -164,28 +165,37 @@ impl Tmux for TmuxCli {
         }
     }
 
-    fn create_session(&self) -> Result<SessionId, TmuxError> {
+    fn create_session(&self, name: Option<&str>) -> Result<SessionId, TmuxError> {
         let socket = self.socket_options();
-        let output =
-            command::run_tmux(&socket, ["new-session", "-d", "-P", "-F", "#{session_id}"])?;
+        let mut args = vec!["new-session", "-d", "-P", "-F", "#{session_id}"];
+        if let Some(name) = name {
+            args.extend(["-s", name]);
+        }
+        let output = command::run_tmux(&socket, args)?;
 
         Self::single_line_value(&output, "new-session")
     }
 
-    fn create_window(&self, session: &SessionId) -> Result<WindowId, TmuxError> {
+    fn create_window(
+        &self,
+        session: &SessionId,
+        name: Option<&str>,
+    ) -> Result<WindowId, TmuxError> {
         let socket = self.socket_options();
         let target = format!("{session}:");
-        let output = command::run_tmux(
-            &socket,
-            [
-                "new-window",
-                "-P",
-                "-F",
-                "#{window_id}",
-                "-t",
-                target.as_str(),
-            ],
-        )?;
+        let mut args = vec![
+            "new-window",
+            "-d",
+            "-P",
+            "-F",
+            "#{window_id}",
+            "-t",
+            target.as_str(),
+        ];
+        if let Some(name) = name {
+            args.extend(["-n", name]);
+        }
+        let output = command::run_tmux(&socket, args)?;
 
         Self::single_line_value(&output, "new-window")
     }

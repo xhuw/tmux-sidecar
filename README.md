@@ -90,6 +90,12 @@ cp target/release/tmux-sidecar ~/.local/bin/
 tmux-sidecar
 ```
 
+For launcher-style behavior that exits as soon as you choose the destination:
+
+```bash
+tmux-sidecar --auto-quit
+```
+
 **Outside tmux** — tell it which client to drive:
 
 ```bash
@@ -120,8 +126,8 @@ That's it. The session tree opens full-screen and stays live.
 | Key | Action |
 |-----|--------|
 | Type | Edit the name directly |
-| `Enter` | Accept the new name |
-| `Esc` | Cancel (keeps the current/default tmux name) |
+| `Enter` | Rename the focused item, or create a new item after confirming the optional name |
+| `Esc` | Cancel the inline edit or pre-create prompt |
 | `Ctrl+u` | Clear the input |
 | `Left` / `Right` / `Home` / `End` / `Backspace` / `Delete` | Cursor editing |
 
@@ -142,6 +148,7 @@ Options:
   --socket-name <name>        Connect to a named tmux socket (-L)
   --socket-path <path>        Connect to a socket by path (-S)
   --poll-interval-ms <ms>     Live-sync interval in milliseconds (default: 500)
+  --auto-quit                 Exit immediately after selecting a session or window
   --print-snapshot            Print the session/window tree and exit (debug)
 ```
 

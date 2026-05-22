@@ -257,6 +257,36 @@ fn app_tree_rows_only_mark_target_clients_visible_window_active() {
 }
 
 #[test]
+fn focus_visible_target_moves_focus_to_target_clients_current_window() {
+    let mut app = AppState::from_tmux(TmuxState {
+        sessions: vec![
+            session(
+                "$1",
+                "work",
+                Some("@11"),
+                vec![
+                    window("@10", 0, "shell", false, WindowAlert::None),
+                    window("@11", 1, "editor", true, WindowAlert::None),
+                ],
+            ),
+            session(
+                "$2",
+                "notes",
+                Some("@20"),
+                vec![window("@20", 0, "scratch", true, WindowAlert::None)],
+            ),
+        ],
+        clients: vec![client("client-2", "$2", Some("@20"), 50)],
+    });
+    app.target_client = Some(ClientName("client-2".to_string()));
+
+    assert!(app.focus_visible_target());
+    assert_eq!(app.focus, Focus::Window("@20".to_string()));
+    assert_eq!(app.focused_row_index(), Some(5));
+    assert!(!app.focus_visible_target());
+}
+
+#[test]
 fn alert_kind_maps_tmux_flags_for_activity_bell_and_silence() {
     let mut activity = window("@1", 0, "activity", false, WindowAlert::None);
     activity.set_flags("#");

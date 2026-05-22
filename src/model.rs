@@ -174,11 +174,10 @@ pub enum Mode {
         input: InputBuffer,
     },
     CreateSessionName {
-        id: SessionId,
         input: InputBuffer,
     },
     CreateWindowName {
-        id: WindowId,
+        session_id: SessionId,
         input: InputBuffer,
     },
 }
@@ -425,6 +424,29 @@ impl AppState {
             row_index,
             focus: self.focus.clone(),
         }
+    }
+
+    pub fn focus_visible_target(&mut self) -> bool {
+        let next_focus = self
+            .tmux
+            .visible_window(self.target_client.as_ref())
+            .map(|(_, window)| Focus::Window(window.id.clone()))
+            .or_else(|| {
+                self.tmux
+                    .visible_session(self.target_client.as_ref())
+                    .map(|session| Focus::Session(session.id.clone()))
+            });
+
+        let Some(next_focus) = next_focus else {
+            return false;
+        };
+
+        if self.focus == next_focus {
+            return false;
+        }
+
+        self.focus = next_focus;
+        true
     }
 
     pub fn edit_buffer(&self) -> Option<&InputBuffer> {

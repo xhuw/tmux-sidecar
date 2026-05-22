@@ -15,7 +15,7 @@ pub fn key_hints(mode: &Mode) -> &'static str {
             "Enter accept  Esc revert  Ctrl+u clear"
         }
         Mode::CreateSessionName { .. } | Mode::CreateWindowName { .. } => {
-            "Enter accept  Esc keep default  Ctrl+u clear"
+            "Enter create  Esc cancel  Ctrl+u clear"
         }
     }
 }
