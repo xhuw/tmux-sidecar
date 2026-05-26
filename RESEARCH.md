@@ -30,6 +30,9 @@ The local development environment has tmux 3.0a. The MVP should avoid features n
 Useful tmux behavior verified against an isolated socket:
 
 - `list-sessions -F` and `list-windows -a -F` provide enough data for a session/window tree.
+- Windows may be linked into multiple sessions; alert flags and current-window state are session-local to each winlink, even when `window_id` is shared.
+- tmux 3.0a does not set `window_*_flag` or `session_alerts` for activity in a session's current window, even if that session is not the target client that sidecar is following. Sidecar must synthesize unseen activity alerts from `window_activity` for windows that are not visible to the target client.
+- If sidecar is launched inside tmux, its own hidden pane can keep redrawing after it switches the target client away, which increments that window's `window_activity`; synthetic activity alerts must ignore sidecar's own `window_id` while preserving real tmux alert flags.
 - `select-window -t <session>:<window>` works without a current tmux client and updates the active window for that session.
 - `switch-client` without a current or targeted client fails with `no current client`, so the app must resolve a target client before activation can satisfy the README's switch semantics.
 - `list-clients -F` is empty when all sessions are detached; outside-tmux activation therefore needs either an attached client, an explicit `--client`, or a documented fatal startup error.
@@ -78,7 +81,7 @@ Recommended snapshot commands use a control-character field separator supplied a
 
 ```text
 list-sessions -F "#{session_id}<US>#{session_name}<US>#{session_attached}<US>#{window_id}<US>#{session_alerts}"
-list-windows -a -F "#{session_id}<US>#{session_name}<US>#{window_id}<US>#{window_index}<US>#{window_name}<US>#{window_active}<US>#{window_flags}<US>#{window_activity_flag}<US>#{window_bell_flag}<US>#{window_silence_flag}"
+list-windows -a -F "#{session_id}<US>#{session_name}<US>#{window_id}<US>#{window_index}<US>#{window_name}<US>#{window_active}<US>#{window_activity}<US>#{window_flags}<US>#{window_activity_flag}<US>#{window_bell_flag}<US>#{window_silence_flag}"
 list-clients -F "#{client_name}<US>#{session_id}<US>#{window_id}<US>#{client_activity}<US>#{client_tty}"
 ```
 
@@ -88,7 +91,7 @@ Action commands:
 
 | Action | tmux command |
 | --- | --- |
-| Switch window | `select-window -t <window_id>` to make the window active in its session, then `switch-client -c <client> -t <session_id>`. |
+| Switch window | `select-window -t <session_id>:<window_id>` to make the selected winlink current in that session, then `switch-client -c <client> -t <session_id>`. |
 | Create window | `new-window -P -F "#{window_id}" -t <session_id>:` then switch to the created window's session. |
 | Rename window | `rename-window -t <window_id> <name>`. |
 | Create session | `new-session -d -P -F "#{session_id}"` then switch target client to it. |

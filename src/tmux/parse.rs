@@ -21,6 +21,7 @@ pub struct WindowRecord {
     pub index: u32,
     pub name: String,
     pub active: bool,
+    pub activity: u64,
     pub flags: WindowFlags,
 }
 
@@ -144,6 +145,7 @@ pub fn window_format() -> String {
         "#{window_index}",
         "#{window_name}",
         "#{window_active}",
+        "#{window_activity}",
         "#{window_flags}",
         "#{window_activity_flag}",
         "#{window_bell_flag}",
@@ -213,11 +215,12 @@ fn parse_window_line(line: &str) -> Result<WindowRecord, ParseError> {
         index,
         name,
         active,
+        activity,
         flags,
         activity_flag,
         bell_flag,
         silence_flag,
-    ] = expect_fields::<10>("window", fields, line)?;
+    ] = expect_fields::<11>("window", fields, line)?;
 
     Ok(WindowRecord {
         session_id: required("session_id", session_id)?,
@@ -226,6 +229,7 @@ fn parse_window_line(line: &str) -> Result<WindowRecord, ParseError> {
         index: parse_u32("window_index", index)?,
         name: name.to_owned(),
         active: parse_bool("window_active", active)?,
+        activity: parse_u64("window_activity", activity)?,
         flags: WindowFlags::from_parts(
             flags.to_owned(),
             parse_bool("window_activity_flag", activity_flag)?,
@@ -389,7 +393,7 @@ mod tests {
     #[test]
     fn parses_windows_and_alert_flags() {
         let raw = format!(
-            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}1{sep}*{sep}1{sep}1{sep}0\n",
+            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}1{sep}42{sep}*{sep}1{sep}1{sep}0\n",
             sep = FIELD_SEPARATOR
         );
 
@@ -399,6 +403,7 @@ mod tests {
         assert_eq!(windows[0].id, "@9");
         assert_eq!(windows[0].index, 4);
         assert!(windows[0].active);
+        assert_eq!(windows[0].activity, 42);
         assert!(windows[0].flags.alerts.has_activity);
         assert!(windows[0].flags.alerts.has_bell);
         assert!(windows[0].flags.has_alert());
@@ -407,7 +412,7 @@ mod tests {
     #[test]
     fn rejects_window_with_non_boolean_active_value() {
         let raw = format!(
-            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}yes{sep}*{sep}0{sep}0{sep}0\n",
+            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}yes{sep}42{sep}*{sep}0{sep}0{sep}0\n",
             sep = FIELD_SEPARATOR
         );
 

@@ -122,10 +122,6 @@ impl TreeView {
                 Span::styled(" ", theme.marker_idle())
             });
             spans.push(Span::raw(" "));
-            if let Some(label) = jump_labels.get(&row.focus) {
-                spans.push(Span::styled(format!("[{label}]"), theme.jump_label()));
-                spans.push(Span::raw(" "));
-            }
 
             let branch = match &row.kind {
                 TreeRowKind::Window { .. } => Some(glyphs.tree_branch),
@@ -137,9 +133,9 @@ impl TreeView {
                 spans.push(Span::raw(" "));
             }
 
-            if is_inline_edit {
+            let mut content_spans = if is_inline_edit {
                 let edit = inline_edit.as_ref().expect("inline edit must exist");
-                spans.extend(inline_label(
+                inline_label(
                     &row.kind,
                     edit,
                     glyphs,
@@ -149,10 +145,14 @@ impl TreeView {
                         row_style
                     },
                     theme,
-                ));
+                )
             } else {
-                spans.extend(label_spans(&row.kind, glyphs, row_style, theme));
+                label_spans(&row.kind, glyphs, row_style, theme)
+            };
+            if let Some(label) = jump_labels.get(&row.focus) {
+                content_spans = overlay_jump_label(content_spans, *label, theme);
             }
+            spans.extend(content_spans);
 
             let mut badges = Vec::new();
             if row.active() {
@@ -190,8 +190,13 @@ fn inline_edit_target(mode: &Mode) -> Option<InlineEdit<'_>> {
             input,
             create: false,
         }),
-        Mode::RenameWindow { id, input, .. } => Some(InlineEdit {
-            focus: Focus::Window(id.clone()),
+        Mode::RenameWindow {
+            session_id,
+            id,
+            input,
+            ..
+        } => Some(InlineEdit {
+            focus: Focus::window(session_id.clone(), id.clone()),
             input,
             create: false,
         }),
@@ -287,6 +292,65 @@ fn alert_label(alert: WindowAlert) -> &'static str {
     }
 }
 
+fn overlay_jump_label(spans: Vec<Span<'static>>, label: char, theme: Theme) -> Vec<Span<'static>> {
+    overlay_jump_label_with(spans, label, theme, char::is_alphanumeric).unwrap_or_else(|spans| {
+        overlay_jump_label_with(spans, label, theme, |ch| !ch.is_whitespace()).unwrap_or_else(
+            |mut spans| {
+                spans.insert(0, Span::styled(label.to_string(), theme.jump_label()));
+                spans
+            },
+        )
+    })
+}
+
+fn overlay_jump_label_with(
+    spans: Vec<Span<'static>>,
+    label: char,
+    theme: Theme,
+    predicate: impl Fn(char) -> bool,
+) -> Result<Vec<Span<'static>>, Vec<Span<'static>>> {
+    let mut rendered = Vec::with_capacity(spans.len() + 2);
+    let mut replaced = false;
+
+    for span in spans {
+        let style = span.style;
+        let content = span.content.into_owned();
+
+        if !replaced {
+            if let Some(start) = content
+                .char_indices()
+                .find_map(|(index, ch)| if predicate(ch) { Some(index) } else { None })
+            {
+                let matched = content[start..]
+                    .chars()
+                    .next()
+                    .expect("matched character must exist");
+                let end = start + matched.len_utf8();
+                let before = &content[..start];
+                let after = &content[end..];
+
+                if !before.is_empty() {
+                    rendered.push(Span::styled(before.to_string(), style));
+                }
+                rendered.push(Span::styled(label.to_string(), theme.jump_label()));
+                if !after.is_empty() {
+                    rendered.push(Span::styled(after.to_string(), style));
+                }
+                replaced = true;
+                continue;
+            }
+        }
+
+        rendered.push(Span::styled(content, style));
+    }
+
+    if replaced {
+        Ok(rendered)
+    } else {
+        Err(rendered)
+    }
+}
+
 fn env_truthy(name: &str) -> bool {
     match env::var(name) {
         Ok(value) => matches!(
@@ -294,5 +358,27 @@ fn env_truthy(name: &str) -> bool {
             "1" | "true" | "yes" | "on"
         ),
         Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::text::Span;
+
+    use super::{Theme, overlay_jump_label};
+
+    #[test]
+    fn jump_label_overlays_first_text_character_instead_of_prefixing_the_row() {
+        let rendered = overlay_jump_label(
+            vec![Span::raw("[+]"), Span::raw(" new session")],
+            'a',
+            Theme::default(),
+        );
+        let text: String = rendered
+            .into_iter()
+            .map(|span| span.content.into_owned())
+            .collect();
+
+        assert_eq!(text, "[+] aew session");
     }
 }

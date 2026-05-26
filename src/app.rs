@@ -125,6 +125,10 @@ impl App {
         let target_client = self.tmux.check_startup(self.cli.target_client.as_deref())?;
 
         self.state.target_client = Some(target_client);
+        self.state.seen_activity = self.tmux.load_seen_activity()?;
+        if let Some(window_id) = self.tmux.sidecar_window_id_from_tmux_pane() {
+            self.state.ignored_activity_window_ids.insert(window_id);
+        }
         self.refresh_snapshot()?;
         self.state.focus_visible_target();
         Ok(())
@@ -162,6 +166,7 @@ impl App {
     fn refresh_snapshot(&mut self) -> Result<()> {
         let snapshot = self.tmux.snapshot()?;
         self.apply_snapshot(snapshot);
+        self.tmux.save_seen_activity(&self.state.seen_activity)?;
         self.state.next_poll_at = Some(Instant::now() + self.poll_interval);
         Ok(())
     }
@@ -382,11 +387,20 @@ impl App {
                 };
                 self.switch_to_target(client, WindowTarget::Session(session_id))
             }
-            Focus::Window(window_id) => {
+            Focus::Window {
+                session_id,
+                window_id,
+            } => {
                 let Some(client) = self.state.target_client.clone() else {
                     return Ok(());
                 };
-                self.switch_to_target(client, WindowTarget::Window(window_id))
+                self.switch_to_target(
+                    client,
+                    WindowTarget::Window {
+                        session_id,
+                        window_id,
+                    },
+                )
             }
             Focus::CreateSession => self.begin_create_session_naming(),
             Focus::CreateWindow(session_id) => self.begin_create_window_naming(session_id),
@@ -432,7 +446,7 @@ impl App {
     }
 
     fn close_focused_window(&mut self) -> Result<()> {
-        let Focus::Window(window_id) = self.state.focus.clone() else {
+        let Focus::Window { window_id, .. } = self.state.focus.clone() else {
             return Ok(());
         };
 
@@ -456,13 +470,17 @@ impl App {
                     input: InputBuffer::from_text(name),
                 };
             }
-            Focus::Window(id) => {
-                let Some(name) = self.window_name(&id) else {
+            Focus::Window {
+                session_id,
+                window_id,
+            } => {
+                let Some(name) = self.window_name(&session_id, &window_id) else {
                     return;
                 };
 
                 self.state.mode = Mode::RenameWindow {
-                    id,
+                    session_id,
+                    id: window_id,
                     original_name: name.clone(),
                     input: InputBuffer::from_text(name),
                 };
@@ -474,7 +492,7 @@ impl App {
     fn focused_session_id_for_new_window(&self) -> Option<String> {
         match self.state.focus.clone() {
             Focus::Session(session_id) | Focus::CreateWindow(session_id) => Some(session_id),
-            Focus::Window(window_id) => self.window_session_id(&window_id),
+            Focus::Window { session_id, .. } => Some(session_id),
             Focus::CreateSession => self
                 .state
                 .tmux
@@ -498,7 +516,12 @@ impl App {
                 self.refresh_snapshot()?;
                 self.state.focus = Focus::Session(id);
             }
-            Mode::RenameWindow { id, input, .. } => {
+            Mode::RenameWindow {
+                session_id,
+                id,
+                input,
+                ..
+            } => {
                 let Some(()) =
                     self.try_tmux_action(|tmux| tmux.rename_window(&id, input.as_str()))?
                 else {
@@ -506,7 +529,7 @@ impl App {
                 };
 
                 self.refresh_snapshot()?;
-                self.state.focus = Focus::Window(id);
+                self.state.focus = Focus::window(session_id, id);
             }
             Mode::CreateSessionName { input } => {
                 let Some(client) = self.state.target_client.clone() else {
@@ -534,9 +557,15 @@ impl App {
                     return Ok(());
                 };
 
-                self.switch_to_target(client, WindowTarget::Window(window_id.clone()))?;
+                self.switch_to_target(
+                    client,
+                    WindowTarget::Window {
+                        session_id: session_id.clone(),
+                        window_id: window_id.clone(),
+                    },
+                )?;
                 if !self.should_quit {
-                    self.state.focus = Focus::Window(window_id);
+                    self.state.focus = Focus::window(session_id, window_id);
                 }
             }
             Mode::Normal | Mode::Help => {}
@@ -554,23 +583,14 @@ impl App {
             .map(|session| session.name.clone())
     }
 
-    fn window_name(&self, id: &str) -> Option<String> {
+    fn window_name(&self, session_id: &str, id: &str) -> Option<String> {
         self.state
             .tmux
             .sessions
             .iter()
-            .flat_map(|session| session.windows.iter())
-            .find(|window| window.id == id)
+            .find(|session| session.id == session_id)
+            .and_then(|session| session.windows.iter().find(|window| window.id == id))
             .map(|window| window.name.clone())
-    }
-
-    fn window_session_id(&self, id: &str) -> Option<String> {
-        self.state
-            .tmux
-            .sessions
-            .iter()
-            .find(|session| session.windows.iter().any(|window| window.id == id))
-            .map(|session| session.id.clone())
     }
 
     fn try_tmux_action<T>(

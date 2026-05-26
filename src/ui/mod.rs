@@ -209,16 +209,17 @@ mod tests {
 
         let output = render_ascii(&state, 96, 16);
 
-        assert!(output.contains("[a] work"));
-        assert!(output.contains("  [s] |-- 0 shell"));
+        assert!(output.contains("aork (1 attached)"));
+        assert!(output.contains("|-- s shell"));
         assert!(output.contains("Jump: type label to switch  invalid key cancels"));
     }
 
     #[test]
     fn inline_edit_snapshot_shows_cursor_and_footer_hints() {
         let mut state = sample_state();
-        state.focus = Focus::Window("@11".to_string());
+        state.focus = Focus::window("$1", "@11");
         state.mode = Mode::RenameWindow {
+            session_id: "$1".to_string(),
             id: "@11".to_string(),
             original_name: "editor".to_string(),
             input: InputBuffer::from_text("editor"),
@@ -259,7 +260,7 @@ mod tests {
     #[test]
     fn alerted_window_snapshot_shows_active_and_alert_badges_together() {
         let mut state = sample_state();
-        state.focus = Focus::Window("@11".to_string());
+        state.focus = Focus::window("$1", "@11");
 
         let output = render_ascii(&state, 96, 16);
         let alert_line = output
@@ -286,6 +287,7 @@ mod tests {
                 active: true,
                 flags: String::new(),
                 alert: WindowAlert::None,
+                activity: 0,
             }],
         });
         state.tmux.clients = vec![Client {
@@ -358,6 +360,7 @@ mod tests {
                             active: false,
                             flags: String::new(),
                             alert: WindowAlert::None,
+                            activity: 0,
                         },
                         Window {
                             id: "@11".to_string(),
@@ -366,6 +369,7 @@ mod tests {
                             active: true,
                             flags: "*!".to_string(),
                             alert: WindowAlert::Bell,
+                            activity: 0,
                         },
                     ],
                 }],

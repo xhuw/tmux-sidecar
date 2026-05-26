@@ -2,11 +2,11 @@ pub mod command;
 pub mod parse;
 pub mod snapshot;
 
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf};
 
 use thiserror::Error;
 
-use crate::model::{ClientName, SessionId, TmuxState, WindowId, WindowTarget};
+use crate::model::{ClientName, Focus, SessionId, TmuxState, WindowId, WindowTarget};
 
 use self::command::SocketOptions;
 
@@ -30,6 +30,8 @@ pub enum TmuxError {
     EmptyValue { command: &'static str },
     #[error("snapshot data mismatch: {0}")]
     SnapshotInvariant(String),
+    #[error("invalid sidecar activity cache entry: {0}")]
+    InvalidActivityCache(String),
 }
 
 pub trait Tmux {
@@ -51,6 +53,8 @@ pub struct TmuxCli {
 }
 
 impl TmuxCli {
+    const SEEN_ACTIVITY_OPTION: &'static str = "@tmux-sidecar-seen-activity";
+
     pub fn check_startup(&self, cli_override: Option<&str>) -> Result<ClientName, TmuxError> {
         self.ensure_tmux_exists()?;
         let snapshot = self.snapshot()?;
@@ -78,17 +82,34 @@ impl TmuxCli {
         }
 
         let socket = self.socket_options();
-        let output = command::run_tmux(
-            &socket,
-            ["display-message", "-p", "-t", &pane, "#{client_name}"],
-        )
-        .ok()?;
-        let name = output.trim();
-        if name.is_empty() {
+        self.display_pane_format(&socket, &pane, "#{client_name}")
+            .map(ClientName)
+    }
+
+    pub fn sidecar_window_id_from_tmux_pane(&self) -> Option<WindowId> {
+        let pane = std::env::var("TMUX_PANE").ok()?;
+        if pane.is_empty() {
             return None;
         }
 
-        Some(ClientName(name.to_owned()))
+        let socket = self.socket_options();
+        self.display_pane_format(&socket, &pane, "#{window_id}")
+    }
+
+    fn display_pane_format(
+        &self,
+        socket: &SocketOptions,
+        pane: &str,
+        format: &'static str,
+    ) -> Option<String> {
+        let output =
+            command::run_tmux(socket, ["display-message", "-p", "-t", pane, format]).ok()?;
+        let value = output.trim();
+        if value.is_empty() {
+            return None;
+        }
+
+        Some(value.to_owned())
     }
 
     fn single_line_value(output: &str, command: &'static str) -> Result<String, TmuxError> {
@@ -99,6 +120,30 @@ impl TmuxCli {
         }
 
         Ok(value.to_owned())
+    }
+
+    pub fn load_seen_activity(&self) -> Result<HashMap<Focus, u64>, TmuxError> {
+        let socket = self.socket_options();
+        let output = command::run_tmux(
+            &socket,
+            ["show-options", "-gqv", Self::SEEN_ACTIVITY_OPTION],
+        )?;
+        parse_seen_activity(output.trim())
+    }
+
+    pub fn save_seen_activity(&self, seen_activity: &HashMap<Focus, u64>) -> Result<(), TmuxError> {
+        let socket = self.socket_options();
+        let value = format_seen_activity(seen_activity);
+        command::run_tmux(
+            &socket,
+            [
+                "set-option",
+                "-gq",
+                Self::SEEN_ACTIVITY_OPTION,
+                value.as_str(),
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -149,7 +194,12 @@ impl Tmux for TmuxCli {
                 )?;
                 Ok(())
             }
-            WindowTarget::Window(window_id) => {
+            WindowTarget::Window {
+                session_id,
+                window_id,
+            } => {
+                let target = format!("{session_id}:{window_id}");
+                command::run_tmux(&socket, ["select-window", "-t", target.as_str()])?;
                 command::run_tmux(
                     &socket,
                     [
@@ -157,7 +207,7 @@ impl Tmux for TmuxCli {
                         "-c",
                         client.0.as_str(),
                         "-t",
-                        window_id.as_str(),
+                        session_id.as_str(),
                     ],
                 )?;
                 Ok(())
@@ -216,5 +266,81 @@ impl Tmux for TmuxCli {
         let socket = self.socket_options();
         command::run_tmux(&socket, ["rename-window", "-t", window.as_str(), name])?;
         Ok(())
+    }
+}
+
+fn parse_seen_activity(raw: &str) -> Result<HashMap<Focus, u64>, TmuxError> {
+    let mut values = HashMap::new();
+    if raw.is_empty() {
+        return Ok(values);
+    }
+
+    for entry in raw.split(',').filter(|entry| !entry.is_empty()) {
+        let mut parts = entry.split(':');
+        let session_id = parts.next();
+        let window_id = parts.next();
+        let activity = parts.next();
+        if session_id.is_none()
+            || window_id.is_none()
+            || activity.is_none()
+            || parts.next().is_some()
+        {
+            return Err(TmuxError::InvalidActivityCache(entry.to_owned()));
+        }
+
+        let activity = activity
+            .expect("activity presence checked")
+            .parse()
+            .map_err(|_| TmuxError::InvalidActivityCache(entry.to_owned()))?;
+        values.insert(
+            Focus::window(
+                session_id.expect("session presence checked"),
+                window_id.expect("window presence checked"),
+            ),
+            activity,
+        );
+    }
+
+    Ok(values)
+}
+
+fn format_seen_activity(seen_activity: &HashMap<Focus, u64>) -> String {
+    let mut entries: Vec<_> = seen_activity
+        .iter()
+        .filter_map(|(focus, activity)| match focus {
+            Focus::Window {
+                session_id,
+                window_id,
+            } => Some(format!("{session_id}:{window_id}:{activity}")),
+            Focus::CreateSession | Focus::Session(_) | Focus::CreateWindow(_) => None,
+        })
+        .collect();
+    entries.sort();
+    entries.join(",")
+}
+
+#[cfg(test)]
+mod activity_cache_tests {
+    use super::{format_seen_activity, parse_seen_activity};
+    use crate::model::Focus;
+
+    #[test]
+    fn activity_cache_round_trips_session_local_window_activity() {
+        let mut values = std::collections::HashMap::new();
+        values.insert(Focus::window("$2", "@9"), 42);
+        values.insert(Focus::window("$1", "@1"), 7);
+
+        let raw = format_seen_activity(&values);
+        assert_eq!(raw, "$1:@1:7,$2:@9:42");
+        assert_eq!(
+            parse_seen_activity(&raw).expect("cache should parse"),
+            values
+        );
+    }
+
+    #[test]
+    fn activity_cache_rejects_malformed_entries() {
+        assert!(parse_seen_activity("$1:@1:not-a-number").is_err());
+        assert!(parse_seen_activity("$1:@1:1:extra").is_err());
     }
 }

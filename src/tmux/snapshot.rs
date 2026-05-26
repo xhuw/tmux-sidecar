@@ -31,6 +31,7 @@ pub struct SnapshotWindow {
     pub index: u32,
     pub name: String,
     pub active: bool,
+    pub activity: u64,
     pub flags: WindowFlags,
     pub alert_flags: AlertFlags,
 }
@@ -64,6 +65,7 @@ impl SnapshotData {
                                     window.alert_flags.has_silence,
                                 ),
                                 flags,
+                                activity: window.activity,
                             }
                         })
                         .collect(),
@@ -160,6 +162,7 @@ pub fn collect_snapshot_data(socket: &SocketOptions) -> Result<SnapshotData, Tmu
             index: window.index,
             name: window.name,
             active: window.active,
+            activity: window.activity,
             flags: window.flags,
             alert_flags,
         });

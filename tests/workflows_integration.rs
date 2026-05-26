@@ -198,6 +198,10 @@ fn type_text(app: &mut App, text: &str) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+fn window_focus(session_id: &str, window_id: &str) -> Focus {
+    Focus::window(session_id, window_id)
+}
+
 #[test]
 #[serial]
 fn snapshot_tracks_target_client_visible_window_for_active_rows()
@@ -254,7 +258,7 @@ fn snapshot_tracks_target_client_visible_window_for_active_rows()
         .ok_or("missing it-main session row")?;
     let main_window = rows
         .iter()
-        .find(|row| row.focus == Focus::Window(main_window_id.clone()))
+        .find(|row| row.focus == window_focus(&main_session_id, &main_window_id))
         .ok_or("missing it-main window row")?;
     let second_session = rows
         .iter()
@@ -262,7 +266,7 @@ fn snapshot_tracks_target_client_visible_window_for_active_rows()
         .ok_or("missing it-second session row")?;
     let second_window = rows
         .iter()
-        .find(|row| row.focus == Focus::Window(second_window_id.clone()))
+        .find(|row| row.focus == window_focus(&second_session_id, &second_window_id))
         .ok_or("missing it-second window row")?;
 
     assert!(!main_session.active());
@@ -283,9 +287,13 @@ fn startup_focuses_target_clients_active_window() -> Result<(), Box<dyn std::err
 
     let server = IsolatedServer::start()?;
     let app = server.app()?;
+    let focused_session_id = server.client_session_id()?;
     let focused_window_id = server.client_window_id()?;
 
-    assert_eq!(app.state().focus, Focus::Window(focused_window_id));
+    assert_eq!(
+        app.state().focus,
+        window_focus(&focused_session_id, &focused_window_id)
+    );
 
     Ok(())
 }
@@ -491,7 +499,7 @@ fn auto_quit_exits_after_keyboard_and_mouse_window_selection()
         .ok_or("missing it-extra window")?;
 
     let mut keyboard_app = server.app_with_auto_quit(true)?;
-    keyboard_app.state_mut().focus = Focus::Window(extra_window_id.clone());
+    keyboard_app.state_mut().focus = window_focus(&main_session.id, &extra_window_id);
     keyboard_app.on_key_event(key(KeyCode::Enter))?;
     assert_eq!(server.client_window_id()?, extra_window_id);
     assert!(keyboard_app.should_quit());
@@ -500,7 +508,7 @@ fn auto_quit_exits_after_keyboard_and_mouse_window_selection()
     let rows = mouse_app.state().tree_rows();
     let row_index = rows
         .iter()
-        .position(|row| row.focus == Focus::Window(main_window_id.clone()))
+        .position(|row| row.focus == window_focus(&main_session.id, &main_window_id))
         .ok_or("missing row for it-win")?;
     let row = TREE_START_ROW + u16::try_from(row_index)?;
     mouse_app.on_mouse_event(mouse_left(row))?;
@@ -595,7 +603,7 @@ fn navigation_hotkeys_start_expected_flows_from_focused_context()
         .map(|window| window.id.clone())
         .ok_or("missing it-second window")?;
 
-    app.state_mut().focus = Focus::Window(second_window_id);
+    app.state_mut().focus = window_focus(&second_session_id, &second_window_id);
     app.on_key_event(key(KeyCode::Char('s')))?;
     assert_eq!(app.state().focus, Focus::CreateSession);
     assert!(matches!(app.state().mode, Mode::CreateSessionName { .. }));
@@ -624,8 +632,9 @@ fn navigation_hotkeys_start_expected_flows_from_focused_context()
     );
     app.on_key_event(key(KeyCode::Esc))?;
 
-    app.state_mut().focus = Focus::Window(
-        second_session
+    app.state_mut().focus = window_focus(
+        &second_session_id,
+        &second_session
             .windows
             .first()
             .map(|window| window.id.clone())
@@ -646,8 +655,9 @@ fn navigation_hotkeys_start_expected_flows_from_focused_context()
     );
 
     app.on_key_event(key(KeyCode::Esc))?;
-    app.state_mut().focus = Focus::Window(
-        second_session
+    app.state_mut().focus = window_focus(
+        &second_session_id,
+        &second_session
             .windows
             .first()
             .map(|window| window.id.clone())
@@ -697,9 +707,12 @@ fn gg_g_and_flash_jump_follow_visible_rows_and_auto_quit() -> Result<(), Box<dyn
         .ok_or("missing it-extra window")?;
 
     let mut app = server.app()?;
-    app.state_mut().focus = Focus::Window(extra_window_id.clone());
+    app.state_mut().focus = window_focus(&main_session.id, &extra_window_id);
     app.on_key_event(key(KeyCode::Char('g')))?;
-    assert_eq!(app.state().focus, Focus::Window(extra_window_id.clone()));
+    assert_eq!(
+        app.state().focus,
+        window_focus(&main_session.id, &extra_window_id)
+    );
     app.on_key_event(key(KeyCode::Char('g')))?;
     assert_eq!(app.state().focus, Focus::Session(main_session.id.clone()));
 
@@ -712,7 +725,7 @@ fn gg_g_and_flash_jump_follow_visible_rows_and_auto_quit() -> Result<(), Box<dyn
     let jump_targets = auto_quit_app.state().jump_targets();
     let jump_label = jump_targets
         .iter()
-        .find(|target| target.focus == Focus::Window(main_window_id.clone()))
+        .find(|target| target.focus == window_focus(&main_session.id, &main_window_id))
         .map(|target| target.label)
         .ok_or("missing jump label for it-win")?;
     auto_quit_app.on_key_event(key(KeyCode::Char(jump_label)))?;
@@ -914,12 +927,15 @@ fn closes_focused_window_with_x_without_confirmation() -> Result<(), Box<dyn std
         .ok_or("missing it-extra window")?;
     let initial_window_count = main_session.windows.len();
 
-    app.state_mut().focus = Focus::Window(doomed_window_id.clone());
+    app.state_mut().focus = window_focus(&main_session.id, &doomed_window_id);
     app.on_key_event(key(KeyCode::Char('x')))?;
 
     assert_eq!(app.state().mode, Mode::Normal);
     assert!(app.state().last_error.is_none());
-    assert_ne!(app.state().focus, Focus::Window(doomed_window_id.clone()));
+    assert_ne!(
+        app.state().focus,
+        window_focus(&main_session.id, &doomed_window_id)
+    );
     assert!(
         app.state()
             .tree_rows()
@@ -984,7 +1000,7 @@ fn renames_with_r_and_refreshes_on_failed_rename() -> Result<(), Box<dyn std::er
         .map(|session| session.name);
     assert_eq!(renamed_session.as_deref(), Some("renamed-main"));
 
-    app.state_mut().focus = Focus::Window(doomed_window_id.clone());
+    app.state_mut().focus = window_focus(&main_session_id, &doomed_window_id);
     app.on_key_event(key(KeyCode::Char('r')))?;
     run_tmux(
         &server.socket_name,
