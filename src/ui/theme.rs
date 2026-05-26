@@ -77,6 +77,12 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    pub fn jump_label(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    }
+
     pub fn badge_active(self) -> Style {
         Style::default()
             .fg(self.active)
@@ -144,6 +150,12 @@ mod tests {
         assert_eq!(theme.row_focused(), bold);
         assert_eq!(theme.modal(), reversed);
         assert_eq!(theme.marker_focus(), bold);
+        assert_eq!(
+            theme.jump_label(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        );
         assert_eq!(
             theme.row_inline_edit_focused(),
             Style::default()

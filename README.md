@@ -37,7 +37,7 @@ Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequ
   └─  new window
    new session
 ────────────────────────────────────────────────────────────────
-Enter switch/create  r rename  x close window  ? help  q quit
+Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x close  ? help  q quit
 ```
 
 > Nerd Font glyphs shown above. An ASCII fallback mode is available for any monospace font.
@@ -115,7 +115,11 @@ That's it. The session tree opens full-screen and stays live.
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` or `k` / `j` | Move focus up/down the tree |
+| `gg` / `G` | Jump to the first / last visible row |
 | `Enter` | Switch to focused session/window, or create from a `[+]` row |
+| `s` | Start the new-session inline create flow |
+| `S` | Show jump labels for visible rows, then switch immediately after choosing one |
+| `c` | Start the new-window inline create flow for the focused session, or for the focused window's session |
 | `r` | Rename the focused session or window (inline, no prompts) |
 | `x` | Close the focused window immediately |
 | `?` | Open/close the help modal |

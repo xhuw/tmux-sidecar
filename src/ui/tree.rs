@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use std::env;
 
 use ratatui::{
@@ -84,6 +86,11 @@ impl TreeView {
         let rows = state.tree_rows();
         let focused = state.focused_row_index();
         let inline_edit = inline_edit_target(&state.mode);
+        let jump_labels: HashMap<_, _> = state
+            .jump_targets()
+            .into_iter()
+            .map(|target| (target.focus, target.label))
+            .collect();
         let mut lines = Vec::with_capacity(rows.len());
 
         for (index, row) in rows.iter().enumerate() {
@@ -115,6 +122,10 @@ impl TreeView {
                 Span::styled(" ", theme.marker_idle())
             });
             spans.push(Span::raw(" "));
+            if let Some(label) = jump_labels.get(&row.focus) {
+                spans.push(Span::styled(format!("[{label}]"), theme.jump_label()));
+                spans.push(Span::raw(" "));
+            }
 
             let branch = match &row.kind {
                 TreeRowKind::Window { .. } => Some(glyphs.tree_branch),

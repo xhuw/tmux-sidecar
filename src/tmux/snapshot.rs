@@ -5,7 +5,7 @@ use crate::model::{Client, ClientName, Session, TmuxState, Window, WindowAlert};
 use super::{
     TmuxError,
     command::{self, SocketOptions},
-    parse::{self, ClientRecord, WindowFlags},
+    parse::{self, AlertFlags, ClientRecord, WindowFlags},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -21,6 +21,7 @@ pub struct SnapshotSession {
     pub attached_count: u32,
     pub active_window_id: Option<String>,
     pub attached_clients: Vec<ClientName>,
+    pub alerts_by_index: HashMap<u32, AlertFlags>,
     pub windows: Vec<SnapshotWindow>,
 }
 
@@ -31,6 +32,7 @@ pub struct SnapshotWindow {
     pub name: String,
     pub active: bool,
     pub flags: WindowFlags,
+    pub alert_flags: AlertFlags,
 }
 
 impl SnapshotData {
@@ -56,7 +58,11 @@ impl SnapshotData {
                                 index: window.index,
                                 name: window.name,
                                 active: window.active,
-                                alert: WindowAlert::from_flags(&flags),
+                                alert: WindowAlert::from_indicators(
+                                    window.alert_flags.has_activity,
+                                    window.alert_flags.has_bell,
+                                    window.alert_flags.has_silence,
+                                ),
                                 flags,
                             }
                         })
@@ -115,6 +121,11 @@ pub fn collect_snapshot_data(socket: &SocketOptions) -> Result<SnapshotData, Tmu
             attached_count: session.attached_count,
             active_window_id: session.active_window_id.clone(),
             attached_clients: Vec::new(),
+            alerts_by_index: session
+                .alerts
+                .iter()
+                .map(|alert| (alert.window_index, alert.flags))
+                .collect(),
             windows: Vec::new(),
         })
         .collect();
@@ -142,12 +153,15 @@ pub fn collect_snapshot_data(socket: &SocketOptions) -> Result<SnapshotData, Tmu
             session.active_window_id = Some(window.id.clone());
         }
 
+        let alert_flags =
+            resolve_window_alerts(&window.flags, &session.alerts_by_index, window.index);
         session.windows.push(SnapshotWindow {
             id: window.id,
             index: window.index,
             name: window.name,
             active: window.active,
             flags: window.flags,
+            alert_flags,
         });
     }
 
@@ -171,10 +185,63 @@ pub fn collect_snapshot_data(socket: &SocketOptions) -> Result<SnapshotData, Tmu
     Ok(SnapshotData { sessions, clients })
 }
 
+fn resolve_window_alerts(
+    window_flags: &WindowFlags,
+    session_alerts: &HashMap<u32, AlertFlags>,
+    window_index: u32,
+) -> AlertFlags {
+    window_flags.alerts.merge(
+        session_alerts
+            .get(&window_index)
+            .copied()
+            .unwrap_or_default(),
+    )
+}
+
 pub fn list_clients(socket: &SocketOptions) -> Result<Vec<ClientRecord>, TmuxError> {
     let output = command::run_tmux(socket, ["list-clients", "-F", &parse::client_format()])?;
     parse::parse_clients(&output).map_err(|source| TmuxError::Parse {
         command: "list-clients",
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::resolve_window_alerts;
+    use crate::tmux::parse::{AlertFlags, WindowFlags};
+
+    #[test]
+    fn resolve_window_alerts_keeps_explicit_window_alert_flags() {
+        let alerts = resolve_window_alerts(
+            &WindowFlags::from_parts(String::from("*"), true, false, false),
+            &HashMap::new(),
+            1,
+        );
+
+        assert!(alerts.has_activity);
+    }
+
+    #[test]
+    fn resolve_window_alerts_uses_session_alerts_as_fallback() {
+        let mut session_alerts = HashMap::new();
+        session_alerts.insert(
+            3,
+            AlertFlags {
+                has_activity: false,
+                has_bell: true,
+                has_silence: false,
+            },
+        );
+
+        let alerts = resolve_window_alerts(
+            &WindowFlags::from_parts(String::new(), false, false, false),
+            &session_alerts,
+            3,
+        );
+
+        assert!(alerts.has_bell);
+    }
 }

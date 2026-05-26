@@ -187,28 +187,95 @@ impl App {
             return self.handle_edit_key(key);
         }
 
+        if self.state.navigation.jumping {
+            return self.handle_jump_key(key);
+        }
+
+        if self.state.navigation.pending_g {
+            return self.handle_pending_g_key(key);
+        }
+
+        self.handle_normal_key(key)
+    }
+
+    fn handle_normal_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
             KeyCode::Char('?') => self.state.mode = Mode::Help,
+            KeyCode::Char('g') => {
+                self.state.start_g_prefix();
+            }
+            KeyCode::Char('G') => {
+                self.state.clear_navigation();
+                self.state.focus_last_row();
+            }
+            KeyCode::Char('s') => {
+                self.state.clear_navigation();
+                self.begin_create_session_naming()?;
+            }
+            KeyCode::Char('S') => {
+                self.state.start_jump();
+            }
+            KeyCode::Char('c') => {
+                self.state.clear_navigation();
+                self.begin_create_window_from_focus()?;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
+                self.state.clear_navigation();
                 self.move_focus(FocusMove::Up);
             }
             KeyCode::Down | KeyCode::Char('j') => {
+                self.state.clear_navigation();
                 self.move_focus(FocusMove::Down);
             }
             KeyCode::Char('x') => {
+                self.state.clear_navigation();
                 self.close_focused_window()?;
             }
             KeyCode::Char('r') => {
+                self.state.clear_navigation();
                 self.start_rename();
             }
             KeyCode::Enter => {
+                self.state.clear_navigation();
                 self.activate_focused_target()?;
             }
-            _ => {}
+            _ => {
+                self.state.clear_navigation();
+            }
+        }
+
+        Ok(())
+    }
+
+    fn handle_pending_g_key(&mut self, key: KeyEvent) -> Result<()> {
+        self.state.clear_g_prefix();
+
+        match key.code {
+            KeyCode::Char('g') => {
+                self.state.focus_first_row();
+                Ok(())
+            }
+            _ => self.handle_normal_key(key),
+        }
+    }
+
+    fn handle_jump_key(&mut self, key: KeyEvent) -> Result<()> {
+        let selected = match key.code {
+            KeyCode::Esc => {
+                self.state.cancel_jump();
+                return Ok(());
+            }
+            KeyCode::Char(label) => self.state.focus_jump_label(label),
+            _ => false,
+        };
+
+        self.state.cancel_jump();
+        if selected {
+            self.activate_focused_target()?;
         }
 
         Ok(())
@@ -267,6 +334,11 @@ impl App {
 
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.state.mode != Mode::Normal {
+            return Ok(());
+        }
+
+        self.state.clear_g_prefix();
+        if self.state.navigation.jumping {
             return Ok(());
         }
 
@@ -335,6 +407,7 @@ impl App {
     }
 
     fn begin_create_session_naming(&mut self) -> Result<()> {
+        self.state.focus = Focus::CreateSession;
         self.state.mode = Mode::CreateSessionName {
             input: InputBuffer::new(),
         };
@@ -342,11 +415,20 @@ impl App {
     }
 
     fn begin_create_window_naming(&mut self, session_id: String) -> Result<()> {
+        self.state.focus = Focus::CreateWindow(session_id.clone());
         self.state.mode = Mode::CreateWindowName {
             session_id,
             input: InputBuffer::new(),
         };
         Ok(())
+    }
+
+    fn begin_create_window_from_focus(&mut self) -> Result<()> {
+        let Some(session_id) = self.focused_session_id_for_new_window() else {
+            return Ok(());
+        };
+
+        self.begin_create_window_naming(session_id)
     }
 
     fn close_focused_window(&mut self) -> Result<()> {
@@ -386,6 +468,18 @@ impl App {
                 };
             }
             Focus::CreateSession | Focus::CreateWindow(_) => {}
+        }
+    }
+
+    fn focused_session_id_for_new_window(&self) -> Option<String> {
+        match self.state.focus.clone() {
+            Focus::Session(session_id) | Focus::CreateWindow(session_id) => Some(session_id),
+            Focus::Window(window_id) => self.window_session_id(&window_id),
+            Focus::CreateSession => self
+                .state
+                .tmux
+                .visible_session(self.state.target_client.as_ref())
+                .map(|session| session.id.clone()),
         }
     }
 
@@ -468,6 +562,15 @@ impl App {
             .flat_map(|session| session.windows.iter())
             .find(|window| window.id == id)
             .map(|window| window.name.clone())
+    }
+
+    fn window_session_id(&self, id: &str) -> Option<String> {
+        self.state
+            .tmux
+            .sessions
+            .iter()
+            .find(|session| session.windows.iter().any(|window| window.id == id))
+            .map(|session| session.id.clone())
     }
 
     fn try_tmux_action<T>(

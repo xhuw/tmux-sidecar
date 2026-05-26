@@ -10,6 +10,7 @@ pub struct SessionRecord {
     pub name: String,
     pub attached_count: u32,
     pub active_window_id: Option<String>,
+    pub alerts: Vec<SessionAlertRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,26 +33,73 @@ pub struct ClientRecord {
     pub tty: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WindowFlags {
-    pub raw: String,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AlertFlags {
     pub has_activity: bool,
     pub has_bell: bool,
     pub has_silence: bool,
 }
 
-impl WindowFlags {
-    pub fn from_raw(raw: String) -> Self {
+impl AlertFlags {
+    pub fn from_symbols(raw: &str) -> Self {
         Self {
             has_activity: raw.contains('#'),
             has_bell: raw.contains('!'),
             has_silence: raw.contains('~'),
+        }
+    }
+
+    pub fn from_booleans(has_activity: bool, has_bell: bool, has_silence: bool) -> Self {
+        Self {
+            has_activity,
+            has_bell,
+            has_silence,
+        }
+    }
+
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            has_activity: self.has_activity || other.has_activity,
+            has_bell: self.has_bell || other.has_bell,
+            has_silence: self.has_silence || other.has_silence,
+        }
+    }
+
+    pub fn has_alert(self) -> bool {
+        self.has_activity || self.has_bell || self.has_silence
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAlertRecord {
+    pub window_index: u32,
+    pub flags: AlertFlags,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowFlags {
+    pub raw: String,
+    pub alerts: AlertFlags,
+}
+
+impl WindowFlags {
+    pub fn from_raw(raw: String) -> Self {
+        Self::from_parts(raw, false, false, false)
+    }
+
+    pub fn from_parts(raw: String, has_activity: bool, has_bell: bool, has_silence: bool) -> Self {
+        Self {
+            alerts: AlertFlags::from_symbols(&raw).merge(AlertFlags::from_booleans(
+                has_activity,
+                has_bell,
+                has_silence,
+            )),
             raw,
         }
     }
 
     pub fn has_alert(&self) -> bool {
-        self.has_activity || self.has_bell || self.has_silence
+        self.alerts.has_alert()
     }
 }
 
@@ -68,6 +116,8 @@ pub enum ParseError {
     InvalidInteger { field: &'static str, value: String },
     #[error("invalid boolean for {field}: {value}")]
     InvalidBoolean { field: &'static str, value: String },
+    #[error("invalid alert flags for {field}: {value}")]
+    InvalidAlert { field: &'static str, value: String },
     #[error("missing required value for {field}")]
     MissingField { field: &'static str },
 }
@@ -82,6 +132,7 @@ pub fn session_format() -> String {
         "#{session_name}",
         "#{session_attached}",
         "#{window_id}",
+        "#{session_alerts}",
     ])
 }
 
@@ -94,6 +145,9 @@ pub fn window_format() -> String {
         "#{window_name}",
         "#{window_active}",
         "#{window_flags}",
+        "#{window_activity_flag}",
+        "#{window_bell_flag}",
+        "#{window_silence_flag}",
     ])
 }
 
@@ -138,20 +192,32 @@ where
 
 fn parse_session_line(line: &str) -> Result<SessionRecord, ParseError> {
     let fields = split_fields(line);
-    let [id, name, attached_count, active_window_id] = expect_fields::<4>("session", fields, line)?;
+    let [id, name, attached_count, active_window_id, alerts] =
+        expect_fields::<5>("session", fields, line)?;
 
     Ok(SessionRecord {
         id: required("session_id", id)?,
         name: name.to_owned(),
         attached_count: parse_u32("session_attached", attached_count)?,
         active_window_id: optional_id(active_window_id),
+        alerts: parse_session_alerts(alerts)?,
     })
 }
 
 fn parse_window_line(line: &str) -> Result<WindowRecord, ParseError> {
     let fields = split_fields(line);
-    let [session_id, session_name, id, index, name, active, flags] =
-        expect_fields::<7>("window", fields, line)?;
+    let [
+        session_id,
+        session_name,
+        id,
+        index,
+        name,
+        active,
+        flags,
+        activity_flag,
+        bell_flag,
+        silence_flag,
+    ] = expect_fields::<10>("window", fields, line)?;
 
     Ok(WindowRecord {
         session_id: required("session_id", session_id)?,
@@ -160,7 +226,12 @@ fn parse_window_line(line: &str) -> Result<WindowRecord, ParseError> {
         index: parse_u32("window_index", index)?,
         name: name.to_owned(),
         active: parse_bool("window_active", active)?,
-        flags: WindowFlags::from_raw(flags.to_owned()),
+        flags: WindowFlags::from_parts(
+            flags.to_owned(),
+            parse_bool("window_activity_flag", activity_flag)?,
+            parse_bool("window_bell_flag", bell_flag)?,
+            parse_bool("window_silence_flag", silence_flag)?,
+        ),
     })
 }
 
@@ -226,6 +297,35 @@ fn required(field: &'static str, value: &str) -> Result<String, ParseError> {
     Ok(value.to_owned())
 }
 
+fn parse_session_alerts(value: &str) -> Result<Vec<SessionAlertRecord>, ParseError> {
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    value
+        .split(',')
+        .filter(|entry| !entry.is_empty())
+        .map(parse_session_alert)
+        .collect()
+}
+
+fn parse_session_alert(value: &str) -> Result<SessionAlertRecord, ParseError> {
+    let split_at = value.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    let (index, flags) = value.split_at(split_at);
+    let flags = AlertFlags::from_symbols(flags);
+    if !flags.has_alert() {
+        return Err(ParseError::InvalidAlert {
+            field: "session_alerts",
+            value: value.to_owned(),
+        });
+    }
+
+    Ok(SessionAlertRecord {
+        window_index: parse_u32("session_alerts", index)?,
+        flags,
+    })
+}
+
 fn optional_id(value: &str) -> Option<String> {
     if value.is_empty() {
         None
@@ -253,7 +353,7 @@ mod tests {
 
     #[test]
     fn parses_sessions_successfully() {
-        let raw = format!("$1{sep}dev{sep}2{sep}@1\n", sep = FIELD_SEPARATOR);
+        let raw = format!("$1{sep}dev{sep}2{sep}@1{sep}1#,3!\n", sep = FIELD_SEPARATOR);
 
         let sessions = parse_sessions(&raw).expect("sessions should parse");
 
@@ -262,6 +362,11 @@ mod tests {
         assert_eq!(sessions[0].name, "dev");
         assert_eq!(sessions[0].attached_count, 2);
         assert_eq!(sessions[0].active_window_id.as_deref(), Some("@1"));
+        assert_eq!(sessions[0].alerts.len(), 2);
+        assert_eq!(sessions[0].alerts[0].window_index, 1);
+        assert!(sessions[0].alerts[0].flags.has_activity);
+        assert_eq!(sessions[0].alerts[1].window_index, 3);
+        assert!(sessions[0].alerts[1].flags.has_bell);
     }
 
     #[test]
@@ -274,7 +379,7 @@ mod tests {
             error,
             ParseError::WrongFieldCount {
                 record: "session",
-                expected: 4,
+                expected: 5,
                 actual: 3,
                 ..
             }
@@ -284,7 +389,7 @@ mod tests {
     #[test]
     fn parses_windows_and_alert_flags() {
         let raw = format!(
-            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}1{sep}!#*\n",
+            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}1{sep}*{sep}1{sep}1{sep}0\n",
             sep = FIELD_SEPARATOR
         );
 
@@ -294,15 +399,15 @@ mod tests {
         assert_eq!(windows[0].id, "@9");
         assert_eq!(windows[0].index, 4);
         assert!(windows[0].active);
-        assert!(windows[0].flags.has_activity);
-        assert!(windows[0].flags.has_bell);
+        assert!(windows[0].flags.alerts.has_activity);
+        assert!(windows[0].flags.alerts.has_bell);
         assert!(windows[0].flags.has_alert());
     }
 
     #[test]
     fn rejects_window_with_non_boolean_active_value() {
         let raw = format!(
-            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}yes{sep}\n",
+            "$1{sep}dev{sep}@9{sep}4{sep}editor{sep}yes{sep}*{sep}0{sep}0{sep}0\n",
             sep = FIELD_SEPARATOR
         );
 
@@ -349,5 +454,20 @@ mod tests {
         assert_eq!(clients[0].session_id, "$1");
         assert_eq!(clients[0].current_window_id.as_deref(), Some("@9"));
         assert_eq!(clients[0].activity, 42);
+    }
+
+    #[test]
+    fn rejects_session_alerts_without_a_known_alert_marker() {
+        let raw = format!("$1{sep}dev{sep}2{sep}@1{sep}1\n", sep = FIELD_SEPARATOR);
+
+        let error = parse_sessions(&raw).expect_err("session alerts should reject malformed flags");
+
+        assert!(matches!(
+            error,
+            ParseError::InvalidAlert {
+                field: "session_alerts",
+                value
+            } if value == "1"
+        ));
     }
 }

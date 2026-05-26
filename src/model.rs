@@ -5,6 +5,8 @@ use crate::input::InputBuffer;
 pub type SessionId = String;
 pub type WindowId = String;
 
+const JUMP_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnmASDFGHJKLQWERTYUIOPZXCVBNM";
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxState {
     pub sessions: Vec<Session>,
@@ -99,16 +101,24 @@ pub enum WindowAlert {
 }
 
 impl WindowAlert {
-    pub fn from_flags(flags: &str) -> Self {
-        if flags.contains('!') {
+    pub fn from_indicators(has_activity: bool, has_bell: bool, has_silence: bool) -> Self {
+        if has_bell {
             Self::Bell
-        } else if flags.contains('#') {
+        } else if has_activity {
             Self::Activity
-        } else if flags.contains('~') {
+        } else if has_silence {
             Self::Silence
         } else {
             Self::None
         }
+    }
+
+    pub fn from_flags(flags: &str) -> Self {
+        Self::from_indicators(
+            flags.contains('#'),
+            flags.contains('!'),
+            flags.contains('~'),
+        )
     }
 
     pub fn is_alerting(self) -> bool {
@@ -213,6 +223,18 @@ pub enum WindowTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionError {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NavigationState {
+    pub pending_g: bool,
+    pub jumping: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JumpTarget {
+    pub focus: Focus,
+    pub label: char,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +362,7 @@ pub struct AppState {
     pub tmux: TmuxState,
     pub focus: Focus,
     pub mode: Mode,
+    pub navigation: NavigationState,
     pub target_client: Option<ClientName>,
     pub last_error: Option<ActionError>,
     pub next_poll_at: Option<Instant>,
@@ -351,6 +374,7 @@ impl Default for AppState {
             tmux: TmuxState::default(),
             focus: Focus::default(),
             mode: Mode::default(),
+            navigation: NavigationState::default(),
             target_client: None,
             last_error: None,
             next_poll_at: None,
@@ -375,6 +399,19 @@ impl AppState {
         self.focused_row_index_in(&rows)
     }
 
+    pub fn focus_first_row(&mut self) -> bool {
+        self.focus_row_index(0)
+    }
+
+    pub fn focus_last_row(&mut self) -> bool {
+        let rows = self.tree_rows();
+        let Some(index) = rows.len().checked_sub(1) else {
+            return false;
+        };
+
+        self.focus_row_index(index)
+    }
+
     pub fn move_focus(&mut self, movement: FocusMove) -> bool {
         let rows = self.tree_rows();
         if rows.is_empty() {
@@ -393,6 +430,69 @@ impl AppState {
         }
 
         self.focus = next_focus;
+        true
+    }
+
+    pub fn start_g_prefix(&mut self) -> bool {
+        if self.navigation.pending_g {
+            return false;
+        }
+
+        self.navigation.pending_g = true;
+        self.navigation.jumping = false;
+        true
+    }
+
+    pub fn clear_g_prefix(&mut self) -> bool {
+        if !self.navigation.pending_g {
+            return false;
+        }
+
+        self.navigation.pending_g = false;
+        true
+    }
+
+    pub fn start_jump(&mut self) -> bool {
+        if self.tree_rows().is_empty() {
+            return false;
+        }
+
+        self.navigation.pending_g = false;
+        self.navigation.jumping = true;
+        true
+    }
+
+    pub fn cancel_jump(&mut self) -> bool {
+        if !self.navigation.jumping {
+            return false;
+        }
+
+        self.navigation.jumping = false;
+        true
+    }
+
+    pub fn clear_navigation(&mut self) {
+        self.navigation = NavigationState::default();
+    }
+
+    pub fn jump_targets(&self) -> Vec<JumpTarget> {
+        if !self.navigation.jumping {
+            return Vec::new();
+        }
+
+        jump_targets_for_rows(&self.tree_rows())
+    }
+
+    pub fn focus_jump_label(&mut self, label: char) -> bool {
+        let Some(target) = self
+            .jump_targets()
+            .into_iter()
+            .find(|target| target.label == label)
+        else {
+            return false;
+        };
+
+        self.focus = target.focus;
         true
     }
 
@@ -484,4 +584,28 @@ impl AppState {
     fn focused_row_index_in(&self, rows: &[TreeRow]) -> Option<usize> {
         rows.iter().position(|row| row.focus == self.focus)
     }
+
+    fn focus_row_index(&mut self, index: usize) -> bool {
+        let rows = self.tree_rows();
+        let Some(next_focus) = rows.get(index).map(|row| row.focus.clone()) else {
+            return false;
+        };
+
+        if next_focus == self.focus {
+            return false;
+        }
+
+        self.focus = next_focus;
+        true
+    }
+}
+
+fn jump_targets_for_rows(rows: &[TreeRow]) -> Vec<JumpTarget> {
+    rows.iter()
+        .zip(JUMP_LABELS.iter().copied())
+        .map(|(row, label)| JumpTarget {
+            focus: row.focus.clone(),
+            label: char::from(label),
+        })
+        .collect()
 }

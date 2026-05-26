@@ -77,8 +77,8 @@ Prefer `std::process::Command` with separate arguments; never shell-join user-pr
 Recommended snapshot commands use a control-character field separator supplied as an actual byte in the `-F` argument:
 
 ```text
-list-sessions -F "#{session_id}<US>#{session_name}<US>#{session_attached}<US>#{session_windows}<US>#{session_activity}"
-list-windows -a -F "#{session_id}<US>#{session_name}<US>#{window_id}<US>#{window_index}<US>#{window_name}<US>#{window_active}<US>#{window_flags}"
+list-sessions -F "#{session_id}<US>#{session_name}<US>#{session_attached}<US>#{window_id}<US>#{session_alerts}"
+list-windows -a -F "#{session_id}<US>#{session_name}<US>#{window_id}<US>#{window_index}<US>#{window_name}<US>#{window_active}<US>#{window_flags}<US>#{window_activity_flag}<US>#{window_bell_flag}<US>#{window_silence_flag}"
 list-clients -F "#{client_name}<US>#{session_id}<US>#{window_id}<US>#{client_activity}<US>#{client_tty}"
 ```
 

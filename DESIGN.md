@@ -30,7 +30,7 @@ Use the alternate screen with a single full-screen view:
  󰐕 new session
 
  ────────────────────────────────────────────────────────
- Enter switch  r rename  ? help  q quit
+ Enter switch/create  s new session  c new window  r rename  x close window  ? help  q quit
 ```
 
 Regions:
@@ -123,7 +123,10 @@ Keyboard defaults:
 | --- | --- |
 | `Up`/`Down`, `k`/`j` | Move focus by visible row. |
 | `Enter` | Activate focused session/window, or start creation from a `[+]` row. |
+| `s` | Start the new-session inline create flow. |
+| `c` | Start the new-window inline create flow for the focused session, or the focused window's session. |
 | `r` | Rename focused session/window. |
+| `x` | Close the focused window immediately. |
 | `Esc` | Cancel rename; for newly-created items, keep tmux's default name. |
 | `?` | Open/close help modal. |
 | `q` | Quit. |

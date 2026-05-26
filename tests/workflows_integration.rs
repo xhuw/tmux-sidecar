@@ -572,6 +572,159 @@ fn creates_session_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn 
 
 #[test]
 #[serial]
+fn navigation_hotkeys_start_expected_flows_from_focused_context()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let second_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .ok_or("missing it-second session")?;
+    let second_session_id = second_session.id.clone();
+    let second_window_id = second_session
+        .windows
+        .first()
+        .map(|window| window.id.clone())
+        .ok_or("missing it-second window")?;
+
+    app.state_mut().focus = Focus::Window(second_window_id);
+    app.on_key_event(key(KeyCode::Char('s')))?;
+    assert_eq!(app.state().focus, Focus::CreateSession);
+    assert!(matches!(app.state().mode, Mode::CreateSessionName { .. }));
+    app.on_key_event(key(KeyCode::Esc))?;
+
+    app.on_key_event(key(KeyCode::Char('S')))?;
+    let jump_targets = app.state().jump_targets();
+    assert!(!jump_targets.is_empty());
+    app.on_key_event(key(KeyCode::Char('!')))?;
+    assert!(app.state().jump_targets().is_empty());
+    assert_eq!(app.state().focus, Focus::CreateSession);
+
+    app.state_mut().focus = Focus::Session(second_session_id.clone());
+    app.on_key_event(key(KeyCode::Char('c')))?;
+    match app.state().mode.clone() {
+        Mode::CreateWindowName { session_id, .. } => {
+            assert_eq!(session_id, second_session_id);
+        }
+        other => {
+            return Err(format!("unexpected mode after session create hotkey: {other:?}").into());
+        }
+    }
+    assert_eq!(
+        app.state().focus,
+        Focus::CreateWindow(second_session_id.clone())
+    );
+    app.on_key_event(key(KeyCode::Esc))?;
+
+    app.state_mut().focus = Focus::Window(
+        second_session
+            .windows
+            .first()
+            .map(|window| window.id.clone())
+            .ok_or("missing it-second window for create hotkey")?,
+    );
+    app.on_key_event(key(KeyCode::Char('c')))?;
+    match app.state().mode.clone() {
+        Mode::CreateWindowName { session_id, .. } => {
+            assert_eq!(session_id, second_session_id);
+        }
+        other => {
+            return Err(format!("unexpected mode after window create hotkey: {other:?}").into());
+        }
+    }
+    assert_eq!(
+        app.state().focus,
+        Focus::CreateWindow(second_session_id.clone())
+    );
+
+    app.on_key_event(key(KeyCode::Esc))?;
+    app.state_mut().focus = Focus::Window(
+        second_session
+            .windows
+            .first()
+            .map(|window| window.id.clone())
+            .ok_or("missing it-second window for jump hotkey")?,
+    );
+    app.on_key_event(key(KeyCode::Char('S')))?;
+    let jump_targets = app.state().jump_targets();
+    let target_label = jump_targets
+        .iter()
+        .find(|target| target.focus == Focus::Session(second_session_id.clone()))
+        .map(|target| target.label)
+        .ok_or("missing jump label for it-second session")?;
+    app.on_key_event(key(KeyCode::Char(target_label)))?;
+    assert_eq!(server.client_session_id()?, second_session_id);
+    assert_eq!(app.state().focus, Focus::Session(second_session_id.clone()));
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn gg_g_and_flash_jump_follow_visible_rows_and_auto_quit() -> Result<(), Box<dyn std::error::Error>>
+{
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let snapshot = server.tmux_cli().snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-win")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-win window")?;
+    let extra_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+
+    let mut app = server.app()?;
+    app.state_mut().focus = Focus::Window(extra_window_id.clone());
+    app.on_key_event(key(KeyCode::Char('g')))?;
+    assert_eq!(app.state().focus, Focus::Window(extra_window_id.clone()));
+    app.on_key_event(key(KeyCode::Char('g')))?;
+    assert_eq!(app.state().focus, Focus::Session(main_session.id.clone()));
+
+    app.on_key_event(key(KeyCode::Char('G')))?;
+    assert_eq!(app.state().focus, Focus::CreateSession);
+
+    let mut auto_quit_app = server.app_with_auto_quit(true)?;
+    auto_quit_app.state_mut().focus = Focus::CreateSession;
+    auto_quit_app.on_key_event(key(KeyCode::Char('S')))?;
+    let jump_targets = auto_quit_app.state().jump_targets();
+    let jump_label = jump_targets
+        .iter()
+        .find(|target| target.focus == Focus::Window(main_window_id.clone()))
+        .map(|target| target.label)
+        .ok_or("missing jump label for it-win")?;
+    auto_quit_app.on_key_event(key(KeyCode::Char(jump_label)))?;
+
+    assert_eq!(server.client_window_id()?, main_window_id);
+    assert!(auto_quit_app.should_quit());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {
         eprintln!("skipping integration test: tmux is unavailable");

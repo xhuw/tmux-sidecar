@@ -287,6 +287,53 @@ fn focus_visible_target_moves_focus_to_target_clients_current_window() {
 }
 
 #[test]
+fn vim_and_jump_navigation_follow_visible_row_order() {
+    let tmux = TmuxState {
+        sessions: vec![
+            session(
+                "$1",
+                "work",
+                Some("@11"),
+                vec![
+                    window("@10", 0, "shell", false, WindowAlert::None),
+                    window("@11", 1, "editor", true, WindowAlert::Activity),
+                ],
+            ),
+            session(
+                "$2",
+                "notes",
+                Some("@20"),
+                vec![window("@20", 0, "scratch", true, WindowAlert::Bell)],
+            ),
+        ],
+        clients: vec![client("client-1", "$1", Some("@11"), 10)],
+    };
+    let mut app = AppState::from_tmux(tmux);
+    app.focus = Focus::Window("@10".to_string());
+
+    assert!(app.focus_first_row());
+    assert_eq!(app.focus, Focus::Session("$1".to_string()));
+    assert!(app.focus_last_row());
+    assert_eq!(app.focus, Focus::CreateSession);
+
+    assert!(app.start_jump());
+    let targets = app.jump_targets();
+    assert_eq!(targets.len(), 8);
+
+    let notes_label = targets
+        .iter()
+        .find(|target| target.focus == Focus::Session("$2".to_string()))
+        .map(|target| target.label)
+        .expect("expected notes label");
+    assert!(app.focus_jump_label(notes_label));
+    assert_eq!(app.focus, Focus::Session("$2".to_string()));
+
+    let focused_before_invalid = app.focus.clone();
+    assert!(!app.focus_jump_label('!'));
+    assert_eq!(app.focus, focused_before_invalid);
+}
+
+#[test]
 fn alert_kind_maps_tmux_flags_for_activity_bell_and_silence() {
     let mut activity = window("@1", 0, "activity", false, WindowAlert::None);
     activity.set_flags("#");

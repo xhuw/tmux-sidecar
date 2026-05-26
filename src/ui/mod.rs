@@ -68,7 +68,7 @@ pub fn render_with_options(frame: &mut Frame<'_>, state: &AppState, options: Ren
     let body = Paragraph::new(tree.lines).style(theme.app());
     frame.render_widget(body, chunks[1]);
 
-    let mut footer_spans = vec![Span::styled(help::key_hints(&state.mode), theme.footer())];
+    let mut footer_spans = vec![Span::styled(help::key_hints(state), theme.footer())];
     if state.last_error.is_some() {
         footer_spans.push(Span::styled("  ", theme.footer()));
         footer_spans.push(Span::styled(
@@ -163,7 +163,9 @@ mod tests {
         assert!(output.contains("tmux-sidecar"));
         assert!(output.contains("> [+] new session"));
         assert!(output.contains("* active ! alert"));
-        assert!(output.contains("Enter switch/create  r rename  x close window  ? help  q quit"));
+        assert!(output.contains(
+            "Enter switch  s session  S jump  c window  gg top  G bottom  r rename  x close  ? help  q quit"
+        ));
     }
 
     #[test]
@@ -193,7 +195,23 @@ mod tests {
         assert!(output.contains("> focused"));
         assert!(output.contains("* active"));
         assert!(output.contains("! alert"));
+        assert!(output.contains("gg / G          first / last row"));
+        assert!(output.contains("s               start new session"));
+        assert!(output.contains("S               jump to row label"));
+        assert!(output.contains("c               new window in focused session"));
         assert!(output.contains("Failed actions refresh from tmux."));
+    }
+
+    #[test]
+    fn jump_render_snapshot_shows_labels_and_jump_footer() {
+        let mut state = sample_state();
+        state.navigation.jumping = true;
+
+        let output = render_ascii(&state, 96, 16);
+
+        assert!(output.contains("[a] work"));
+        assert!(output.contains("  [s] |-- 0 shell"));
+        assert!(output.contains("Jump: type label to switch  invalid key cancels"));
     }
 
     #[test]
