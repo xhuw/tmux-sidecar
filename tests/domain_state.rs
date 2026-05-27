@@ -69,7 +69,7 @@ fn tree_rows_include_new_rows_and_focus_moves_by_visible_order() {
                 Some("@11"),
                 vec![
                     window("@10", 0, "shell", false, WindowAlert::None),
-                    window("@11", 1, "editor", true, WindowAlert::Activity),
+                    window("@11", 1, "editor", true, WindowAlert::None),
                 ],
             ),
             session(
@@ -200,7 +200,7 @@ fn alert_state_is_preserved_separately_from_active_and_focus_state() {
     app.focus = window_focus("$1", "@11");
 
     let mut refreshed_alerted_window = window("@11", 1, "editor", false, WindowAlert::None);
-    refreshed_alerted_window.set_flags("#");
+    refreshed_alerted_window.set_flags("!");
 
     let reconcile = app.reconcile_tmux(TmuxState {
         sessions: vec![session(
@@ -224,7 +224,7 @@ fn alert_state_is_preserved_separately_from_active_and_focus_state() {
         .find(|row| row.focus == window_focus("$1", "@11"))
         .expect("expected alerted window row");
 
-    assert_eq!(alerted_row.alert(), Some(WindowAlert::Activity));
+    assert_eq!(alerted_row.alert(), Some(WindowAlert::Bell));
     assert!(!alerted_row.active());
 }
 
@@ -270,7 +270,7 @@ fn linked_window_rows_keep_session_local_active_and_alert_state() {
 }
 
 #[test]
-fn local_alerts_detect_unseen_activity_in_another_sessions_current_window() {
+fn reconciliation_does_not_synthesize_activity_alerts() {
     let mut app = AppState {
         tmux: TmuxState {
             sessions: vec![
@@ -345,102 +345,7 @@ fn local_alerts_detect_unseen_activity_in_another_sessions_current_window() {
         .into_iter()
         .find(|row| row.focus == window_focus("$2", "@20"))
         .expect("expected other session row");
-    assert_eq!(alerted_row.alert(), Some(WindowAlert::Activity));
-
-    app.reconcile_tmux(TmuxState {
-        sessions: vec![
-            session(
-                "$1",
-                "visible",
-                Some("@10"),
-                vec![window_with_activity(
-                    "@10",
-                    0,
-                    "visible",
-                    true,
-                    WindowAlert::None,
-                    10,
-                )],
-            ),
-            session(
-                "$2",
-                "other",
-                Some("@20"),
-                vec![window_with_activity(
-                    "@20",
-                    0,
-                    "other",
-                    true,
-                    WindowAlert::None,
-                    21,
-                )],
-            ),
-        ],
-        clients: vec![client("client-1", "$2", Some("@20"), 11)],
-    });
-
-    let viewed_row = app
-        .tree_rows()
-        .into_iter()
-        .find(|row| row.focus == window_focus("$2", "@20"))
-        .expect("expected viewed other session row");
-    assert_eq!(viewed_row.alert(), None);
-}
-
-#[test]
-fn local_alerts_ignore_sidecars_own_hidden_window_activity() {
-    let mut app = AppState {
-        target_client: Some(ClientName("client-1".to_string())),
-        ..AppState::default()
-    };
-    let sidecar_focus = window_focus("$1", "@sidecar");
-    app.seen_activity.insert(sidecar_focus.clone(), 10);
-    app.ignored_activity_window_ids
-        .insert("@sidecar".to_string());
-
-    app.reconcile_tmux(TmuxState {
-        sessions: vec![
-            session(
-                "$1",
-                "sidecar",
-                Some("@sidecar"),
-                vec![window_with_activity(
-                    "@sidecar",
-                    0,
-                    "tmux-sidecar",
-                    true,
-                    WindowAlert::None,
-                    11,
-                )],
-            ),
-            session(
-                "$2",
-                "target",
-                Some("@target"),
-                vec![window_with_activity(
-                    "@target",
-                    0,
-                    "shell",
-                    true,
-                    WindowAlert::None,
-                    20,
-                )],
-            ),
-        ],
-        clients: vec![client("client-1", "$2", Some("@target"), 20)],
-    });
-
-    let sidecar_row = app
-        .tree_rows()
-        .into_iter()
-        .find(|row| row.focus == sidecar_focus)
-        .expect("expected sidecar window row");
-
-    assert_eq!(sidecar_row.alert(), None);
-    assert_eq!(
-        app.seen_activity.get(&window_focus("$1", "@sidecar")),
-        Some(&11)
-    );
+    assert_eq!(alerted_row.alert(), None);
 }
 
 #[test]
@@ -531,7 +436,7 @@ fn vim_and_jump_navigation_follow_visible_row_order() {
                 Some("@11"),
                 vec![
                     window("@10", 0, "shell", false, WindowAlert::None),
-                    window("@11", 1, "editor", true, WindowAlert::Activity),
+                    window("@11", 1, "editor", true, WindowAlert::None),
                 ],
             ),
             session(
@@ -569,7 +474,7 @@ fn vim_and_jump_navigation_follow_visible_row_order() {
 }
 
 #[test]
-fn alert_kind_maps_tmux_flags_for_activity_bell_and_silence() {
+fn alert_kind_only_marks_bell_flags_as_alerts() {
     let mut activity = window("@1", 0, "activity", false, WindowAlert::None);
     activity.set_flags("#");
     let mut bell = window("@2", 1, "bell", false, WindowAlert::None);
@@ -577,7 +482,7 @@ fn alert_kind_maps_tmux_flags_for_activity_bell_and_silence() {
     let mut silence = window("@3", 2, "silence", false, WindowAlert::None);
     silence.set_flags("~");
 
-    assert_eq!(activity.alert, WindowAlert::Activity);
+    assert_eq!(activity.alert, WindowAlert::None);
     assert_eq!(bell.alert, WindowAlert::Bell);
-    assert_eq!(silence.alert, WindowAlert::Silence);
+    assert_eq!(silence.alert, WindowAlert::None);
 }

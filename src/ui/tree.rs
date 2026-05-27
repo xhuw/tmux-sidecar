@@ -286,9 +286,7 @@ fn render_with_cursor(input: &crate::input::InputBuffer) -> String {
 fn alert_label(alert: WindowAlert) -> &'static str {
     match alert {
         WindowAlert::None => "alert",
-        WindowAlert::Activity => "alert",
         WindowAlert::Bell => "alert",
-        WindowAlert::Silence => "alert",
     }
 }
 

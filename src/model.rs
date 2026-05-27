@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
-};
+use std::time::Instant;
 
 use crate::input::InputBuffer;
 
@@ -98,22 +95,12 @@ pub struct Session {
 pub enum WindowAlert {
     #[default]
     None,
-    Activity,
     Bell,
-    Silence,
 }
 
 impl WindowAlert {
-    pub fn from_indicators(has_activity: bool, has_bell: bool, has_silence: bool) -> Self {
-        if has_bell {
-            Self::Bell
-        } else if has_activity {
-            Self::Activity
-        } else if has_silence {
-            Self::Silence
-        } else {
-            Self::None
-        }
+    pub fn from_indicators(_has_activity: bool, has_bell: bool, _has_silence: bool) -> Self {
+        if has_bell { Self::Bell } else { Self::None }
     }
 
     pub fn from_flags(flags: &str) -> Self {
@@ -125,7 +112,7 @@ impl WindowAlert {
     }
 
     pub fn is_alerting(self) -> bool {
-        !matches!(self, Self::None)
+        matches!(self, Self::Bell)
     }
 }
 
@@ -383,9 +370,6 @@ pub struct AppState {
     pub focus: Focus,
     pub mode: Mode,
     pub navigation: NavigationState,
-    pub seen_activity: HashMap<Focus, u64>,
-    pub local_alerts: HashMap<Focus, WindowAlert>,
-    pub ignored_activity_window_ids: HashSet<WindowId>,
     pub target_client: Option<ClientName>,
     pub last_error: Option<ActionError>,
     pub next_poll_at: Option<Instant>,
@@ -398,9 +382,6 @@ impl Default for AppState {
             focus: Focus::default(),
             mode: Mode::default(),
             navigation: NavigationState::default(),
-            seen_activity: HashMap::new(),
-            local_alerts: HashMap::new(),
-            ignored_activity_window_ids: HashSet::new(),
             target_client: None,
             last_error: None,
             next_poll_at: None,
@@ -528,20 +509,8 @@ impl AppState {
         let previous_index = self
             .focused_row_index_in(&previous_rows)
             .unwrap_or_else(|| previous_rows.len().saturating_sub(1));
-        let visible_window_id = tmux
-            .visible_window(self.target_client.as_ref())
-            .map(|(_, window)| window.id.clone());
-        let (seen_activity, local_alerts) = reconcile_local_alerts(
-            &tmux,
-            &self.seen_activity,
-            &self.ignored_activity_window_ids,
-            visible_window_id.as_deref(),
-        );
 
         self.tmux = tmux;
-        self.seen_activity = seen_activity;
-        self.local_alerts = local_alerts;
-        self.apply_local_alerts();
         let rows = self.tree_rows();
 
         let (recovery, row_index) = match rows.iter().position(|row| row.focus == previous_focus) {
@@ -636,20 +605,6 @@ impl AppState {
         self.focus = next_focus;
         true
     }
-
-    fn apply_local_alerts(&mut self) {
-        for session in &mut self.tmux.sessions {
-            for window in &mut session.windows {
-                let focus = Focus::window(session.id.clone(), window.id.clone());
-                if window.alert.is_alerting() {
-                    continue;
-                }
-                if let Some(alert) = self.local_alerts.get(&focus) {
-                    window.alert = *alert;
-                }
-            }
-        }
-    }
 }
 
 fn jump_targets_for_rows(rows: &[TreeRow]) -> Vec<JumpTarget> {
@@ -660,43 +615,4 @@ fn jump_targets_for_rows(rows: &[TreeRow]) -> Vec<JumpTarget> {
             label: char::from(label),
         })
         .collect()
-}
-
-fn reconcile_local_alerts(
-    tmux: &TmuxState,
-    current_seen_activity: &HashMap<Focus, u64>,
-    ignored_activity_window_ids: &HashSet<WindowId>,
-    visible_window_id: Option<&str>,
-) -> (HashMap<Focus, u64>, HashMap<Focus, WindowAlert>) {
-    let mut seen_activity = HashMap::new();
-    let mut alerts = HashMap::new();
-
-    for session in &tmux.sessions {
-        for window in &session.windows {
-            let focus = Focus::window(session.id.clone(), window.id.clone());
-            if visible_window_id == Some(window.id.as_str()) {
-                seen_activity.insert(focus, window.activity);
-                continue;
-            }
-            if ignored_activity_window_ids.contains(&window.id) {
-                seen_activity.insert(focus, window.activity);
-                continue;
-            }
-
-            let Some(last_seen) = current_seen_activity.get(&focus).copied() else {
-                seen_activity.insert(focus, window.activity);
-                continue;
-            };
-            seen_activity.insert(focus.clone(), last_seen);
-
-            if window.alert.is_alerting() {
-                continue;
-            }
-            if window.activity > last_seen {
-                alerts.insert(focus, WindowAlert::Activity);
-            }
-        }
-    }
-
-    (seen_activity, alerts)
 }

@@ -76,7 +76,7 @@ Use the terminal's native foreground/background and ANSI palette slots instead o
 | `accent` | cyan | Focus marker, selected text, primary affordances. |
 | `active` | green | tmux's active window. |
 | `warning` | yellow | Pending rename/create hint. |
-| `alert` | yellow | tmux window activity, bell, silence, or notification state. |
+| `alert` | yellow | tmux window bell state. |
 | `danger` | red | Fatal or transient failed action indicator. |
 
 The UI should not assume a dark background. Light and dark terminal themes must both inherit cleanly from the host terminal without introducing custom fill colors that clash with the rest of the session.
@@ -105,7 +105,7 @@ Focus, active tmux state, and alert/notification state are different concepts. I
 
 ## Alerts and notifications
 
-Window rows must show tmux alert/notification state when tmux reports it, including activity, bell, silence, or equivalent window flags exposed by the snapshot layer. Alerts are visual only in the MVP; selecting or switching to a window lets tmux clear or preserve the alert according to normal tmux behavior.
+Window rows must show tmux bell alert state when tmux reports it. Activity and silence flags from tmux are parsed by the snapshot layer but are not rendered as sidecar alert badges. Alerts are visual only in the MVP; selecting or switching to a window lets tmux clear or preserve the alert according to normal tmux behavior.
 
 Alert display rules:
 

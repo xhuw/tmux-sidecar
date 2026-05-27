@@ -15,7 +15,7 @@
 ---
 
 Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequences.
-**tmux-sidecar** drops a beautiful, always-live session tree right into your terminal — every session, every window, every alert, one keystroke away.
+**tmux-sidecar** drops a beautiful, always-live session tree right into your terminal — every session, every window, every bell alert, one keystroke away.
 
 ---
 

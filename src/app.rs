@@ -125,10 +125,6 @@ impl App {
         let target_client = self.tmux.check_startup(self.cli.target_client.as_deref())?;
 
         self.state.target_client = Some(target_client);
-        self.state.seen_activity = self.tmux.load_seen_activity()?;
-        if let Some(window_id) = self.tmux.sidecar_window_id_from_tmux_pane() {
-            self.state.ignored_activity_window_ids.insert(window_id);
-        }
         self.refresh_snapshot()?;
         self.state.focus_visible_target();
         Ok(())
@@ -166,7 +162,6 @@ impl App {
     fn refresh_snapshot(&mut self) -> Result<()> {
         let snapshot = self.tmux.snapshot()?;
         self.apply_snapshot(snapshot);
-        self.tmux.save_seen_activity(&self.state.seen_activity)?;
         self.state.next_poll_at = Some(Instant::now() + self.poll_interval);
         Ok(())
     }
