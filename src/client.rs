@@ -1,7 +1,9 @@
 use std::{
     env,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::BufReader,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -195,7 +197,9 @@ pub fn resolve_tmux_socket_path(
     socket_name: Option<String>,
     socket_path: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    if let Some(socket_path) = socket_path {
+    if let Some(socket_path) =
+        resolve_tmux_socket_path_fast(socket_name.clone(), socket_path.clone())
+    {
         return Ok(socket_path);
     }
 
@@ -209,6 +213,30 @@ pub fn resolve_tmux_socket_path(
     }
 
     Ok(PathBuf::from(resolved))
+}
+
+pub fn resolve_tmux_socket_path_fast(
+    socket_name: Option<String>,
+    socket_path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(socket_path) = socket_path {
+        return Some(socket_path);
+    }
+    if socket_name.is_some() {
+        return None;
+    }
+
+    env::var_os("TMUX").and_then(|value| parse_tmux_env_socket_path(&value))
+}
+
+fn parse_tmux_env_socket_path(value: &OsStr) -> Option<PathBuf> {
+    let socket_path = value.as_bytes().split(|byte| *byte == b',').next()?;
+    if socket_path.is_empty() {
+        return None;
+    }
+
+    let socket_path = PathBuf::from(OsString::from_vec(socket_path.to_vec()));
+    socket_path.is_absolute().then_some(socket_path)
 }
 
 fn connect_or_spawn_stream(tmux_socket_path: &Path) -> Result<UnixStream> {
@@ -337,5 +365,54 @@ fn acquire_spawn_lock(lock_path: &Path, socket_path: &Path) -> Result<SpawnLock>
                     .with_context(|| format!("failed to acquire `{}`", lock_path.display()));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        ffi::OsString,
+        os::unix::ffi::OsStringExt,
+        path::{Path, PathBuf},
+    };
+
+    use super::{parse_tmux_env_socket_path, resolve_tmux_socket_path_fast};
+
+    #[test]
+    fn fast_socket_resolution_prefers_explicit_socket_path() {
+        assert_eq!(
+            resolve_tmux_socket_path_fast(
+                None,
+                Some(Path::new("/tmp/tmux/custom.sock").to_path_buf())
+            ),
+            Some(PathBuf::from("/tmp/tmux/custom.sock"))
+        );
+    }
+
+    #[test]
+    fn fast_socket_resolution_skips_named_socket_override() {
+        assert_eq!(
+            resolve_tmux_socket_path_fast(Some(String::from("work")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn tmux_env_socket_path_uses_absolute_first_field() {
+        let value = OsString::from_vec(b"/tmp/tmux-1000/default,123,0".to_vec());
+
+        assert_eq!(
+            parse_tmux_env_socket_path(&value),
+            Some(PathBuf::from("/tmp/tmux-1000/default"))
+        );
+    }
+
+    #[test]
+    fn tmux_env_socket_path_rejects_empty_or_relative_values() {
+        assert_eq!(parse_tmux_env_socket_path(&OsString::from(",123,0")), None);
+        assert_eq!(
+            parse_tmux_env_socket_path(&OsString::from("relative,123,0")),
+            None
+        );
     }
 }

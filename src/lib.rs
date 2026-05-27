@@ -6,6 +6,7 @@ pub mod input;
 pub mod ipc;
 pub mod model;
 pub mod server;
+pub mod state_cache;
 pub mod tmux;
 pub mod ui;
 
@@ -31,14 +32,6 @@ pub fn run(cli: cli::Cli) -> Result<()> {
 }
 
 fn run_app(cli: cli::Cli) -> Result<()> {
-    if !cli.print_snapshot {
-        if let Ok(tmux_socket_path) =
-            client::resolve_tmux_socket_path(cli.socket_name.clone(), cli.socket_path.clone())
-        {
-            let _ = client::ensure_server_running(&tmux_socket_path);
-        }
-    }
-
     let mut app = app::App::new(cli);
     app.run()
 }

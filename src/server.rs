@@ -44,6 +44,7 @@ type SharedWriter = Arc<Mutex<UnixStream>>;
 struct SharedState {
     server_id: String,
     tmux_socket_path: PathBuf,
+    cache_path: PathBuf,
     generation: u64,
     state: ProjectionState,
     subscribers: BTreeMap<u64, SharedWriter>,
@@ -139,12 +140,14 @@ impl Server {
             .context("failed to configure sidecar listener")?;
         fs::write(&sidecar_paths.pid_path, format!("{}\n", std::process::id()))
             .context("failed to write sidecar pid file")?;
+        store_state_cache(&sidecar_paths.cache_path, &initial_state);
 
         Ok(Self {
             listener,
             shared: Arc::new(Mutex::new(SharedState {
                 server_id: format!("tmux-sidecar-{}", std::process::id()),
                 tmux_socket_path,
+                cache_path: sidecar_paths.cache_path,
                 generation: 1,
                 state: initial_state,
                 subscribers: BTreeMap::new(),
@@ -350,15 +353,19 @@ fn refresh_state_with_hook(
         apply_hook_event_overlay(&mut next_state, event);
     }
 
-    let update = {
+    let (cache_path, update) = {
         let mut guard = shared.lock().expect("shared state poisoned");
         guard.generation += 1;
         guard.state = next_state;
-        StateUpdated {
-            generation: guard.generation,
-            state: guard.state.clone(),
-        }
+        (
+            guard.cache_path.clone(),
+            StateUpdated {
+                generation: guard.generation,
+                state: guard.state.clone(),
+            },
+        )
     };
+    store_state_cache(&cache_path, &update.state);
 
     broadcast(shared, ServerMessage::StateUpdated(update.clone()));
     Ok(update)
@@ -524,6 +531,11 @@ fn send_error(writer: &SharedWriter, message: impl Into<String>) -> Result<()> {
             message: message.into(),
         }),
     )
+}
+
+fn store_state_cache(cache_path: &Path, state: &ProjectionState) {
+    // The cache only accelerates the next UI launch; live tmux synchronization must not depend on it.
+    let _ = crate::state_cache::store_path(cache_path, state);
 }
 
 fn handle_action_request(

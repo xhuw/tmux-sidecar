@@ -41,6 +41,11 @@ pub struct App {
     should_quit: bool,
 }
 
+struct StartupContext {
+    target_client: ClientName,
+    tmux_socket_path: PathBuf,
+}
+
 impl App {
     pub fn new(cli: Cli) -> Self {
         let render_tick = cli.poll_interval();
@@ -117,19 +122,40 @@ impl App {
     }
 
     fn run_interactive(&mut self) -> Result<()> {
-        self.startup()?;
+        let startup = self.startup_preflight()?;
         install_panic_hook();
+        self.prepare_first_paint_state(&startup);
 
         let mut terminal = TerminalSession::enter()?;
+        terminal
+            .terminal
+            .draw(|frame| ui::render(frame, &self.state))?;
+        self.finish_startup(startup)?;
         self.event_loop(&mut terminal.terminal)
     }
 
     pub fn startup(&mut self) -> Result<()> {
+        let startup = self.startup_preflight()?;
+        self.finish_startup(startup)
+    }
+
+    fn startup_preflight(&self) -> Result<StartupContext> {
         let target_client = self.tmux.check_startup(self.cli.target_client.as_deref())?;
         let tmux_socket_path = client::resolve_tmux_socket_path(
             self.cli.socket_name.clone(),
             self.cli.socket_path.clone(),
         )?;
+        Ok(StartupContext {
+            target_client,
+            tmux_socket_path,
+        })
+    }
+
+    fn finish_startup(&mut self, startup: StartupContext) -> Result<()> {
+        let StartupContext {
+            target_client,
+            tmux_socket_path,
+        } = startup;
         client::ensure_server_running(&tmux_socket_path)?;
         self.install_hooks()?;
 
@@ -264,6 +290,7 @@ impl App {
 
     fn handle_state_update(&mut self, update: StateUpdated) {
         let should_focus_visible_target = self.state.is_tree_loading();
+        self.state.tree_loading = false;
         self.apply_projection(update.state);
         if should_focus_visible_target {
             self.state.focus_visible_target();
@@ -272,6 +299,28 @@ impl App {
 
     fn apply_projection(&mut self, projection: ProjectionState) -> FocusReconcile {
         self.state.reconcile_tmux(projection.into_tmux_state())
+    }
+
+    fn prepare_first_paint_state(&mut self, startup: &StartupContext) {
+        self.state.tree_loading = true;
+        self.state.target_client = Some(startup.target_client.clone());
+        let sidecar_paths =
+            crate::ipc::SidecarPaths::from_tmux_socket_path(&startup.tmux_socket_path);
+
+        match crate::state_cache::load(&sidecar_paths) {
+            Ok(Some(projection)) => {
+                self.apply_cached_projection(projection, startup.target_client.clone())
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!("warning: failed to load sidecar state cache: {error:#}"),
+        }
+    }
+
+    fn apply_cached_projection(&mut self, projection: ProjectionState, target_client: ClientName) {
+        self.state.target_client = Some(target_client);
+        self.state.tree_loading = false;
+        self.apply_projection(projection);
+        self.state.focus_visible_target();
     }
 
     fn handle_event(&mut self, event: AppEvent) -> Result<()> {
@@ -1006,6 +1055,7 @@ mod tests {
     fn initial_server_state_focuses_visible_target() {
         let mut app = App::new(test_cli());
         app.state_mut().target_client = Some(ClientName(String::from("client-1")));
+        app.state_mut().tree_loading = true;
 
         app.handle_server_message(ServerMessage::StateUpdated(StateUpdated {
             generation: 1,
@@ -1014,6 +1064,24 @@ mod tests {
         .expect("apply initial state");
 
         assert_eq!(app.state().focus, Focus::window("$1", "@1"));
+        assert!(!app.state().is_tree_loading());
+    }
+
+    #[test]
+    fn cached_projection_populates_first_paint_state() {
+        let mut app = App::new(test_cli());
+
+        app.apply_cached_projection(
+            projection_state(&[("$1", "main", &[("@1", "win", true)])]),
+            ClientName(String::from("client-1")),
+        );
+
+        assert_eq!(
+            app.state().target_client,
+            Some(ClientName(String::from("client-1")))
+        );
+        assert_eq!(app.state().focus, Focus::window("$1", "@1"));
+        assert!(!app.state().is_tree_loading());
     }
 
     #[test]

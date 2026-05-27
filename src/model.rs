@@ -486,6 +486,7 @@ pub struct AppState {
     pub navigation: NavigationState,
     pub target_client: Option<ClientName>,
     pub last_error: Option<ActionError>,
+    pub tree_loading: bool,
 }
 
 impl Default for AppState {
@@ -497,6 +498,7 @@ impl Default for AppState {
             navigation: NavigationState::default(),
             target_client: None,
             last_error: None,
+            tree_loading: false,
         }
     }
 }
@@ -510,7 +512,7 @@ impl AppState {
     }
 
     pub fn is_tree_loading(&self) -> bool {
-        self.target_client.is_some() && self.tmux.sessions.is_empty()
+        self.tree_loading || (self.target_client.is_some() && self.tmux.sessions.is_empty())
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {

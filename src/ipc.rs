@@ -346,6 +346,7 @@ pub struct SidecarPaths {
     pub socket_path: PathBuf,
     pub lock_path: PathBuf,
     pub pid_path: PathBuf,
+    pub cache_path: PathBuf,
 }
 
 impl SidecarPaths {
@@ -373,6 +374,7 @@ impl SidecarPaths {
             socket_path: runtime_dir.join(format!("{stem}.sock")),
             lock_path: runtime_dir.join(format!("{stem}.lock")),
             pid_path: runtime_dir.join(format!("{stem}.pid")),
+            cache_path: runtime_dir.join(format!("{stem}.state.json")),
         }
     }
 }
@@ -482,6 +484,7 @@ mod tests {
         );
         assert_eq!(first.lock_path.file_name(), second.lock_path.file_name());
         assert_eq!(first.pid_path.file_name(), second.pid_path.file_name());
+        assert_eq!(first.cache_path.file_name(), second.cache_path.file_name());
         assert_eq!(
             first.runtime_dir,
             Path::new("/run/user/1000").join("tmux-sidecar")
