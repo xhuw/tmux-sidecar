@@ -66,6 +66,8 @@ impl SnapshotData {
                                 ),
                                 flags,
                                 activity: window.activity,
+                                activity_flag: window.alert_flags.has_activity,
+                                silence_flag: window.alert_flags.has_silence,
                             }
                         })
                         .collect(),

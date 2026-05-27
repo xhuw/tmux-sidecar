@@ -51,13 +51,11 @@ pub struct TmuxCli {
 }
 
 impl TmuxCli {
+    const MONITOR_SILENCE_SECONDS: &'static str = "10";
+
     pub fn check_startup(&self, cli_override: Option<&str>) -> Result<ClientName, TmuxError> {
         self.ensure_tmux_exists()?;
-        let snapshot = self.snapshot()?;
-        if snapshot.sessions.is_empty() {
-            return Err(TmuxError::NoSessions);
-        }
-
+        self.ensure_sessions_exist()?;
         self.resolve_target_client(cli_override)
     }
 
@@ -65,6 +63,16 @@ impl TmuxCli {
         let socket = self.socket_options();
         command::run_tmux(&socket, ["-V"])?;
         Ok(())
+    }
+
+    fn ensure_sessions_exist(&self) -> Result<(), TmuxError> {
+        let socket = self.socket_options();
+        let output = command::run_tmux(&socket, ["list-sessions", "-F", "#{session_id}"])?;
+        if output.lines().any(|line| !line.trim().is_empty()) {
+            Ok(())
+        } else {
+            Err(TmuxError::NoSessions)
+        }
     }
 
     fn socket_options(&self) -> SocketOptions {
@@ -106,6 +114,33 @@ impl TmuxCli {
         }
 
         Ok(value.to_owned())
+    }
+
+    pub fn configure_activity_monitoring(&self, window: &WindowId) -> Result<(), TmuxError> {
+        let socket = self.socket_options();
+        command::run_tmux(
+            &socket,
+            [
+                "set-window-option",
+                "-q",
+                "-t",
+                window.as_str(),
+                "monitor-activity",
+                "on",
+            ],
+        )?;
+        command::run_tmux(
+            &socket,
+            [
+                "set-window-option",
+                "-q",
+                "-t",
+                window.as_str(),
+                "monitor-silence",
+                Self::MONITOR_SILENCE_SECONDS,
+            ],
+        )?;
+        Ok(())
     }
 }
 

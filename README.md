@@ -15,7 +15,7 @@
 ---
 
 Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequences.
-**tmux-sidecar** drops a beautiful, always-live session tree right into your terminal — every session, every window, every bell alert, one keystroke away.
+**tmux-sidecar** drops a beautiful, always-live session tree right into your terminal — every session, every window, every burst of activity, every bell alert, one keystroke away.
 
 ---
 
@@ -50,7 +50,7 @@ Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x
 - **One-keystroke everything** — switch, create, rename, or close without leaving the keyboard
 - **Mouse? Sure.** — click any row to jump straight to it
 - **Zero config** — attach inside tmux and it just works; no plugins, no hooks, no config changes required
-- **Alerts at a glance** — activity, bell, and silence flags surface as visual badges so nothing gets lost in a busy session
+- **Activity and alerts at a glance** — current activity animates in-place and bell alerts stay visible so nothing gets lost in a busy session
 - **Inline rename** — rename sessions and windows without dropping to a tmux prompt, with full cursor editing
 - **Survives chaos** — if something changes in tmux behind your back, the tree re-syncs and focus recovers gracefully
 - **Fast** — written in Rust; sub-millisecond renders, 500 ms background polling

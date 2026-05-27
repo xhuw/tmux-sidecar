@@ -8,6 +8,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Clear, Paragraph},
 };
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::model::{AppState, Mode};
 
@@ -29,12 +30,14 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RenderOptions {
     pub glyph_mode: GlyphMode,
+    pub activity_animation_frame: usize,
 }
 
 impl RenderOptions {
     pub fn from_env() -> Self {
         Self {
             glyph_mode: GlyphMode::from_env(),
+            activity_animation_frame: current_activity_animation_frame(),
         }
     }
 
@@ -42,6 +45,15 @@ impl RenderOptions {
     pub const fn ascii() -> Self {
         Self {
             glyph_mode: GlyphMode::Ascii,
+            activity_animation_frame: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub const fn ascii_with_animation_frame(activity_animation_frame: usize) -> Self {
+        Self {
+            glyph_mode: GlyphMode::Ascii,
+            activity_animation_frame,
         }
     }
 }
@@ -64,8 +76,16 @@ pub fn render_with_options(frame: &mut Frame<'_>, state: &AppState, options: Ren
     let header = Paragraph::new(header_line(state, glyphs, theme)).style(theme.header());
     frame.render_widget(header, chunks[0]);
 
-    let tree = TreeView::from_state(state, theme, glyphs);
-    let body = Paragraph::new(tree.lines).style(theme.app());
+    let body = if state.is_tree_loading() {
+        Paragraph::new(Line::from(Span::styled(
+            "Loading tmux tree...",
+            theme.row_disabled(),
+        )))
+        .style(theme.app())
+    } else {
+        let tree = TreeView::from_state(state, theme, glyphs, options.activity_animation_frame);
+        Paragraph::new(tree.lines).style(theme.app())
+    };
     frame.render_widget(body, chunks[1]);
 
     let mut footer_spans = vec![Span::styled(help::key_hints(state), theme.footer())];
@@ -131,6 +151,10 @@ fn header_line(state: &AppState, glyphs: Glyphs, theme: Theme) -> Line<'static> 
 }
 
 fn active_target_label(state: &AppState) -> String {
+    if state.is_tree_loading() {
+        return "loading...".to_string();
+    }
+
     if let Some((session, window)) = state.tmux.visible_window(state.target_client.as_ref()) {
         return format!("{}:{}.{}", session.name, window.index, window.name);
     }
@@ -140,6 +164,13 @@ fn active_target_label(state: &AppState) -> String {
     }
 
     "none".to_string()
+}
+
+fn current_activity_animation_frame() -> usize {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    ((elapsed.as_millis() / 400) % 3) as usize
 }
 
 #[cfg(test)]
@@ -169,6 +200,19 @@ mod tests {
     }
 
     #[test]
+    fn loading_snapshot_renders_placeholder_tree_and_footer() {
+        let state = AppState {
+            target_client: Some(ClientName("client-1".to_string())),
+            ..AppState::default()
+        };
+        let output = render_ascii(&state, 96, 16);
+
+        assert!(output.contains("target client-1"));
+        assert!(output.contains("active loading..."));
+        assert!(output.contains("Loading tmux tree..."));
+    }
+
+    #[test]
     fn new_session_renders_after_session_rows() {
         let output = render_ascii(&sample_state(), 96, 16);
         let lines: Vec<_> = output.lines().collect();
@@ -194,6 +238,7 @@ mod tests {
         assert!(output.contains("Help"));
         assert!(output.contains("> focused"));
         assert!(output.contains("* active"));
+        assert!(output.contains("... activity"));
         assert!(output.contains("! alert"));
         assert!(output.contains("gg / G          first / last row"));
         assert!(output.contains("s               start new session"));
@@ -273,6 +318,42 @@ mod tests {
     }
 
     #[test]
+    fn activity_window_snapshot_shows_animation_badge() {
+        let mut state = sample_state();
+        state.tmux.sessions[0].windows[1].alert = WindowAlert::None;
+        state.tmux.sessions[0].windows[1].flags = String::from("*#");
+        state.tmux.sessions[0].windows[1].activity_flag = true;
+        state.tmux.sessions[0].windows[1].silence_flag = false;
+
+        let output = render_ascii_with_frame(&state, 96, 16, 2);
+        let activity_line = output
+            .lines()
+            .find(|line| line.contains("|-- 1 editor"))
+            .expect("expected editor row");
+
+        assert!(activity_line.contains("..."));
+        assert!(!activity_line.contains("! alert"));
+    }
+
+    #[test]
+    fn activity_and_alert_snapshot_show_both_badges() {
+        let mut state = sample_state();
+        state.focus = Focus::window("$1", "@11");
+        state.tmux.sessions[0].windows[1].activity_flag = true;
+        state.tmux.sessions[0].windows[1].silence_flag = false;
+
+        let output = render_ascii_with_frame(&state, 96, 16, 2);
+        let activity_line = output
+            .lines()
+            .find(|line| line.contains("|-- 1 editor"))
+            .expect("expected editor row");
+
+        assert!(activity_line.contains("* active"));
+        assert!(activity_line.contains("..."));
+        assert!(activity_line.contains("! alert"));
+    }
+
+    #[test]
     fn render_marks_only_target_clients_visible_window_active() {
         let mut state = sample_state();
         state.tmux.sessions.push(Session {
@@ -288,6 +369,8 @@ mod tests {
                 flags: String::new(),
                 alert: WindowAlert::None,
                 activity: 0,
+                activity_flag: false,
+                silence_flag: false,
             }],
         });
         state.tmux.clients = vec![Client {
@@ -325,10 +408,25 @@ mod tests {
     }
 
     fn render_ascii(state: &AppState, width: u16, height: u16) -> String {
+        render_ascii_with_frame(state, width, height, 0)
+    }
+
+    fn render_ascii_with_frame(
+        state: &AppState,
+        width: u16,
+        height: u16,
+        activity_animation_frame: usize,
+    ) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).expect("test backend must initialize");
         terminal
-            .draw(|frame| render_with_options(frame, state, RenderOptions::ascii()))
+            .draw(|frame| {
+                render_with_options(
+                    frame,
+                    state,
+                    RenderOptions::ascii_with_animation_frame(activity_animation_frame),
+                )
+            })
             .expect("draw should succeed");
 
         let buffer = terminal.backend().buffer();
@@ -361,6 +459,8 @@ mod tests {
                             flags: String::new(),
                             alert: WindowAlert::None,
                             activity: 0,
+                            activity_flag: false,
+                            silence_flag: false,
                         },
                         Window {
                             id: "@11".to_string(),
@@ -370,6 +470,8 @@ mod tests {
                             flags: "*!".to_string(),
                             alert: WindowAlert::Bell,
                             activity: 0,
+                            activity_flag: false,
+                            silence_flag: false,
                         },
                     ],
                 }],

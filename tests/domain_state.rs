@@ -28,6 +28,8 @@ fn window(id: &str, index: u32, name: &str, active: bool, alert: WindowAlert) ->
         flags: String::new(),
         alert,
         activity: 0,
+        activity_flag: false,
+        silence_flag: false,
     }
 }
 
@@ -481,8 +483,35 @@ fn alert_kind_only_marks_bell_flags_as_alerts() {
     bell.set_flags("!");
     let mut silence = window("@3", 2, "silence", false, WindowAlert::None);
     silence.set_flags("~");
+    let mut current_and_alert = window("@4", 3, "build", false, WindowAlert::None);
+    current_and_alert.set_flags("#!");
 
     assert_eq!(activity.alert, WindowAlert::None);
+    assert!(activity.has_current_activity());
     assert_eq!(bell.alert, WindowAlert::Bell);
+    assert!(!bell.has_current_activity());
     assert_eq!(silence.alert, WindowAlert::None);
+    assert!(!silence.has_current_activity());
+    assert_eq!(current_and_alert.alert, WindowAlert::Bell);
+    assert!(current_and_alert.has_current_activity());
+}
+
+#[test]
+fn tree_rows_keep_current_activity_separate_from_bell_alerts() {
+    let mut active_window = window("@11", 1, "editor", true, WindowAlert::None);
+    active_window.set_flags("#!");
+    let app = AppState::from_tmux(TmuxState {
+        sessions: vec![session("$1", "work", Some("@11"), vec![active_window])],
+        clients: vec![client("client-1", "$1", Some("@11"), 10)],
+    });
+
+    let row = app
+        .tree_rows()
+        .into_iter()
+        .find(|row| row.focus == window_focus("$1", "@11"))
+        .expect("expected editor row");
+
+    assert!(row.active());
+    assert!(row.current_activity());
+    assert_eq!(row.alert(), Some(WindowAlert::Bell));
 }

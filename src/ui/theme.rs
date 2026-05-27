@@ -89,6 +89,12 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    pub fn badge_activity(self) -> Style {
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn badge_alert(self) -> Style {
         Style::default().fg(self.alert).add_modifier(Modifier::BOLD)
     }
@@ -155,6 +161,12 @@ mod tests {
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        );
+        assert_eq!(
+            theme.badge_activity(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         );
         assert_eq!(
             theme.row_inline_edit_focused(),

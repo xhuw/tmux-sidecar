@@ -178,3 +178,81 @@ fn snapshot_reads_background_window_alerts() -> Result<(), Box<dyn std::error::E
 
     Err("background window bell alert was not observed in snapshot".into())
 }
+
+#[test]
+#[serial]
+fn snapshot_reads_background_window_current_activity_until_silence_timeout()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let _control = ControlClient::attach(&server.socket_name, "it-main")?;
+    let tmux = TmuxCli {
+        socket_name: Some(server.socket_name.clone()),
+        socket_path: None,
+    };
+    let extra_window_id = tmux.snapshot()?.sessions[0]
+        .windows
+        .iter()
+        .find(|window| window.name == "extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing extra window in snapshot")?;
+
+    tmux.configure_activity_monitoring(&extra_window_id)?;
+    assert_eq!(
+        run_tmux(
+            &server.socket_name,
+            &[
+                "show-options",
+                "-wqv",
+                "-t",
+                "it-main:1",
+                "monitor-activity"
+            ],
+        )?
+        .trim(),
+        "on"
+    );
+    assert_eq!(
+        run_tmux(
+            &server.socket_name,
+            &["show-options", "-wqv", "-t", "it-main:1", "monitor-silence"],
+        )?
+        .trim(),
+        "10"
+    );
+
+    run_tmux(
+        &server.socket_name,
+        &["send-keys", "-t", "it-main:1", "printf hi", "Enter"],
+    )?;
+
+    for _ in 0..20 {
+        let snapshot = tmux.snapshot()?;
+        let extra_window = snapshot.sessions[0]
+            .windows
+            .iter()
+            .find(|window| window.name == "extra")
+            .ok_or("missing extra window in snapshot")?;
+        if extra_window.has_current_activity() {
+            thread::sleep(Duration::from_secs(11));
+            let snapshot = tmux.snapshot()?;
+            let extra_window = snapshot.sessions[0]
+                .windows
+                .iter()
+                .find(|window| window.name == "extra")
+                .ok_or("missing extra window in snapshot")?;
+            assert!(extra_window.activity_flag);
+            assert!(extra_window.silence_flag);
+            assert!(!extra_window.has_current_activity());
+            return Ok(());
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err("background window activity was not observed in snapshot".into())
+}

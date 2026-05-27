@@ -8,6 +8,10 @@ use super::{
 };
 
 pub fn key_hints(state: &AppState) -> &'static str {
+    if state.is_tree_loading() {
+        return "Loading tmux tree...";
+    }
+
     if state.navigation.jumping {
         return "Jump: type label to switch  invalid key cancels";
     }
@@ -47,6 +51,8 @@ pub fn modal_lines(glyph_mode: GlyphMode, theme: Theme) -> Vec<Line<'static>> {
             Span::styled(format!("{} focused", glyphs.focus), theme.marker_focus()),
             Span::raw("   "),
             Span::styled(format!("{} active", glyphs.active), theme.badge_active()),
+            Span::raw("   "),
+            Span::styled("... activity", theme.badge_activity()),
             Span::raw("   "),
             Span::styled(format!("{} alert", glyphs.alert), theme.badge_alert()),
         ]),

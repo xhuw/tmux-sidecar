@@ -125,16 +125,24 @@ pub struct Window {
     pub flags: String,
     pub alert: WindowAlert,
     pub activity: u64,
+    pub activity_flag: bool,
+    pub silence_flag: bool,
 }
 
 impl Window {
     pub fn set_flags(&mut self, flags: impl Into<String>) {
         self.flags = flags.into();
+        self.activity_flag = self.flags.contains('#');
+        self.silence_flag = self.flags.contains('~');
         self.alert = WindowAlert::from_flags(&self.flags);
     }
 
     pub fn has_alert(&self) -> bool {
         self.alert.is_alerting()
+    }
+
+    pub fn has_current_activity(&self) -> bool {
+        self.activity_flag && !self.silence_flag
     }
 }
 
@@ -289,6 +297,7 @@ pub enum TreeRowKind {
         index: u32,
         name: String,
         active: bool,
+        current_activity: bool,
         alert: WindowAlert,
     },
     CreateWindow {
@@ -334,6 +343,7 @@ impl TreeRow {
                 index: window.index,
                 name: window.name.clone(),
                 active,
+                current_activity: window.has_current_activity(),
                 alert: window.alert,
             },
         }
@@ -360,6 +370,15 @@ impl TreeRow {
         match &self.kind {
             TreeRowKind::Window { alert, .. } if alert.is_alerting() => Some(*alert),
             _ => None,
+        }
+    }
+
+    pub fn current_activity(&self) -> bool {
+        match &self.kind {
+            TreeRowKind::Window {
+                current_activity, ..
+            } => *current_activity,
+            _ => false,
         }
     }
 }
@@ -395,6 +414,10 @@ impl AppState {
             tmux,
             ..Self::default()
         }
+    }
+
+    pub fn is_tree_loading(&self) -> bool {
+        self.target_client.is_some() && self.tmux.sessions.is_empty()
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {

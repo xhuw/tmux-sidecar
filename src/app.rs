@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io, panic,
     sync::Once,
     time::{Duration, Instant},
@@ -22,7 +23,7 @@ use crate::{
     input::InputBuffer,
     model::{
         ActionError, AppState, ClientName, EditAction, Focus, FocusMove, FocusReconcile, Mode,
-        TmuxState, WindowTarget,
+        TmuxState, WindowId, WindowTarget,
     },
     tmux::{Tmux, TmuxCli, TmuxError},
     ui,
@@ -36,6 +37,7 @@ pub struct App {
     state: AppState,
     tmux: TmuxCli,
     poll_interval: Duration,
+    activity_monitored_window_ids: HashSet<WindowId>,
     should_quit: bool,
 }
 
@@ -52,6 +54,7 @@ impl App {
             state: AppState::default(),
             tmux,
             poll_interval,
+            activity_monitored_window_ids: HashSet::new(),
             should_quit: false,
         }
     }
@@ -125,8 +128,6 @@ impl App {
         let target_client = self.tmux.check_startup(self.cli.target_client.as_deref())?;
 
         self.state.target_client = Some(target_client);
-        self.refresh_snapshot()?;
-        self.state.focus_visible_target();
         Ok(())
     }
 
@@ -134,12 +135,13 @@ impl App {
         while !self.should_quit {
             terminal.draw(|frame| ui::render(frame, &self.state))?;
 
-            let event = event::poll_next(self.timeout_until_poll())?;
-            self.handle_event(event)?;
-
             if self.poll_due() {
                 self.refresh_snapshot()?;
+                continue;
             }
+
+            let event = event::poll_next(self.timeout_until_poll())?;
+            self.handle_event(event)?;
         }
 
         Ok(())
@@ -161,8 +163,32 @@ impl App {
 
     fn refresh_snapshot(&mut self) -> Result<()> {
         let snapshot = self.tmux.snapshot()?;
+        self.sync_activity_monitoring(&snapshot)?;
+        let should_focus_visible_target = self.state.is_tree_loading();
         self.apply_snapshot(snapshot);
+        if should_focus_visible_target {
+            self.state.focus_visible_target();
+        }
         self.state.next_poll_at = Some(Instant::now() + self.poll_interval);
+        Ok(())
+    }
+
+    fn sync_activity_monitoring(&mut self, snapshot: &TmuxState) -> Result<()> {
+        let current_window_ids: HashSet<_> = snapshot
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter().map(|window| window.id.clone()))
+            .collect();
+        let new_window_ids: Vec<_> = current_window_ids
+            .difference(&self.activity_monitored_window_ids)
+            .cloned()
+            .collect();
+
+        for window_id in &new_window_ids {
+            self.tmux.configure_activity_monitoring(window_id)?;
+        }
+
+        self.activity_monitored_window_ids = current_window_ids;
         Ok(())
     }
 
