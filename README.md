@@ -125,6 +125,16 @@ tmux-sidecar init-plugin
 
 Launching `tmux-sidecar` also refreshes the hooks automatically, but the tmux config snippet is the recommended always-on setup.
 
+### Status line alert count
+
+For a dynamic tmux status line count of active bell alerts, install the hooks and add `query alerts` to a `#(...)` status command:
+
+```tmux
+run-shell -b 'tmux-sidecar install-hooks'
+set -g status-interval 1
+set -g status-right '#[fg=red]alerts #(tmux-sidecar query --socket-path #{q:socket_path} alerts)#[default] | %H:%M'
+```
+
 ---
 
 ## Usage
@@ -170,6 +180,7 @@ Launching `tmux-sidecar` also refreshes the hooks automatically, but the tmux co
 | `init-plugin` | Print the recommended `run-shell -b 'tmux-sidecar install-hooks'` snippet |
 | `server` | Run the local per-socket sidecar server (normally auto-started); use `server --kill` to stop the running server for the selected tmux socket |
 | `hook` | Send one tmux hook event to the sidecar server (normally used by installed hooks) |
+| `query alerts` | Print the number of active bell alerts tracked by the sidecar server, suitable for tmux `#(...)` status lines |
 
 ### Options
 

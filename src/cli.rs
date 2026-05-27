@@ -62,6 +62,39 @@ pub enum CliCommand {
     Server(ServerArgs),
     /// Send a single tmux hook event to the sidecar server.
     Hook(HookArgs),
+    /// Query current sidecar state for scripts and status lines.
+    Query(QueryArgs),
+}
+
+#[derive(Debug, Clone, Args, Default)]
+#[command(group(
+    ArgGroup::new("query_socket")
+        .args(["socket_name", "socket_path"])
+        .multiple(false)
+))]
+pub struct QueryArgs {
+    /// tmux socket name passed with `tmux -L`.
+    #[arg(long = "socket-name", value_name = "SOCKET")]
+    pub socket_name: Option<String>,
+
+    /// tmux socket path passed with `tmux -S`.
+    #[arg(long = "socket-path", value_name = "PATH")]
+    pub socket_path: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub command: Option<QueryCommand>,
+}
+
+impl QueryArgs {
+    pub fn command_or_default(&self) -> QueryCommand {
+        self.command.unwrap_or(QueryCommand::Alerts)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum QueryCommand {
+    /// Print the number of active bell alerts.
+    Alerts,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -149,7 +182,7 @@ pub struct HookArgs {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, CliCommand};
+    use super::{Cli, CliCommand, QueryCommand};
 
     #[test]
     fn parses_hook_management_subcommands() {
@@ -176,6 +209,43 @@ mod tests {
         };
 
         assert_eq!(args.socket_name.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn query_defaults_to_alerts_and_accepts_explicit_alerts_command() {
+        let cli = Cli::try_parse_from(["tmux-sidecar", "query"]).unwrap();
+
+        let Some(CliCommand::Query(args)) = cli.command else {
+            panic!("expected query command");
+        };
+        assert_eq!(args.command_or_default(), QueryCommand::Alerts);
+
+        let cli = Cli::try_parse_from(["tmux-sidecar", "query", "alerts"]).unwrap();
+
+        let Some(CliCommand::Query(args)) = cli.command else {
+            panic!("expected query alerts command");
+        };
+        assert_eq!(args.command_or_default(), QueryCommand::Alerts);
+    }
+
+    #[test]
+    fn query_accepts_socket_selection_flags() {
+        let cli = Cli::try_parse_from([
+            "tmux-sidecar",
+            "query",
+            "--socket-path",
+            "/tmp/tmux/default",
+            "alerts",
+        ])
+        .unwrap();
+
+        let Some(CliCommand::Query(args)) = cli.command else {
+            panic!("expected query command");
+        };
+        assert_eq!(
+            args.socket_path.as_deref(),
+            Some(std::path::Path::new("/tmp/tmux/default"))
+        );
     }
 
     #[test]

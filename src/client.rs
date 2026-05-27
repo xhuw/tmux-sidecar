@@ -17,13 +17,14 @@ use crate::{
     cli::HookArgs,
     ipc::{
         AckKind, Action, ActionRequest, ClientKind, ClientMessage, Hello, HookEvent,
-        PROTOCOL_VERSION, ServerMessage, SidecarPaths, Subscribe, write_message,
+        PROTOCOL_VERSION, ProjectionState, ServerMessage, SidecarPaths, Subscribe, write_message,
     },
     tmux::command::{SocketOptions, run_tmux},
 };
 
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const PROJECTION_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct IpcClient {
@@ -176,6 +177,26 @@ pub fn subscribe(tmux_socket_path: &Path, target_client: Option<String>) -> Resu
     let mut client = IpcClient::connect_or_spawn(tmux_socket_path, ClientKind::Ui)?;
     client.send(&ClientMessage::Subscribe(Subscribe { target_client }))?;
     Ok(client)
+}
+
+pub fn request_snapshot(tmux_socket_path: &Path) -> Result<ProjectionState> {
+    let mut client = IpcClient::connect_or_spawn(tmux_socket_path, ClientKind::Control)?;
+    client.send(&ClientMessage::SnapshotRequest)?;
+    client.set_read_timeout(Some(PROJECTION_QUERY_TIMEOUT))?;
+    let result = match client.read_status()? {
+        ReadStatus::Message(ServerMessage::StateUpdated(update)) => Ok(update.state),
+        ReadStatus::Message(ServerMessage::Error(error)) => Err(anyhow!(error.message)),
+        ReadStatus::Message(message) => Err(anyhow!("unexpected snapshot response: {message:?}")),
+        ReadStatus::Pending => Err(anyhow!("timed out waiting for sidecar snapshot")),
+        ReadStatus::Closed => Err(anyhow!("sidecar server closed the connection")),
+    };
+    let reset = client.set_read_timeout(None);
+
+    match (result, reset) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(state), Ok(())) => Ok(state),
+    }
 }
 
 pub fn shutdown_server(tmux_socket_path: &Path) -> Result<()> {

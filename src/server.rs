@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::BufReader,
     os::unix::net::{UnixListener, UnixStream},
@@ -376,6 +376,8 @@ fn preserve_cached_bell_flags(
     next_state: &mut ProjectionState,
     hook_event: Option<&HookEvent>,
 ) {
+    let viewed_windows = viewed_projection_windows(next_state);
+
     for previous_session in &previous_state.sessions {
         let Some(next_session) = next_state
             .sessions
@@ -399,6 +401,8 @@ fn preserve_cached_bell_flags(
             };
 
             if next_window.bell_flag
+                || viewed_windows
+                    .contains(&(previous_session.id.clone(), previous_window.id.clone()))
                 || hook_event_clears_cached_bell(
                     hook_event,
                     &previous_session.id,
@@ -412,6 +416,27 @@ fn preserve_cached_bell_flags(
             next_window.bell_flag = true;
         }
     }
+}
+
+fn viewed_projection_windows(state: &ProjectionState) -> BTreeSet<(String, String)> {
+    let active_window_by_session: BTreeMap<&str, &str> = state
+        .sessions
+        .iter()
+        .filter_map(|session| Some((session.id.as_str(), session.active_window_id.as_deref()?)))
+        .collect();
+
+    state
+        .clients
+        .iter()
+        .filter_map(|client| {
+            let window_id = client.current_window_id.as_deref().or_else(|| {
+                active_window_by_session
+                    .get(client.session_id.as_str())
+                    .copied()
+            })?;
+            Some((client.session_id.clone(), window_id.to_owned()))
+        })
+        .collect()
 }
 
 fn hook_event_clears_cached_bell(
@@ -664,8 +689,9 @@ mod tests {
     use super::{Server, ServerTmuxOps, execute_action_request};
     use crate::ipc::{
         Ack, AckKind, Action, ActionRequest, ActionResult, ActionResultKind, ClientKind,
-        ClientMessage, Hello, HookEvent, HookName, PROTOCOL_VERSION, ProjectionSession,
-        ProjectionState, ProjectionWindow, ServerMessage, SidecarPaths, StateUpdated,
+        ClientMessage, Hello, HookEvent, HookName, PROTOCOL_VERSION, ProjectionClient,
+        ProjectionSession, ProjectionState, ProjectionWindow, ServerMessage, SidecarPaths,
+        StateUpdated,
     };
     use crate::{
         model::{ClientName, SessionId, WindowId, WindowTarget},
@@ -973,6 +999,28 @@ mod tests {
         }
     }
 
+    fn add_projection_client(
+        state: &mut ProjectionState,
+        name: &str,
+        session_id: &str,
+        window_id: &str,
+    ) {
+        if let Some(session) = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+        {
+            session.attached_count = session.attached_count.max(1);
+        }
+        state.clients.push(ProjectionClient {
+            name: name.to_owned(),
+            session_id: session_id.to_owned(),
+            current_window_id: Some(window_id.to_owned()),
+            activity: 1,
+            tty: String::from("/dev/pts/1"),
+        });
+    }
+
     fn shutdown_server(socket_path: &Path) -> Result<()> {
         let mut shutdown = RawClient::connect(socket_path, ClientKind::Control)?;
         shutdown.send(&ClientMessage::Shutdown)?;
@@ -1051,6 +1099,80 @@ mod tests {
         server_thread.join().expect("server thread panicked")?;
         assert!(!sidecar_paths.socket_path.exists());
         assert!(!sidecar_paths.pid_path.exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_request_returns_current_state_without_registering_subscriber() -> Result<()> {
+        let sandbox = TestDir::new("server-query")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        let server = Server::bind(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state.clone(),
+            false,
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 1,
+                state: initial_state.clone(),
+            })
+        );
+
+        let mut query = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Control)?;
+        query.send(&ClientMessage::SnapshotRequest)?;
+        assert_eq!(
+            query.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 1,
+                state: initial_state.clone(),
+            })
+        );
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::AlertBell,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_index: Some(0),
+            pane_id: Some(String::from("%1")),
+            client_name: None,
+            timestamp_ms: Some(1_000),
+        }))?;
+
+        let mut alerted_state = initial_state;
+        alerted_state.sessions[0].windows[0].bell_flag = true;
+        alerted_state.sessions[0].windows[0].activity = 1;
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: alerted_state,
+            })
+        );
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+
+        drop(query);
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
 
         Ok(())
     }
@@ -1240,6 +1362,130 @@ mod tests {
             window_index: Some(0),
             pane_id: Some(String::from("%1")),
             client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: snapshot_without_alert,
+            })
+        );
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn cached_bell_alert_clears_on_action_refresh_when_client_views_window() -> Result<()> {
+        let sandbox = TestDir::new("server-alert-action-clear")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        initial_state.sessions[0].windows[0].bell_flag = true;
+        let mut snapshot_without_alert =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        add_projection_client(&mut snapshot_without_alert, "client-1", "$1", "@1");
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![snapshot_without_alert.clone()],
+            vec![Ok(())],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux,
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut client = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        client.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = client.recv()?;
+
+        let request = ActionRequest {
+            request_id: String::from("req-switch"),
+            target_client: Some(String::from("client-1")),
+            action: Action::SwitchWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            },
+        };
+        client.send(&ClientMessage::ActionRequest(request.clone()))?;
+
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: snapshot_without_alert,
+            })
+        );
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::ActionResult(ActionResult {
+                request_id: request.request_id,
+                result: ActionResultKind::Ok,
+            })
+        );
+
+        shutdown_server(&sidecar_paths.socket_path)?;
+        drop(client);
+        server_thread.join().expect("server thread panicked")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn cached_bell_alert_clears_on_hook_refresh_when_client_views_window() -> Result<()> {
+        let sandbox = TestDir::new("server-alert-client-view-clear")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        initial_state.sessions[0].windows[0].bell_flag = true;
+        let mut snapshot_without_alert =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        add_projection_client(&mut snapshot_without_alert, "client-1", "$1", "@1");
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![snapshot_without_alert.clone()],
+            vec![],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux,
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::ClientAttached,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_index: Some(0),
+            pane_id: None,
+            client_name: Some(String::from("client-1")),
             timestamp_ms: None,
         }))?;
 

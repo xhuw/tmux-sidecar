@@ -308,6 +308,14 @@ impl ProjectionState {
                 .collect(),
         }
     }
+
+    pub fn active_alert_count(&self) -> usize {
+        self.sessions
+            .iter()
+            .flat_map(|session| &session.windows)
+            .filter(|window| window.bell_flag)
+            .count()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -499,5 +507,61 @@ mod tests {
     fn client_kind_serializes_with_kebab_case_names() {
         let encoded = serde_json::to_string(&ClientKind::Control).expect("serialize client kind");
         assert_eq!(encoded, "\"control\"");
+    }
+
+    #[test]
+    fn projection_state_counts_active_bell_alerts() {
+        let state = super::ProjectionState {
+            tmux_socket_path: Path::new("/tmp/tmux/default").to_path_buf(),
+            sessions: vec![
+                super::ProjectionSession {
+                    id: String::from("$1"),
+                    name: String::from("work"),
+                    attached_count: 1,
+                    active_window_id: Some(String::from("@1")),
+                    windows: vec![
+                        super::ProjectionWindow {
+                            id: String::from("@1"),
+                            index: 0,
+                            name: String::from("shell"),
+                            active: true,
+                            activity: 0,
+                            activity_flag: true,
+                            bell_flag: false,
+                            silence_flag: false,
+                        },
+                        super::ProjectionWindow {
+                            id: String::from("@2"),
+                            index: 1,
+                            name: String::from("tests"),
+                            active: false,
+                            activity: 0,
+                            activity_flag: false,
+                            bell_flag: true,
+                            silence_flag: false,
+                        },
+                    ],
+                },
+                super::ProjectionSession {
+                    id: String::from("$2"),
+                    name: String::from("notes"),
+                    attached_count: 0,
+                    active_window_id: Some(String::from("@3")),
+                    windows: vec![super::ProjectionWindow {
+                        id: String::from("@3"),
+                        index: 0,
+                        name: String::from("scratch"),
+                        active: false,
+                        activity: 0,
+                        activity_flag: false,
+                        bell_flag: true,
+                        silence_flag: true,
+                    }],
+                },
+            ],
+            clients: Vec::new(),
+        };
+
+        assert_eq!(state.active_alert_count(), 2);
     }
 }

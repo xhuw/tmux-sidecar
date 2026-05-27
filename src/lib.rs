@@ -5,6 +5,7 @@ pub mod event;
 pub mod input;
 pub mod ipc;
 pub mod model;
+pub mod query;
 pub mod server;
 pub mod state_cache;
 pub mod tmux;
@@ -27,6 +28,7 @@ pub fn run(cli: cli::Cli) -> Result<()> {
         }
         Some(cli::CliCommand::Server(command)) => run_server(&command),
         Some(cli::CliCommand::Hook(command)) => client::run_hook(command),
+        Some(cli::CliCommand::Query(command)) => run_query(&cli, &command),
         None => run_app(cli),
     }
 }
@@ -45,6 +47,21 @@ fn install_hooks(command: &cli::InstallHooksArgs) -> Result<()> {
 fn uninstall_hooks(command: &cli::UninstallHooksArgs) -> Result<()> {
     tmux_cli(command.socket_name.clone(), command.socket_path.clone()).uninstall_hooks()?;
     Ok(())
+}
+
+fn run_query(cli: &cli::Cli, command: &cli::QueryArgs) -> Result<()> {
+    let tmux_socket_path = client::resolve_tmux_socket_path(
+        command
+            .socket_name
+            .clone()
+            .or_else(|| cli.socket_name.clone()),
+        command
+            .socket_path
+            .clone()
+            .or_else(|| cli.socket_path.clone()),
+    )?;
+    let state = client::request_snapshot(&tmux_socket_path)?;
+    query::write_result(command, &state, &mut std::io::stdout())
 }
 
 fn run_server(command: &cli::ServerArgs) -> Result<()> {
