@@ -508,17 +508,13 @@ fn alert_kind_only_marks_bell_flags_as_alerts() {
     current_and_alert.set_flags("#!");
 
     assert_eq!(activity.alert, WindowAlert::None);
-    assert!(activity.has_current_activity());
     assert_eq!(bell.alert, WindowAlert::Bell);
-    assert!(!bell.has_current_activity());
     assert_eq!(silence.alert, WindowAlert::None);
-    assert!(!silence.has_current_activity());
     assert_eq!(current_and_alert.alert, WindowAlert::Bell);
-    assert!(current_and_alert.has_current_activity());
 }
 
 #[test]
-fn tree_rows_keep_current_activity_separate_from_bell_alerts() {
+fn tree_rows_ignore_activity_flags_but_keep_bell_alerts() {
     let mut active_window = window("@11", 1, "editor", true, WindowAlert::None);
     active_window.set_flags("#!");
     let app = AppState::from_tmux(TmuxState {
@@ -531,8 +527,7 @@ fn tree_rows_keep_current_activity_separate_from_bell_alerts() {
         .into_iter()
         .find(|row| row.focus == window_focus("$1", "@11"))
         .expect("expected editor row");
-
     assert!(row.active());
-    assert!(row.current_activity());
+    assert!(row.active());
     assert_eq!(row.alert(), Some(WindowAlert::Bell));
 }

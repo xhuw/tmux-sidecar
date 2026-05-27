@@ -82,12 +82,7 @@ pub struct TreeView {
 }
 
 impl TreeView {
-    pub fn from_state(
-        state: &AppState,
-        theme: Theme,
-        glyphs: Glyphs,
-        activity_animation_frame: usize,
-    ) -> Self {
+    pub fn from_state(state: &AppState, theme: Theme, glyphs: Glyphs) -> Self {
         let rows = state.tree_rows();
         let focused = state.focused_row_index();
         let inline_edit = inline_edit_target(&state.mode);
@@ -164,12 +159,6 @@ impl TreeView {
                 badges.push(Span::styled(
                     format!(" {} active", glyphs.active),
                     theme.badge_active(),
-                ));
-            }
-            if row.current_activity() {
-                badges.push(Span::styled(
-                    format!(" {}", activity_label(activity_animation_frame)),
-                    theme.badge_activity(),
                 ));
             }
             if let Some(alert) = row.alert() {
@@ -292,14 +281,6 @@ fn render_with_cursor(input: &crate::input::InputBuffer) -> String {
     let cursor = input.cursor().min(text.len());
     let (head, tail) = text.split_at(cursor);
     format!("{head}|{tail}")
-}
-
-fn activity_label(activity_animation_frame: usize) -> &'static str {
-    match activity_animation_frame % 3 {
-        0 => ".  ",
-        1 => ".. ",
-        _ => "...",
-    }
 }
 
 fn alert_label(alert: WindowAlert) -> &'static str {

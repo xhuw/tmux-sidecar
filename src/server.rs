@@ -438,18 +438,8 @@ fn apply_hook_event_overlay(state: &mut ProjectionState, event: &HookEvent) {
     };
 
     match event.event {
-        HookName::AlertActivity => {
-            window.activity_flag = true;
-            window.silence_flag = false;
-            update_activity_timestamp(window, event);
-        }
         HookName::AlertBell => {
             window.bell_flag = true;
-            update_activity_timestamp(window, event);
-        }
-        HookName::AlertSilence => {
-            window.activity_flag = true;
-            window.silence_flag = true;
             update_activity_timestamp(window, event);
         }
         _ => {}

@@ -31,8 +31,8 @@ Useful tmux behavior verified against an isolated socket:
 
 - `list-sessions -F` and `list-windows -a -F` provide enough data for a session/window tree.
 - Windows may be linked into multiple sessions; alert flags and current-window state are session-local to each winlink, even when `window_id` is shared.
-- tmux 3.0a does not set `window_*_flag` or `session_alerts` for activity in a session's current window, even if that session is not the target client that sidecar is following. Sidecar does not synthesize activity from `window_activity`; it only animates activity when tmux reports `window_activity_flag` without `window_silence_flag`.
-- With `monitor-activity on` and `monitor-silence 10`, background window activity sets `window_activity_flag`, and after roughly ten seconds of inactivity tmux also sets `window_silence_flag`; sidecar can therefore treat `activity && !silence` as current activity while still preserving real tmux bell flags.
+- tmux 3.0a does not set `window_*_flag` or `session_alerts` for activity in a session's current window, even if that session is not the target client that sidecar is following. Sidecar now ignores activity/silence flags for UI alerts and only displays bell alerts.
+- With `monitor-activity on` and `monitor-silence 10`, background window activity sets `window_activity_flag`, and after roughly ten seconds of inactivity tmux also sets `window_silence_flag`; sidecar intentionally does not configure these options.
 - `select-window -t <session>:<window>` works without a current tmux client and updates the active window for that session.
 - `switch-client` without a current or targeted client fails with `no current client`, so the app must resolve a target client before activation can satisfy the README's switch semantics.
 - `list-clients -F` is empty when all sessions are detached; outside-tmux activation therefore needs either an attached client, an explicit `--client`, or a documented fatal startup error.

@@ -389,9 +389,50 @@ fn install_hooks_configures_monitoring_and_uninstall_keeps_user_hooks()
             "display-message keep-me",
         ],
     )?;
+    run_tmux(
+        &server.socket_name,
+        &[
+            "set-hook",
+            "-g",
+            "alert-activity[909]",
+            "display-message stale-activity",
+        ],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &[
+            "set-hook",
+            "-g",
+            "alert-silence[911]",
+            "display-message stale-silence",
+        ],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &["set-window-option", "-g", "monitor-activity", "off"],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &["set-window-option", "-g", "monitor-silence", "123"],
+    )?;
+    for target in ["it-main:0", "it-main:1", "it-second:0"] {
+        run_tmux(
+            &server.socket_name,
+            &["set-window-option", "-t", target, "monitor-activity", "off"],
+        )?;
+        run_tmux(
+            &server.socket_name,
+            &["set-window-option", "-t", target, "monitor-silence", "77"],
+        )?;
+    }
 
     let tmux = server.tmux_cli();
     tmux.install_hooks(&hooks::HookCommandProgram::default())?;
+
+    let activity_hooks = run_tmux(&server.socket_name, &["show-hooks", "-g", "alert-activity"])?;
+    assert!(!activity_hooks.contains("stale-activity"));
+    let silence_hooks = run_tmux(&server.socket_name, &["show-hooks", "-g", "alert-silence"])?;
+    assert!(!silence_hooks.contains("stale-silence"));
 
     for target in ["it-main:0", "it-main:1", "it-second:0"] {
         assert_eq!(
@@ -400,7 +441,7 @@ fn install_hooks_configures_monitoring_and_uninstall_keeps_user_hooks()
                 &["show-options", "-wqv", "-t", target, "monitor-activity"],
             )?
             .trim(),
-            "on"
+            "off"
         );
         assert_eq!(
             run_tmux(
@@ -416,7 +457,7 @@ fn install_hooks_configures_monitoring_and_uninstall_keeps_user_hooks()
                 &["show-options", "-wqv", "-t", target, "monitor-silence"],
             )?
             .trim(),
-            "10"
+            "77"
         );
     }
 
@@ -426,7 +467,7 @@ fn install_hooks_configures_monitoring_and_uninstall_keeps_user_hooks()
             &["show-options", "-gwqv", "monitor-activity"],
         )?
         .trim(),
-        "on"
+        "off"
     );
     assert_eq!(
         run_tmux(
@@ -442,19 +483,18 @@ fn install_hooks_configures_monitoring_and_uninstall_keeps_user_hooks()
             &["show-options", "-gwqv", "monitor-silence"],
         )?
         .trim(),
-        "10"
+        "123"
     );
 
     run_tmux(
         &server.socket_name,
         &["new-window", "-d", "-t", "it-main:", "-n", "post-install"],
     )?;
-    for option in ["monitor-activity", "monitor-bell", "monitor-silence"] {
-        let expected = if option == "monitor-silence" {
-            "10"
-        } else {
-            "on"
-        };
+    for (option, expected) in [
+        ("monitor-activity", "off"),
+        ("monitor-bell", "on"),
+        ("monitor-silence", "123"),
+    ] {
         assert_eq!(
             run_tmux(
                 &server.socket_name,
@@ -491,6 +531,10 @@ fn install_hooks_configures_monitoring_and_uninstall_keeps_user_hooks()
             .lines()
             .any(|line| line.trim() == "session-created[7] display-message keep-me")
     );
+    let activity_hooks = run_tmux(&server.socket_name, &["show-hooks", "-g", "alert-activity"])?;
+    assert!(!activity_hooks.contains("stale-activity"));
+    let silence_hooks = run_tmux(&server.socket_name, &["show-hooks", "-g", "alert-silence"])?;
+    assert!(!silence_hooks.contains("stale-silence"));
 
     Ok(())
 }

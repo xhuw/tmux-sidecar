@@ -9,7 +9,7 @@ Goal: make the rewrite safe by capturing current behavior and the failing alert 
 Tasks:
 
 - Run the existing checks to establish the baseline: `cargo fmt --all --check`, `cargo check`, and `cargo test`.
-- Add or update a failing integration test that reproduces alerts/activity from a non-current session not reaching the UI reliably.
+- Add or update a failing integration test that reproduces bell alerts from a non-current session not reaching the UI reliably.
 - Inventory reusable code: tmux command wrapper, snapshot parsers, domain row model, input buffer, rendering, and workflow tests.
 - Decide which current modules will be deleted or replaced. The polling `App` loop and UI-owned tmux adapter should be considered throwaway.
 
@@ -48,7 +48,7 @@ Tasks:
 - On bootstrap, collect full state with `list-sessions`, `list-windows -a`, and `list-clients`.
 - Implement dirty marking and debounce hook bursts into full snapshot reconciliation.
 - Apply alert hook payloads immediately when they include enough identity, then reconcile from tmux.
-- Configure `monitor-activity on`, `monitor-bell on`, and `monitor-silence 10` for all discovered windows.
+- Configure `monitor-bell on` for all discovered windows without changing user `monitor-activity` or `monitor-silence` settings.
 
 Done when:
 
@@ -72,7 +72,7 @@ Done when:
 
 - Reloading tmux config does not duplicate sidecar hooks.
 - Existing unrelated user hooks remain installed and still fire.
-- `alert-bell`, `alert-activity`, and `alert-silence` hooks reach the sidecar server from an isolated tmux server.
+- `alert-bell` hooks reach the sidecar server from an isolated tmux server.
 
 ## Phase 4: UI as a server subscriber
 
@@ -83,7 +83,7 @@ Tasks:
 - Replace `poll_interval_ms` sync behavior with a server subscription.
 - Keep focus, edit mode, help mode, jump state, and render state local to the UI.
 - Reconcile incoming `StateUpdated` messages with existing focus recovery rules.
-- Preserve a small local render tick only for animations, not for tmux refresh.
+- Avoid periodic render ticks for tmux refreshes or activity animations.
 - Exit cleanly if the server disconnects instead of rendering stale state.
 
 Done when:
@@ -115,7 +115,7 @@ Goal: prove the original issue is fixed.
 
 Tasks:
 
-- Add real tmux tests where a non-current session/window triggers bell, activity, and silence alerts.
+- Add real tmux tests where a non-current session/window triggers bell alerts.
 - Add linked-window tests where the same `window_id` appears in multiple sessions with different session-local alert and active state.
 - Verify alert updates are pushed to subscribers without waiting for a UI poll.
 - Verify selecting or switching a window lets tmux clear/preserve alerts according to normal tmux behavior, and sidecar follows the next hook/snapshot.

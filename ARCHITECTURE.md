@@ -8,7 +8,7 @@ tmux remains the durable source of truth. The sidecar server owns only an in-mem
 
 ## Goals
 
-- Track sessions, windows, clients, activity, silence, and bell alerts across all sessions in the tmux server.
+- Track sessions, windows, clients, and bell alerts across all sessions in the tmux server.
 - Keep linked windows session-local: active state and alert state are keyed by the session/winlink, not just `window_id`.
 - Push updates to every tmux-sidecar UI without requiring blind polling in the UI.
 - Route UI actions through one tmux command boundary so create, close, rename, and switch operations reconcile through the same state engine as hook updates.
@@ -55,6 +55,7 @@ Use a lock file next to the socket during auto-spawn so simultaneous hook invoca
 | --- | --- |
 | `tmux-sidecar` | Start the TUI. Resolve the tmux socket, ensure the server is running, subscribe, then render. |
 | `tmux-sidecar server --socket-path <path>` | Internal persistent daemon for one tmux server. Bootstraps state, listens on the sidecar Unix socket, and exits when the tmux server disappears or after an idle timeout. |
+| `tmux-sidecar server --kill [--socket-name <name>\|--socket-path <path>]` | Ask an existing sidecar server for the selected tmux socket to shut down without spawning a replacement. |
 | `tmux-sidecar hook --socket-path <path> --event <name> [ids...]` | Short-lived hook entry point. Connects to the server, auto-spawns it if needed, sends one hook event, and exits quickly. |
 | `tmux-sidecar install-hooks [--socket-path <path>]` | Installs or refreshes the tmux hook block and monitoring options for the current tmux server. Intended for `run-shell` from `.tmux.conf`. |
 | `tmux-sidecar uninstall-hooks [--socket-path <path>]` | Removes only tmux-sidecar's indexed hook entries. |
@@ -86,18 +87,16 @@ Install hooks for these state-changing classes:
 | --- | --- |
 | Sessions | `session-created`, `session-closed`, `session-renamed`, `session-window-changed` |
 | Windows/winlinks | `window-linked`, `window-unlinked`, `window-renamed`, `window-pane-changed`, `window-layout-changed` |
-| Alerts | `alert-activity`, `alert-bell`, `alert-silence` |
+| Alerts | `alert-bell` |
 | Clients | `client-attached`, `client-detached`, `client-session-changed` |
 | Command fallback | `after-new-session`, `after-new-window`, `after-rename-session`, `after-rename-window`, `after-kill-pane`, `after-select-window` |
 
 Some hooks overlap. That is acceptable because the server debounces updates and reconciles from snapshots.
 
-`install-hooks` should also configure monitoring for existing and future windows:
+`install-hooks` should also configure bell monitoring for existing and future windows:
 
 ```text
-monitor-activity on
 monitor-bell on
-monitor-silence 10
 ```
 
 Apply this at bootstrap for every window and after any hook that may introduce a new winlink/window. If tmux supports global defaults reliably for the target version, set those too, but do not rely on defaults alone.
@@ -246,7 +245,7 @@ loop:
   ActionResult error -> show footer error and rely on following StateUpdated
 ```
 
-No UI timer should be required for tmux sync. A small render tick may still exist for local animations such as the activity badge.
+No UI timer should be required for tmux sync.
 
 ## Startup and failure behavior
 
@@ -272,7 +271,7 @@ Integration tests against real isolated tmux servers:
 - `install-hooks` installs indexed hooks without removing an unrelated user hook.
 - Hook invocation auto-spawns the server.
 - Creating, renaming, closing, linking, and unlinking sessions/windows cause state updates without UI polling.
-- Bell/activity/silence in a non-current session reaches the server and UI subscription.
+- Bell alerts in a non-current session reach the server and UI subscription.
 - Linked windows keep alert and active state session-local.
 - UI actions for switch/create/rename/close reconcile through the server.
 

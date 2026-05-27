@@ -55,10 +55,6 @@ impl WindowState {
     pub fn alert(&self) -> WindowAlert {
         WindowAlert::from_indicators(self.activity_flag, self.bell_flag, self.silence_flag)
     }
-
-    pub fn has_current_activity(&self) -> bool {
-        self.activity_flag && !self.silence_flag
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -247,10 +243,6 @@ impl Window {
     pub fn has_alert(&self) -> bool {
         self.alert.is_alerting()
     }
-
-    pub fn has_current_activity(&self) -> bool {
-        self.activity_flag && !self.silence_flag
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -411,7 +403,6 @@ pub enum TreeRowKind {
         index: u32,
         name: String,
         active: bool,
-        current_activity: bool,
         alert: WindowAlert,
     },
     CreateWindow {
@@ -457,7 +448,6 @@ impl TreeRow {
                 index: window.index,
                 name: window.name.clone(),
                 active,
-                current_activity: window.has_current_activity(),
                 alert: window.alert,
             },
         }
@@ -484,15 +474,6 @@ impl TreeRow {
         match &self.kind {
             TreeRowKind::Window { alert, .. } if alert.is_alerting() => Some(*alert),
             _ => None,
-        }
-    }
-
-    pub fn current_activity(&self) -> bool {
-        match &self.kind {
-            TreeRowKind::Window {
-                current_activity, ..
-            } => *current_activity,
-            _ => false,
         }
     }
 }

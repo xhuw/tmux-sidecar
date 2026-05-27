@@ -139,10 +139,6 @@ impl TmuxCli {
     pub fn configure_all_window_monitoring(&self) -> Result<(), TmuxError> {
         hooks::configure_existing_window_monitoring(&self.socket_options())
     }
-
-    pub fn configure_activity_monitoring(&self, window: &WindowId) -> Result<(), TmuxError> {
-        self.configure_window_monitoring(window)
-    }
 }
 
 impl Tmux for TmuxCli {

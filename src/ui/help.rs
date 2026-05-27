@@ -52,8 +52,6 @@ pub fn modal_lines(glyph_mode: GlyphMode, theme: Theme) -> Vec<Line<'static>> {
             Span::raw("   "),
             Span::styled(format!("{} active", glyphs.active), theme.badge_active()),
             Span::raw("   "),
-            Span::styled("... activity", theme.badge_activity()),
-            Span::raw("   "),
             Span::styled(format!("{} alert", glyphs.alert), theme.badge_alert()),
         ]),
         Line::from(format!(

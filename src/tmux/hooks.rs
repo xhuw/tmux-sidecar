@@ -9,7 +9,6 @@ use super::{
 
 pub const DEFAULT_HOOK_BINARY: &str = "tmux-sidecar";
 pub const RESERVED_HOOK_INDEX_START: u16 = 900;
-pub const MONITOR_SILENCE_SECONDS: &str = "10";
 
 const TMUX_SOCKET_PATH_FORMAT: &str = "#{q:socket_path}";
 const SESSION_ID_FORMAT: &str = "#{q:session_id}";
@@ -58,7 +57,7 @@ const WINDOW_HOOKS: &[HookDefinition] = &[
 ];
 
 const ALERT_HOOKS: &[HookDefinition] = &[
-    HookDefinition::new(
+    HookDefinition::disabled(
         "alert-activity",
         &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
     ),
@@ -66,7 +65,7 @@ const ALERT_HOOKS: &[HookDefinition] = &[
         "alert-bell",
         &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
     ),
-    HookDefinition::new(
+    HookDefinition::disabled(
         "alert-silence",
         &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
     ),
@@ -130,11 +129,24 @@ impl HookArgument {
 struct HookDefinition {
     name: &'static str,
     args: &'static [HookArgument],
+    install: bool,
 }
 
 impl HookDefinition {
     const fn new(name: &'static str, args: &'static [HookArgument]) -> Self {
-        Self { name, args }
+        Self {
+            name,
+            args,
+            install: true,
+        }
+    }
+
+    const fn disabled(name: &'static str, args: &'static [HookArgument]) -> Self {
+        Self {
+            name,
+            args,
+            install: false,
+        }
     }
 }
 
@@ -193,6 +205,7 @@ pub fn installed_hooks(program: &HookCommandProgram) -> Vec<InstalledHook> {
     hook_definitions()
         .iter()
         .enumerate()
+        .filter(|(_, definition)| definition.install)
         .map(|(offset, definition)| InstalledHook {
             name: definition.name,
             index: RESERVED_HOOK_INDEX_START + offset as u16,
@@ -225,7 +238,7 @@ pub fn install_hooks(
 }
 
 pub fn uninstall_hooks(socket: &SocketOptions) -> Result<(), TmuxError> {
-    for hook in installed_hooks(&HookCommandProgram::default()) {
+    for hook in managed_hooks(&HookCommandProgram::default()) {
         command::run_tmux(
             socket,
             vec![
@@ -237,6 +250,18 @@ pub fn uninstall_hooks(socket: &SocketOptions) -> Result<(), TmuxError> {
     }
 
     Ok(())
+}
+
+fn managed_hooks(program: &HookCommandProgram) -> Vec<InstalledHook> {
+    hook_definitions()
+        .iter()
+        .enumerate()
+        .map(|(offset, definition)| InstalledHook {
+            name: definition.name,
+            index: RESERVED_HOOK_INDEX_START + offset as u16,
+            command: hook_command(program, definition),
+        })
+        .collect()
 }
 
 pub fn configure_existing_window_monitoring(socket: &SocketOptions) -> Result<(), TmuxError> {
@@ -326,12 +351,8 @@ fn list_window_ids(socket: &SocketOptions) -> Result<Vec<String>, TmuxError> {
         .collect())
 }
 
-fn window_monitoring_options() -> [(&'static str, &'static str); 3] {
-    [
-        ("monitor-activity", "on"),
-        ("monitor-bell", "on"),
-        ("monitor-silence", MONITOR_SILENCE_SECONDS),
-    ]
+fn window_monitoring_options() -> [(&'static str, &'static str); 1] {
+    [("monitor-bell", "on")]
 }
 
 fn shell_join(words: impl IntoIterator<Item = String>) -> String {
@@ -372,9 +393,9 @@ fn is_shell_safe(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIENT_NAME_FORMAT, HookCommandProgram, PANE_ID_FORMAT, RESERVED_HOOK_INDEX_START,
-        SESSION_ID_FORMAT, TMUX_SOCKET_PATH_FORMAT, WINDOW_ID_FORMAT, WINDOW_INDEX_FORMAT,
-        init_plugin_snippet, installed_hooks,
+        CLIENT_NAME_FORMAT, HookCommandProgram, PANE_ID_FORMAT, SESSION_ID_FORMAT,
+        TMUX_SOCKET_PATH_FORMAT, WINDOW_ID_FORMAT, WINDOW_INDEX_FORMAT, init_plugin_snippet,
+        installed_hooks, managed_hooks,
     };
 
     #[test]
@@ -394,9 +415,7 @@ mod tests {
                 "window-renamed",
                 "window-pane-changed",
                 "window-layout-changed",
-                "alert-activity",
                 "alert-bell",
-                "alert-silence",
                 "client-attached",
                 "client-detached",
                 "client-session-changed",
@@ -410,10 +429,35 @@ mod tests {
         );
 
         let indices: Vec<_> = hooks.iter().map(|hook| hook.index).collect();
-        let expected: Vec<_> =
-            (RESERVED_HOOK_INDEX_START..RESERVED_HOOK_INDEX_START + hooks.len() as u16).collect();
-        assert_eq!(indices, expected);
+        assert_eq!(
+            indices,
+            vec![
+                900, 901, 902, 903, 904, 905, 906, 907, 908, 910, 912, 913, 914, 915, 916, 917,
+                918, 919, 920,
+            ]
+        );
         assert!(indices.last().copied().unwrap_or_default() <= 949);
+    }
+
+    #[test]
+    fn managed_hooks_include_disabled_activity_slots_for_cleanup() {
+        let hooks = managed_hooks(&HookCommandProgram::default());
+
+        assert!(
+            hooks
+                .iter()
+                .any(|hook| hook.qualified_name() == "alert-activity[909]")
+        );
+        assert!(
+            hooks
+                .iter()
+                .any(|hook| hook.qualified_name() == "alert-silence[911]")
+        );
+        assert!(
+            !installed_hooks(&HookCommandProgram::default())
+                .iter()
+                .any(|hook| matches!(hook.name, "alert-activity" | "alert-silence"))
+        );
     }
 
     #[test]

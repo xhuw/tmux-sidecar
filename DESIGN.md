@@ -87,7 +87,6 @@ The UI should not assume a dark background. Light and dark terminal themes must 
 | --- | --- | --- |
 | Focused row | `>` | Accent marker and reverse-video row emphasis. |
 | Active tmux window | `*` | `active` foreground; label remains readable if also focused. |
-| Current window activity | `. .. ...` | `accent` foreground fixed-width animated badge when tmux reports activity without silence. |
 | Creation row | `[+]` | Muted label, accent plus sign. |
 | Alerted window | `!` | `alert` foreground badge on the right side of the window row. |
 | Inline edit | `[...]` | Warning prompt text; if also focused, combine with reverse-video emphasis. |
@@ -95,7 +94,7 @@ The UI should not assume a dark background. Light and dark terminal themes must 
 
 The table shows ASCII markers for clarity; the default rendered UI should use the glyph system above.
 
-Focus, active tmux state, current activity, and alert/notification state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, current activity owns the next badge, and alert owns the next right-side badge. A window can show active, activity, and alert states together.
+Focus, active tmux state, and alert/notification state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, and alert owns the next right-side badge. A window can show active and alert states together.
 
 ## Implementation plan
 
@@ -106,16 +105,15 @@ Focus, active tmux state, current activity, and alert/notification state are dif
 
 ## Alerts and notifications
 
-Window rows must show tmux bell alert state when tmux reports it, and they must show a separate current-activity indicator when tmux reports `activity && !silence`. Sidecar configures tmux window monitoring with `monitor-activity on` and `monitor-silence 10` so the animation reflects roughly the last ten seconds of activity. Alerts are visual only in the MVP; selecting or switching to a window lets tmux clear or preserve the alert according to normal tmux behavior.
+Window rows must show tmux bell alert state when tmux reports it. Sidecar configures tmux window monitoring with `monitor-bell on`; it does not change `monitor-activity` or `monitor-silence`. Alerts are visual only in the MVP; selecting or switching to a window lets tmux clear or preserve the alert according to normal tmux behavior.
 
 Alert display rules:
 
-- Show current activity and alerts only on window rows, not session rows, unless a later phase adds aggregated session badges.
-- Render current activity as a fixed-width `. .. ...` animation so the badge does not jitter as it cycles.
+- Show alerts only on window rows, not session rows, unless a later phase adds aggregated session badges.
 - Use the `alert` token and `󰂞` badge by default.
-- Do not replace the active marker or activity marker with the alert marker; show all applicable badges.
+- Do not replace the active marker with the alert marker; show all applicable badges.
 - Preserve alerts during external polling refreshes.
-- Include the activity and alert badges in the help modal legend.
+- Include the alert badge in the help modal legend.
 
 ## Interactions
 
