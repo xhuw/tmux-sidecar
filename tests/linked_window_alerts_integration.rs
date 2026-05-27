@@ -6,7 +6,7 @@ use std::{
 
 use serial_test::serial;
 use tmux_sidecar::{
-    model::{ClientName, TreeRowKind, WindowAlert},
+    model::{ClientName, TreeRowKind, WindowAlert, WinlinkKey},
     tmux::{Tmux, TmuxCli},
 };
 
@@ -151,6 +151,9 @@ fn linked_window_alerts_remain_session_local() -> Result<(), Box<dyn std::error:
             .and_then(|session| session.windows.first())
             .map(|window| window.id.clone())
             .ok_or("missing linked window in s1")?;
+        let session_states = snapshot.session_states();
+        let current_key = WinlinkKey::new(current_session_id.clone(), linked_window_id.clone());
+        let alerted_key = WinlinkKey::new(alerted_session_id.clone(), linked_window_id.clone());
         let rows = snapshot.tree_rows_for_client(Some(&target_client));
         let mut current_row = None;
         let mut alerted_row = None;
@@ -191,6 +194,17 @@ fn linked_window_alerts_remain_session_local() -> Result<(), Box<dyn std::error:
             && !alerted_active
             && alerted_alert == WindowAlert::Bell
             && current_focus != alerted_focus
+            && snapshot.visible_window_key(Some(&target_client)) == Some(current_key.clone())
+            && session_states
+                .get(&current_session_id)
+                .and_then(|session| session.windows.get(&current_key))
+                .map(|window| window.active && !window.bell_flag)
+                .unwrap_or(false)
+            && session_states
+                .get(&alerted_session_id)
+                .and_then(|session| session.windows.get(&alerted_key))
+                .map(|window| !window.active && window.bell_flag)
+                .unwrap_or(false)
         {
             return Ok(());
         }

@@ -42,7 +42,7 @@ pub fn modal_lines(glyph_mode: GlyphMode, theme: Theme) -> Vec<Line<'static>> {
         Line::from("S               jump to row label"),
         Line::from("c               new window in focused session"),
         Line::from("r               rename focused session/window"),
-        Line::from("x               close focused window"),
+        Line::from("x               close focused session/window"),
         Line::from("?               toggle help"),
         Line::from("q               quit"),
         Line::from(""),

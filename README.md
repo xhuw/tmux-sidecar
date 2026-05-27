@@ -46,14 +46,15 @@ Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x
 
 ## Why tmux-sidecar?
 
-- **Instant context** — see all your sessions and windows at a glance, always live-synced to tmux
+- **Instant context** — see all your sessions and windows at a glance in a UI subscribed to tmux-sidecar state updates
 - **One-keystroke everything** — switch, create, rename, or close without leaving the keyboard
 - **Mouse? Sure.** — click any row to jump straight to it
-- **Zero config** — attach inside tmux and it just works; no plugins, no hooks, no config changes required
+- **Hook-driven sync** — tmux hooks feed a local per-socket sidecar server, so the UI stays current without querying tmux for every refresh
+- **Plugin-friendly setup** — install or refresh the hook wiring with one `run-shell -b 'tmux-sidecar install-hooks'`
 - **Activity and alerts at a glance** — current activity animates in-place and bell alerts stay visible so nothing gets lost in a busy session
 - **Inline rename** — rename sessions and windows without dropping to a tmux prompt, with full cursor editing
-- **Survives chaos** — if something changes in tmux behind your back, the tree re-syncs and focus recovers gracefully
-- **Fast** — written in Rust; sub-millisecond renders, 500 ms background polling
+- **Survives chaos** — if something changes in tmux behind your back, the sidecar refreshes state and focus recovers gracefully
+- **Fast** — written in Rust with lightweight local IPC and cheap renders
 
 ---
 
@@ -69,7 +70,7 @@ Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x
 ### Build from source
 
 ```bash
-git clone https://github.com/youruser/tmux-sidecar
+git clone https://github.com/xhuw/tmux-sidecar
 cd tmux-sidecar
 cargo build --release
 ```
@@ -90,6 +91,8 @@ cp target/release/tmux-sidecar ~/.local/bin/
 tmux-sidecar
 ```
 
+On startup, tmux-sidecar reuses or auto-starts a local sidecar for the current tmux socket, refreshes hooks with `install-hooks`, and subscribes the UI to server-pushed state updates.
+
 For launcher-style behavior that exits as soon as you choose the destination:
 
 ```bash
@@ -104,7 +107,23 @@ tmux-sidecar --target-client <client-name>
 
 Not sure of the client name? `tmux list-clients` will tell you.
 
-That's it. The session tree opens full-screen and stays live.
+The session tree opens full-screen and stays live through the local sidecar server.
+
+### Recommended tmux setup
+
+Add this to `~/.tmux.conf` so tmux installs or refreshes the hooks whenever the server starts or you reload the config:
+
+```tmux
+run-shell -b 'tmux-sidecar install-hooks'
+```
+
+If you want the snippet generated for you:
+
+```bash
+tmux-sidecar init-plugin
+```
+
+Launching `tmux-sidecar` also refreshes the hooks automatically, but the tmux config snippet is the recommended always-on setup.
 
 ---
 
@@ -121,7 +140,7 @@ That's it. The session tree opens full-screen and stays live.
 | `S` | Show jump labels for visible rows, then switch immediately after choosing one |
 | `c` | Start the new-window inline create flow for the focused session, or for the focused window's session |
 | `r` | Rename the focused session or window (inline, no prompts) |
-| `x` | Close the focused window immediately |
+| `x` | Close the focused session or window immediately |
 | `?` | Open/close the help modal |
 | `q` or `Ctrl+c` | Quit |
 
@@ -142,19 +161,25 @@ That's it. The session tree opens full-screen and stays live.
 | Left click | Focus + activate that row |
 | Scroll wheel | Move focus up/down |
 
+### Commands
+
+| Command | Action |
+|---------|--------|
+| `install-hooks` | Install or refresh tmux-sidecar-managed hooks for the selected tmux socket |
+| `uninstall-hooks` | Remove tmux-sidecar-managed hooks from the selected tmux socket |
+| `init-plugin` | Print the recommended `run-shell -b 'tmux-sidecar install-hooks'` snippet |
+| `server` | Run the local per-socket sidecar server (normally auto-started) |
+| `hook` | Send one tmux hook event to the sidecar server (normally used by installed hooks) |
+
 ### Options
 
-```
-tmux-sidecar [OPTIONS]
-
-Options:
-  --target-client <name>      Use a specific tmux client for switching
-  --socket-name <name>        Connect to a named tmux socket (-L)
-  --socket-path <path>        Connect to a socket by path (-S)
-  --poll-interval-ms <ms>     Live-sync interval in milliseconds (default: 500)
-  --auto-quit                 Exit immediately after selecting a session or window
-  --print-snapshot            Print the session/window tree and exit (debug)
-```
+| Option | Action |
+|--------|--------|
+| `--target-client <name>` | Use a specific tmux client for switching |
+| `--socket-name <name>` | Connect to a named tmux socket (`tmux -L`) |
+| `--socket-path <path>` | Connect to a socket by path (`tmux -S`) |
+| `--poll-interval-ms <ms>` | Control the UI render/input poll tick while the TUI is open (default: `500`) |
+| `--auto-quit` | Exit immediately after selecting a session or window |
 
 ### ASCII / font fallback
 

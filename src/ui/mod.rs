@@ -244,6 +244,7 @@ mod tests {
         assert!(output.contains("s               start new session"));
         assert!(output.contains("S               jump to row label"));
         assert!(output.contains("c               new window in focused session"));
+        assert!(output.contains("x               close focused session/window"));
         assert!(output.contains("Failed actions refresh from tmux."));
     }
 

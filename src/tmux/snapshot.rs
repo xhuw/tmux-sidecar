@@ -1,6 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::model::{Client, ClientName, Session, TmuxState, Window, WindowAlert};
+use crate::model::{
+    Client, ClientName, Session, SessionId, SessionState, TmuxState, Window, WindowAlert,
+    WindowState, WinlinkKey,
+};
 
 use super::{
     TmuxError,
@@ -27,6 +30,7 @@ pub struct SnapshotSession {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotWindow {
+    pub key: WinlinkKey,
     pub id: String,
     pub index: u32,
     pub name: String,
@@ -52,24 +56,7 @@ impl SnapshotData {
                     windows: session
                         .windows
                         .into_iter()
-                        .map(|window| {
-                            let flags = window.flags.raw;
-                            Window {
-                                id: window.id,
-                                index: window.index,
-                                name: window.name,
-                                active: window.active,
-                                alert: WindowAlert::from_indicators(
-                                    window.alert_flags.has_activity,
-                                    window.alert_flags.has_bell,
-                                    window.alert_flags.has_silence,
-                                ),
-                                flags,
-                                activity: window.activity,
-                                activity_flag: window.alert_flags.has_activity,
-                                silence_flag: window.alert_flags.has_silence,
-                            }
-                        })
+                        .map(SnapshotWindow::into_window)
                         .collect(),
                 })
                 .collect(),
@@ -84,6 +71,75 @@ impl SnapshotData {
                     tty: client.tty,
                 })
                 .collect(),
+        }
+    }
+
+    pub fn into_session_states(self) -> BTreeMap<SessionId, SessionState> {
+        self.sessions
+            .into_iter()
+            .map(|session| {
+                let session_id = session.id.clone();
+                (session_id, session.into_session_state())
+            })
+            .collect()
+    }
+}
+
+impl SnapshotSession {
+    pub fn active_window_key(&self) -> Option<WinlinkKey> {
+        self.active_window_id
+            .as_ref()
+            .map(|window_id| WinlinkKey::new(self.id.clone(), window_id.clone()))
+    }
+
+    fn into_session_state(self) -> SessionState {
+        SessionState {
+            id: self.id,
+            name: self.name,
+            attached_count: self.attached_count.max(self.attached_clients.len() as u32),
+            active_window_id: self.active_window_id,
+            windows: self
+                .windows
+                .into_iter()
+                .map(|window| {
+                    let key = window.key.clone();
+                    (key, window.into_window_state())
+                })
+                .collect(),
+        }
+    }
+}
+
+impl SnapshotWindow {
+    pub fn into_window(self) -> Window {
+        let flags = self.flags.raw;
+        Window {
+            id: self.id,
+            index: self.index,
+            name: self.name,
+            active: self.active,
+            alert: WindowAlert::from_indicators(
+                self.alert_flags.has_activity,
+                self.alert_flags.has_bell,
+                self.alert_flags.has_silence,
+            ),
+            flags,
+            activity: self.activity,
+            activity_flag: self.alert_flags.has_activity,
+            silence_flag: self.alert_flags.has_silence,
+        }
+    }
+
+    pub fn into_window_state(self) -> WindowState {
+        WindowState {
+            id: self.id,
+            index: self.index,
+            name: self.name,
+            active: self.active,
+            activity: self.activity,
+            activity_flag: self.alert_flags.has_activity,
+            bell_flag: self.alert_flags.has_bell,
+            silence_flag: self.alert_flags.has_silence,
         }
     }
 }
@@ -160,6 +216,7 @@ pub fn collect_snapshot_data(socket: &SocketOptions) -> Result<SnapshotData, Tmu
         let alert_flags =
             resolve_window_alerts(&window.flags, &session.alerts_by_index, window.index);
         session.windows.push(SnapshotWindow {
+            key: WinlinkKey::new(session.id.clone(), window.id.clone()),
             id: window.id,
             index: window.index,
             name: window.name,
@@ -215,8 +272,11 @@ pub fn list_clients(socket: &SocketOptions) -> Result<Vec<ClientRecord>, TmuxErr
 mod tests {
     use std::collections::HashMap;
 
-    use super::resolve_window_alerts;
-    use crate::tmux::parse::{AlertFlags, WindowFlags};
+    use super::{SnapshotData, SnapshotSession, SnapshotWindow, resolve_window_alerts};
+    use crate::{
+        model::{SessionState, WinlinkKey},
+        tmux::parse::{AlertFlags, WindowFlags},
+    };
 
     #[test]
     fn resolve_window_alerts_keeps_explicit_window_alert_flags() {
@@ -248,5 +308,112 @@ mod tests {
         );
 
         assert!(alerts.has_bell);
+    }
+
+    #[test]
+    fn snapshot_data_projects_linked_windows_by_session_local_key() {
+        let session_states = SnapshotData {
+            sessions: vec![
+                SnapshotSession {
+                    id: "$1".to_string(),
+                    name: "current".to_string(),
+                    attached_count: 1,
+                    active_window_id: Some("@shared".to_string()),
+                    attached_clients: vec![],
+                    alerts_by_index: HashMap::new(),
+                    windows: vec![snapshot_window(
+                        "$1",
+                        "@shared",
+                        0,
+                        true,
+                        Default::default(),
+                    )],
+                },
+                SnapshotSession {
+                    id: "$2".to_string(),
+                    name: "other".to_string(),
+                    attached_count: 0,
+                    active_window_id: Some("@20".to_string()),
+                    attached_clients: vec![],
+                    alerts_by_index: HashMap::new(),
+                    windows: vec![
+                        snapshot_window("$2", "@20", 0, true, Default::default()),
+                        snapshot_window(
+                            "$2",
+                            "@shared",
+                            5,
+                            false,
+                            AlertFlags {
+                                has_activity: false,
+                                has_bell: true,
+                                has_silence: false,
+                            },
+                        ),
+                    ],
+                },
+            ],
+            clients: vec![],
+        }
+        .into_session_states();
+
+        assert_eq!(
+            session_states
+                .get("$1")
+                .and_then(SessionState::active_window_key),
+            Some(WinlinkKey::new("$1", "@shared"))
+        );
+        assert_eq!(
+            session_states
+                .get("$2")
+                .and_then(SessionState::active_window_key),
+            Some(WinlinkKey::new("$2", "@20"))
+        );
+
+        let current_key = WinlinkKey::new("$1", "@shared");
+        let alerted_key = WinlinkKey::new("$2", "@shared");
+        let current_window = session_states
+            .get("$1")
+            .and_then(|session| session.windows.get(&current_key))
+            .expect("expected current-session linked window");
+        let alerted_window = session_states
+            .get("$2")
+            .and_then(|session| session.windows.get(&alerted_key))
+            .expect("expected other-session linked window");
+
+        assert!(current_window.active);
+        assert!(!current_window.bell_flag);
+        assert!(!alerted_window.active);
+        assert!(alerted_window.bell_flag);
+        assert_eq!(session_states["$2"].windows.len(), 2);
+        assert_eq!(
+            session_states["$2"]
+                .windows
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                WinlinkKey::new("$2", "@20"),
+                WinlinkKey::new("$2", "@shared")
+            ]
+        );
+    }
+
+    fn snapshot_window(
+        session_id: &str,
+        id: &str,
+        index: u32,
+        active: bool,
+        alert_flags: AlertFlags,
+    ) -> SnapshotWindow {
+        SnapshotWindow {
+            key: WinlinkKey::new(session_id, id),
+            id: id.to_string(),
+            index,
+            name: id.to_string(),
+            active,
+            activity: 0,
+            flags: WindowFlags::default(),
+            alert_flags,
+        }
     }
 }

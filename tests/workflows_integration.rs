@@ -1,4 +1,5 @@
 use std::{
+    env,
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -9,7 +10,7 @@ use serial_test::serial;
 use tmux_sidecar::{
     app::App,
     cli::Cli,
-    model::{ClientName, Focus, Mode},
+    model::{Focus, Mode},
     tmux::{Tmux, TmuxCli},
     ui::TREE_START_ROW,
 };
@@ -97,12 +98,16 @@ impl IsolatedServer {
             poll_interval_ms: 500,
             auto_quit,
             print_snapshot: false,
+            command: None,
         };
+        unsafe {
+            env::set_var(
+                "CARGO_BIN_EXE_tmux-sidecar",
+                env!("CARGO_BIN_EXE_tmux-sidecar"),
+            );
+        }
         let mut app = App::new(cli);
-        let tmux = self.tmux_cli();
-        app.state_mut().target_client = Some(ClientName(self.client_name.clone()));
-        app.apply_snapshot(tmux.snapshot()?);
-        app.state_mut().focus_visible_target();
+        app.startup()?;
         Ok(app)
     }
 
@@ -306,9 +311,7 @@ fn refresh_syncs_external_create_rename_close_reindex_and_active_changes()
         eprintln!("skipping integration test: tmux is unavailable");
         return Ok(());
     }
-
     let server = IsolatedServer::start()?;
-    let tmux = server.tmux_cli();
     let mut app = server.app()?;
 
     let main_session = app
@@ -342,7 +345,7 @@ fn refresh_syncs_external_create_rename_close_reindex_and_active_changes()
             "ext-created",
         ],
     )?;
-    app.apply_snapshot(tmux.snapshot()?);
+    assert!(app.sync_with_server(Duration::from_secs(2))?);
     let created_window_id = app
         .state()
         .tmux
@@ -385,7 +388,7 @@ fn refresh_syncs_external_create_rename_close_reindex_and_active_changes()
         &["kill-window", "-t", &first_window_id],
     )?;
 
-    app.apply_snapshot(tmux.snapshot()?);
+    assert!(app.sync_with_server(Duration::from_secs(2))?);
     let refreshed_main = app
         .state()
         .tmux
@@ -956,6 +959,51 @@ fn closes_focused_window_with_x_without_confirmation() -> Result<(), Box<dyn std
             .iter()
             .any(|window| window.id == doomed_window_id)
     );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn closes_focused_session_with_x_without_confirmation() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let doomed_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .ok_or("missing it-second session")?;
+    let initial_session_count = snapshot.sessions.len();
+    let initial_client_session_id = server.client_session_id()?;
+
+    app.state_mut().focus = Focus::Session(doomed_session.id.clone());
+    app.on_key_event(key(KeyCode::Char('x')))?;
+
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(app.state().last_error.is_none());
+    assert_ne!(app.state().focus, Focus::Session(doomed_session.id.clone()));
+    assert!(
+        app.state()
+            .tree_rows()
+            .iter()
+            .any(|row| row.focus == app.state().focus)
+    );
+
+    let refreshed_sessions = tmux.snapshot()?.sessions;
+    assert_eq!(refreshed_sessions.len(), initial_session_count - 1);
+    assert!(
+        !refreshed_sessions
+            .iter()
+            .any(|session| session.id == doomed_session.id)
+    );
+    assert_eq!(server.client_session_id()?, initial_client_session_id);
 
     Ok(())
 }

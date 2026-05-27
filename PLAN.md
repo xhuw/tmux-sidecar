@@ -1,153 +1,144 @@
-# MVP implementation plan
+# Hook/server rewrite plan
 
-This plan is intended for a future implementation agent. It assumes the agent will read `README.md`, `DESIGN.md`, `RESEARCH.md`, and `ARCHITECTURE.md` before making code changes.
+This plan replaces the polling-centered MVP with the architecture in `ARCHITECTURE.md`. Treat the existing implementation as reference material and a source of reusable tests, not as the structure to preserve. Reuse small pieces only when they still fit the new server/client design, such as tmux format parsers, safe command execution, input editing, tree rendering, and focus reconciliation.
 
-## Phase 0: Baseline and project setup
+## Phase 0: confirm baseline and preserve behavior
 
-Goal: establish a clean Rust baseline and make future changes safe.
-
-Tasks:
-
-- Confirm the repository builds from the current skeleton.
-- Add the selected dependencies from `RESEARCH.md`: `ratatui`, `crossterm`, `clap`, `anyhow`, `thiserror`, and test-only crates as needed.
-- Keep the binary small and synchronous for MVP; do not introduce Tokio.
-- Create the module skeleton from `ARCHITECTURE.md`.
-- Add a minimal CLI with options for tmux socket name/path, target client override, poll interval, and a hidden/test snapshot command if useful.
-
-Done when:
-
-- `cargo check` passes.
-- `tmux-sidecar --help` documents the supported flags.
-- Empty module scaffolding is in place without implementing unrelated behavior.
-
-## Phase 1: tmux command boundary
-
-Goal: make tmux access safe, typed, and testable.
+Goal: make the rewrite safe by capturing current behavior and the failing alert scenario.
 
 Tasks:
 
-- Implement `Tmux` trait and `TmuxCli` production adapter.
-- Execute tmux via `std::process::Command` with separate arguments only.
-- Support isolated tmux sockets for tests with `-L` or `-S`.
-- Implement startup checks: tmux exists, sessions exist, and a target client can be resolved.
-- Parse `list-sessions`, `list-windows -a`, and `list-clients` using a unit separator format.
-- Capture stable IDs, names, indexes, active state, attached clients, and window alert/notification flags.
-- Return typed errors for command failures and parse failures.
+- Run the existing checks to establish the baseline: `cargo fmt --all --check`, `cargo check`, and `cargo test`.
+- Add or update a failing integration test that reproduces alerts/activity from a non-current session not reaching the UI reliably.
+- Inventory reusable code: tmux command wrapper, snapshot parsers, domain row model, input buffer, rendering, and workflow tests.
+- Decide which current modules will be deleted or replaced. The polling `App` loop and UI-owned tmux adapter should be considered throwaway.
 
 Done when:
 
-- Unit tests cover parser success and malformed output.
-- Integration tests can create an isolated tmux server and read a correct snapshot.
-- Startup failure paths print concise stderr errors and exit non-zero before TUI startup.
+- The current failure is represented by a test or documented tmux reproduction.
+- The rewrite boundaries are clear enough that later phases do not try to patch polling back into the app.
 
-## Phase 2: domain model and app state
+## Phase 1: protocol and daemon foundation
 
-Goal: implement behavior as pure state transitions wherever possible.
+Goal: introduce the sidecar server without changing the TUI yet.
 
 Tasks:
 
-- Define `AppState`, `TmuxState`, `Session`, `Window`, `Focus`, `Mode`, `TreeRow`, and action types.
-- Build tree rows from snapshots, including a bottom-level new-session row and per-session new-window rows.
-- Implement focus movement, nearest-row focus recovery, and ID-preserving reconciliation after refresh.
-- Implement the single-line input buffer for create/rename modes.
-- Model alert/notification state separately from active and focused state.
+- Add IPC dependencies, likely `serde` and `serde_json`.
+- Define protocol structs for `Hello`, `HookEvent`, `Subscribe`, `ActionRequest`, `StateUpdated`, `ActionResult`, and `Error`.
+- Implement deterministic sidecar socket path derivation from tmux `socket_path`.
+- Implement stale socket detection and an auto-spawn lock file.
+- Add `tmux-sidecar server --socket-path <path>` with a blocking Unix-listener accept loop.
+- Add `tmux-sidecar hook --socket-path <path> --event <name> ...` that connects, auto-spawns once if needed, sends an event, and exits.
 
 Done when:
 
-- Unit tests cover focus movement, focus recovery after external changes, edit buffer behavior, and alert state preservation.
-- No UI code or tmux command code is needed to test core state behavior.
+- A unit or integration test can start the server, send a synthetic hook event, and receive an acknowledgement.
+- Concurrent hook invocations do not spawn multiple servers for one tmux socket.
 
-## Phase 3: terminal event loop
+## Phase 2: server state engine
 
-Goal: run a stable synchronous Ratatui/Crossterm application shell.
+Goal: move tmux state ownership into the server.
 
 Tasks:
 
-- Initialize alternate screen, raw mode, mouse capture, and panic-safe terminal restoration.
-- Implement the event loop using `crossterm::event::poll(timeout)`.
-- Add periodic tmux polling, defaulting to 500 ms.
-- Refresh immediately after every tmux action.
-- Handle quit, help modal toggle, keyboard navigation, and mouse row focus.
+- Move or recreate snapshot collection inside the server path.
+- Model windows by session-local winlink key `(session_id, window_id)` so linked windows can carry different active/alert state.
+- Build `ServerState` with generation numbers and subscriber broadcasting.
+- On bootstrap, collect full state with `list-sessions`, `list-windows -a`, and `list-clients`.
+- Implement dirty marking and debounce hook bursts into full snapshot reconciliation.
+- Apply alert hook payloads immediately when they include enough identity, then reconcile from tmux.
+- Configure `monitor-activity on`, `monitor-bell on`, and `monitor-silence 10` for all discovered windows.
 
 Done when:
 
-- The app starts and exits cleanly without corrupting the terminal.
-- Polling updates app state without user input.
-- Terminal restoration works on normal quit and action errors.
+- Synthetic hook tests prove generation changes and subscriber broadcasts.
+- Real tmux tests prove full snapshot reconciliation handles create, rename, close, link/unlink, client changes, and renumbering.
 
-## Phase 4: MVP rendering
+## Phase 3: plugin and hook installer
 
-Goal: implement the visual design from `DESIGN.md`.
+Goal: make tmux reliably feed the server.
 
 Tasks:
 
-- Implement the dark graphite theme with semantic style tokens.
-- Render header, tree, footer, and centered help modal.
-- Default to Nerd Font/Powerline glyphs with straight-line geometry.
-- Add ASCII fallback rendering mode.
-- Render focused, active, create, inline-edit, disabled, and alert/notification states distinctly.
-- Show both active and alert badges when a window has both states.
-- Keep rendering pure: no tmux calls from UI modules.
+- Implement `install-hooks` to install tmux-sidecar hooks into reserved indexed hook slots, for example `hook-name[900]`.
+- Implement `uninstall-hooks` to remove only those reserved indexed hook slots.
+- Ensure hook commands use `run-shell -b` and quote every tmux format with `#{q:...}`.
+- Pass only stable IDs, indexes, booleans, event names, and socket paths through hook commands; never pass session/window names.
+- Install hooks for sessions, windows/winlinks, alerts, clients, and command fallback hooks listed in `ARCHITECTURE.md`.
+- Implement `init-plugin` to print a `.tmux.conf` snippet based on `run-shell -b 'tmux-sidecar install-hooks'`.
 
 Done when:
 
-- Manual runs match the intended design language.
-- Help modal includes keybindings and the focused/active/alert legend.
-- Render-focused tests or snapshots cover normal, help, inline edit, and alerted-window states.
+- Reloading tmux config does not duplicate sidecar hooks.
+- Existing unrelated user hooks remain installed and still fire.
+- `alert-bell`, `alert-activity`, and `alert-silence` hooks reach the sidecar server from an isolated tmux server.
 
-## Phase 5: switch, create, and rename workflows
+## Phase 4: UI as a server subscriber
 
-Goal: complete every user workflow in the README.
+Goal: remove UI-owned tmux polling.
 
 Tasks:
 
-- Switch to focused session/window from keyboard and mouse activation.
-- Create a new session from the bottom creation row and auto-switch to it.
-- Create a new window from a session creation row and auto-switch to it.
-- Enter inline naming immediately after create.
-- Rename focused sessions/windows with `r`.
-- Submit names with `Enter`; cancel with `Esc`.
-- On create-name cancel, keep tmux's default name.
-- On failed create, rename, or switch, refresh from tmux and restore accurate UI state.
+- Replace `poll_interval_ms` sync behavior with a server subscription.
+- Keep focus, edit mode, help mode, jump state, and render state local to the UI.
+- Reconcile incoming `StateUpdated` messages with existing focus recovery rules.
+- Preserve a small local render tick only for animations, not for tmux refresh.
+- Exit cleanly if the server disconnects instead of rendering stale state.
 
 Done when:
 
-- End-to-end tests cover switching, creating sessions, creating windows, accepting names, canceling names, and failed rename refresh/revert behavior.
-- Workflows pass both inside an isolated tmux server and, where practical, with an attached target client.
+- External tmux changes update the UI through server messages.
+- There is no periodic tmux snapshot call in the TUI event loop.
 
-## Phase 6: external sync and alerts
+## Phase 5: route UI actions through the server
 
-Goal: prove tmux remains the source of truth when it changes outside tmux-sidecar.
+Goal: centralize all tmux mutations and post-action reconciliation.
 
 Tasks:
 
-- Detect externally created, renamed, closed, or re-indexed sessions/windows on the next poll.
-- Detect external active-window/session changes on the next poll.
-- Detect tmux window alert/notification flags on the next poll and show them in the tree.
-- Preserve focus sensibly when the focused item still exists.
-- Move focus predictably when an externally removed item disappears.
+- Add server-side actions for switch session/window, create session/window, rename session/window, close session, and close window.
+- Update UI key/mouse handlers to send `ActionRequest` messages instead of calling tmux directly.
+- Add session close support in the UI. Use the existing close key if acceptable, but distinguish session/window close behavior clearly in the footer/help.
+- After every action, have the server reconcile from tmux and broadcast the resulting state.
+- On action error, return `ActionResult` with a clear message and do not retain speculative UI state.
 
 Done when:
 
-- End-to-end tests mutate tmux outside the app/snapshot layer and verify the next refresh reflects the change.
-- Alert/notification display is covered by a real tmux test where feasible, or a fake `Tmux` app-state test if tmux alert triggering is too environment-sensitive.
+- Existing switch/create/rename/close-window workflow tests pass through the server path.
+- New close-session tests pass.
+- Two UI subscribers both update after an action from either UI.
 
-## Phase 7: hardening and release readiness
+## Phase 6: alert correctness across sessions
 
-Goal: make the MVP reliable enough to hand to users.
+Goal: prove the original issue is fixed.
 
 Tasks:
 
-- Run formatting, linting, tests, and any existing build checks.
-- Review all tmux command targets for ID-based addressing and argument safety.
-- Verify no code path shell-joins user-provided session/window names.
-- Verify all fatal startup errors occur before raw mode.
-- Verify runtime tmux errors do not leave speculative UI state.
-- Update README with usage, keybindings, dependencies, font/fallback note, and testing instructions.
-- Document known limitations, especially target-client requirements when launched outside tmux.
+- Add real tmux tests where a non-current session/window triggers bell, activity, and silence alerts.
+- Add linked-window tests where the same `window_id` appears in multiple sessions with different session-local alert and active state.
+- Verify alert updates are pushed to subscribers without waiting for a UI poll.
+- Verify selecting or switching a window lets tmux clear/preserve alerts according to normal tmux behavior, and sidecar follows the next hook/snapshot.
 
 Done when:
 
-- All tests pass.
-- README describes how to run the MVP.
-- The app satisfies every MVP item in `README.md`, including visual active markers, alert/notification display, external sync, create/rename/switch workflows, and help modal.
+- The failing alert test from Phase 0 passes.
+- Cross-session alert state remains correct after create, link, unlink, switch, and close operations.
+
+## Phase 7: hardening, docs, and migration
+
+Goal: make the rewrite usable as the default implementation.
+
+Tasks:
+
+- Remove obsolete polling CLI flags and code, or hide compatibility flags with clear deprecation behavior.
+- Update `README.md` so setup no longer claims zero config and documents the plugin snippet.
+- Update troubleshooting docs for hook installation, stale sidecar sockets, missing `tmux-sidecar` on tmux's `PATH`, and server logs.
+- Run `cargo fmt --all --check`, `cargo check`, and `cargo test`.
+- Manually test real `.tmux.conf` reload, two simultaneous UI clients, server kill/restart, and tmux server shutdown.
+
+Done when:
+
+- The hook/server implementation is the normal `tmux-sidecar` path.
+- Documentation matches the new plugin requirement.
+- The test suite covers hook install, server IPC, state reconciliation, UI subscription, actions, and cross-session alerts.

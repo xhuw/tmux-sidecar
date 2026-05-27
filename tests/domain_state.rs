@@ -6,7 +6,7 @@ mod model;
 use input::InputBuffer;
 use model::{
     AppState, Client, ClientName, EditAction, Focus, FocusMove, FocusRecovery, Mode, Session,
-    TmuxState, TreeRowKind, Window, WindowAlert,
+    TmuxState, TreeRowKind, Window, WindowAlert, WinlinkKey,
 };
 
 fn session(id: &str, name: &str, active_window_id: Option<&str>, windows: Vec<Window>) -> Session {
@@ -269,6 +269,27 @@ fn linked_window_rows_keep_session_local_active_and_alert_state() {
     assert!(!alerted_row.active());
     assert_eq!(alerted_row.alert(), Some(WindowAlert::Bell));
     assert_ne!(current_row.focus, alerted_row.focus);
+
+    let session_states = app.tmux.session_states();
+    let current_key = WinlinkKey::new("$1", "@shared");
+    let alerted_key = WinlinkKey::new("$2", "@shared");
+    let current_window = session_states
+        .get("$1")
+        .and_then(|session| session.windows.get(&current_key))
+        .expect("expected current-session winlink state");
+    let alerted_window = session_states
+        .get("$2")
+        .and_then(|session| session.windows.get(&alerted_key))
+        .expect("expected alerted-session winlink state");
+
+    assert_eq!(
+        app.tmux.visible_window_key(app.target_client.as_ref()),
+        Some(current_key)
+    );
+    assert!(current_window.active);
+    assert!(!current_window.bell_flag);
+    assert!(!alerted_window.active);
+    assert!(alerted_window.bell_flag);
 }
 
 #[test]

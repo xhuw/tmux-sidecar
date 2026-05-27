@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::collections::BTreeMap;
 
 use crate::input::InputBuffer;
 
@@ -6,6 +6,60 @@ pub type SessionId = String;
 pub type WindowId = String;
 
 const JUMP_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnmASDFGHJKLQWERTYUIOPZXCVBNM";
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WinlinkKey {
+    pub session_id: SessionId,
+    pub window_id: WindowId,
+}
+
+impl WinlinkKey {
+    pub fn new(session_id: impl Into<SessionId>, window_id: impl Into<WindowId>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            window_id: window_id.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionState {
+    pub id: SessionId,
+    pub name: String,
+    pub attached_count: u32,
+    pub active_window_id: Option<WindowId>,
+    pub windows: BTreeMap<WinlinkKey, WindowState>,
+}
+
+impl SessionState {
+    pub fn active_window_key(&self) -> Option<WinlinkKey> {
+        self.active_window_id
+            .as_ref()
+            .map(|window_id| WinlinkKey::new(self.id.clone(), window_id.clone()))
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindowState {
+    pub id: WindowId,
+    pub index: u32,
+    pub name: String,
+    pub active: bool,
+    pub activity: u64,
+    pub activity_flag: bool,
+    pub bell_flag: bool,
+    pub silence_flag: bool,
+}
+
+impl WindowState {
+    pub fn alert(&self) -> WindowAlert {
+        WindowAlert::from_indicators(self.activity_flag, self.bell_flag, self.silence_flag)
+    }
+
+    pub fn has_current_activity(&self) -> bool {
+        self.activity_flag && !self.silence_flag
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxState {
@@ -19,19 +73,18 @@ impl TmuxState {
     }
 
     pub fn tree_rows_for_client(&self, target_client: Option<&ClientName>) -> Vec<TreeRow> {
-        let visible_window = self
-            .visible_window(target_client)
-            .map(|(session, window)| (session.id.as_str(), window.id.as_str()));
+        let visible_window = self.visible_window_key(target_client);
         let mut rows = Vec::new();
 
         for session in &self.sessions {
             rows.push(TreeRow::session(session));
 
             for window in &session.windows {
+                let window_key = window.winlink_key(session.id.clone());
                 rows.push(TreeRow::window(
                     session.id.clone(),
                     window,
-                    visible_window == Some((session.id.as_str(), window.id.as_str())),
+                    visible_window.as_ref() == Some(&window_key),
                 ));
             }
 
@@ -63,6 +116,18 @@ impl TmuxState {
         Some((session, window))
     }
 
+    pub fn visible_window_key(&self, target_client: Option<&ClientName>) -> Option<WinlinkKey> {
+        self.visible_window(target_client)
+            .map(|(session, window)| window.winlink_key(session.id.clone()))
+    }
+
+    pub fn session_states(&self) -> BTreeMap<SessionId, SessionState> {
+        self.sessions
+            .iter()
+            .map(|session| (session.id.clone(), session.session_state()))
+            .collect()
+    }
+
     pub fn visible_session(&self, target_client: Option<&ClientName>) -> Option<&Session> {
         if let Some((session, _)) = self.visible_window(target_client) {
             return Some(session);
@@ -89,6 +154,28 @@ pub struct Session {
     pub attached_count: u32,
     pub active_window_id: Option<WindowId>,
     pub windows: Vec<Window>,
+}
+
+impl Session {
+    pub fn active_window_key(&self) -> Option<WinlinkKey> {
+        self.active_window_id
+            .as_ref()
+            .map(|window_id| WinlinkKey::new(self.id.clone(), window_id.clone()))
+    }
+
+    pub fn session_state(&self) -> SessionState {
+        SessionState {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            attached_count: self.attached_count,
+            active_window_id: self.active_window_id.clone(),
+            windows: self
+                .windows
+                .iter()
+                .map(|window| (window.winlink_key(self.id.clone()), window.window_state()))
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -130,6 +217,26 @@ pub struct Window {
 }
 
 impl Window {
+    pub fn winlink_key(&self, session_id: impl Into<SessionId>) -> WinlinkKey {
+        WinlinkKey::new(session_id, self.id.clone())
+    }
+
+    pub fn window_state(&self) -> WindowState {
+        let activity_flag = self.activity_flag || self.flags.contains('#');
+        let bell_flag = self.alert.is_alerting() || self.flags.contains('!');
+        let silence_flag = self.silence_flag || self.flags.contains('~');
+        WindowState {
+            id: self.id.clone(),
+            index: self.index,
+            name: self.name.clone(),
+            active: self.active,
+            activity: self.activity,
+            activity_flag,
+            bell_flag,
+            silence_flag,
+        }
+    }
+
     pub fn set_flags(&mut self, flags: impl Into<String>) {
         self.flags = flags.into();
         self.activity_flag = self.flags.contains('#');
@@ -175,6 +282,13 @@ impl Focus {
         Self::Window {
             session_id: session_id.into(),
             window_id: window_id.into(),
+        }
+    }
+
+    pub fn winlink(key: WinlinkKey) -> Self {
+        Self::Window {
+            session_id: key.session_id,
+            window_id: key.window_id,
         }
     }
 }
@@ -391,7 +505,6 @@ pub struct AppState {
     pub navigation: NavigationState,
     pub target_client: Option<ClientName>,
     pub last_error: Option<ActionError>,
-    pub next_poll_at: Option<Instant>,
 }
 
 impl Default for AppState {
@@ -403,7 +516,6 @@ impl Default for AppState {
             navigation: NavigationState::default(),
             target_client: None,
             last_error: None,
-            next_poll_at: None,
         }
     }
 }
@@ -559,8 +671,8 @@ impl AppState {
     pub fn focus_visible_target(&mut self) -> bool {
         let next_focus = self
             .tmux
-            .visible_window(self.target_client.as_ref())
-            .map(|(session, window)| Focus::window(session.id.clone(), window.id.clone()))
+            .visible_window_key(self.target_client.as_ref())
+            .map(Focus::winlink)
             .or_else(|| {
                 self.tmux
                     .visible_session(self.target_client.as_ref())

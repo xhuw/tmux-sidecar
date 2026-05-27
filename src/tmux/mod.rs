@@ -1,4 +1,5 @@
 pub mod command;
+pub mod hooks;
 pub mod parse;
 pub mod snapshot;
 
@@ -39,6 +40,7 @@ pub trait Tmux {
     fn create_session(&self, name: Option<&str>) -> Result<SessionId, TmuxError>;
     fn create_window(&self, session: &SessionId, name: Option<&str>)
     -> Result<WindowId, TmuxError>;
+    fn close_session(&self, session: &SessionId) -> Result<(), TmuxError>;
     fn close_window(&self, window: &WindowId) -> Result<(), TmuxError>;
     fn rename_session(&self, session: &SessionId, name: &str) -> Result<(), TmuxError>;
     fn rename_window(&self, window: &WindowId, name: &str) -> Result<(), TmuxError>;
@@ -51,8 +53,6 @@ pub struct TmuxCli {
 }
 
 impl TmuxCli {
-    const MONITOR_SILENCE_SECONDS: &'static str = "10";
-
     pub fn check_startup(&self, cli_override: Option<&str>) -> Result<ClientName, TmuxError> {
         self.ensure_tmux_exists()?;
         self.ensure_sessions_exist()?;
@@ -116,31 +116,32 @@ impl TmuxCli {
         Ok(value.to_owned())
     }
 
+    #[allow(dead_code)]
+    pub fn install_hooks(&self, program: &hooks::HookCommandProgram) -> Result<(), TmuxError> {
+        hooks::install_hooks(&self.socket_options(), program)
+    }
+
+    #[allow(dead_code)]
+    pub fn uninstall_hooks(&self) -> Result<(), TmuxError> {
+        hooks::uninstall_hooks(&self.socket_options())
+    }
+
+    #[allow(dead_code)]
+    pub fn init_plugin_snippet(program: &hooks::HookCommandProgram) -> String {
+        hooks::init_plugin_snippet(program)
+    }
+
+    pub fn configure_window_monitoring(&self, window: &WindowId) -> Result<(), TmuxError> {
+        hooks::configure_window_monitoring(&self.socket_options(), window)
+    }
+
+    #[allow(dead_code)]
+    pub fn configure_all_window_monitoring(&self) -> Result<(), TmuxError> {
+        hooks::configure_existing_window_monitoring(&self.socket_options())
+    }
+
     pub fn configure_activity_monitoring(&self, window: &WindowId) -> Result<(), TmuxError> {
-        let socket = self.socket_options();
-        command::run_tmux(
-            &socket,
-            [
-                "set-window-option",
-                "-q",
-                "-t",
-                window.as_str(),
-                "monitor-activity",
-                "on",
-            ],
-        )?;
-        command::run_tmux(
-            &socket,
-            [
-                "set-window-option",
-                "-q",
-                "-t",
-                window.as_str(),
-                "monitor-silence",
-                Self::MONITOR_SILENCE_SECONDS,
-            ],
-        )?;
-        Ok(())
+        self.configure_window_monitoring(window)
     }
 }
 
@@ -245,6 +246,12 @@ impl Tmux for TmuxCli {
         let output = command::run_tmux(&socket, args)?;
 
         Self::single_line_value(&output, "new-window")
+    }
+
+    fn close_session(&self, session: &SessionId) -> Result<(), TmuxError> {
+        let socket = self.socket_options();
+        command::run_tmux(&socket, ["kill-session", "-t", session.as_str()])?;
+        Ok(())
     }
 
     fn close_window(&self, window: &WindowId) -> Result<(), TmuxError> {
