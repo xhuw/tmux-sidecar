@@ -65,10 +65,23 @@ pub enum CliCommand {
 }
 
 #[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("server_socket")
+        .args(["socket_name", "socket_path"])
+        .multiple(false)
+))]
 pub struct ServerArgs {
+    /// Stop the running sidecar server for the selected tmux socket.
+    #[arg(long = "kill")]
+    pub kill: bool,
+
+    /// tmux socket name passed with `tmux -L` when using `--kill`.
+    #[arg(long = "socket-name", value_name = "SOCKET")]
+    pub socket_name: Option<String>,
+
     /// tmux socket path passed through tmux hook interpolation.
     #[arg(long = "socket-path", value_name = "PATH")]
-    pub socket_path: PathBuf,
+    pub socket_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -162,6 +175,30 @@ mod tests {
             panic!("expected install-hooks command");
         };
 
+        assert_eq!(args.socket_name.as_deref(), Some("work"));
+    }
+
+    #[test]
+    fn server_kill_accepts_optional_socket_selection_flags() {
+        let cli = Cli::try_parse_from(["tmux-sidecar", "server", "--kill"]).unwrap();
+
+        let Some(CliCommand::Server(args)) = cli.command else {
+            panic!("expected server command");
+        };
+
+        assert!(args.kill);
+        assert!(args.socket_name.is_none());
+        assert!(args.socket_path.is_none());
+
+        let cli =
+            Cli::try_parse_from(["tmux-sidecar", "server", "--kill", "--socket-name", "work"])
+                .unwrap();
+
+        let Some(CliCommand::Server(args)) = cli.command else {
+            panic!("expected server command");
+        };
+
+        assert!(args.kill);
         assert_eq!(args.socket_name.as_deref(), Some("work"));
     }
 }

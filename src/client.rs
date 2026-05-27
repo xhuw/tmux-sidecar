@@ -38,6 +38,23 @@ pub enum ReadStatus {
 impl IpcClient {
     pub fn connect_or_spawn(tmux_socket_path: &Path, client_kind: ClientKind) -> Result<Self> {
         let stream = connect_or_spawn_stream(tmux_socket_path)?;
+        Self::connect_stream(stream, client_kind)
+    }
+
+    fn connect_existing_socket(
+        sidecar_socket_path: &Path,
+        client_kind: ClientKind,
+    ) -> Result<Self> {
+        let stream = UnixStream::connect(sidecar_socket_path).with_context(|| {
+            format!(
+                "failed to connect to running sidecar server at `{}`",
+                sidecar_socket_path.display()
+            )
+        })?;
+        Self::connect_stream(stream, client_kind)
+    }
+
+    fn connect_stream(stream: UnixStream, client_kind: ClientKind) -> Result<Self> {
         let reader_stream = stream
             .try_clone()
             .context("failed to clone sidecar stream")?;
@@ -151,6 +168,20 @@ pub fn subscribe(tmux_socket_path: &Path, target_client: Option<String>) -> Resu
 
 pub fn shutdown_server(tmux_socket_path: &Path) -> Result<()> {
     let mut client = IpcClient::connect_or_spawn(tmux_socket_path, ClientKind::Control)?;
+    send_shutdown(&mut client)
+}
+
+pub fn shutdown_existing_server(tmux_socket_path: &Path) -> Result<()> {
+    let sidecar_paths = SidecarPaths::from_tmux_socket_path(tmux_socket_path);
+    shutdown_existing_server_at(&sidecar_paths.socket_path)
+}
+
+pub(crate) fn shutdown_existing_server_at(sidecar_socket_path: &Path) -> Result<()> {
+    let mut client = IpcClient::connect_existing_socket(sidecar_socket_path, ClientKind::Control)?;
+    send_shutdown(&mut client)
+}
+
+fn send_shutdown(client: &mut IpcClient) -> Result<()> {
     client.send(&ClientMessage::Shutdown)?;
 
     match client.read_required()? {

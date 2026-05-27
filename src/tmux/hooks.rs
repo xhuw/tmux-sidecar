@@ -283,19 +283,23 @@ fn configure_global_window_monitoring(socket: &SocketOptions) -> Result<(), Tmux
 }
 
 fn hook_command(program: &HookCommandProgram, definition: &HookDefinition) -> String {
-    let mut words = program.argv().to_vec();
+    let mut words = program
+        .argv()
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<_>>();
     words.push(String::from("hook"));
     words.push(String::from("--socket-path"));
     words.push(String::from(TMUX_SOCKET_PATH_FORMAT));
     words.push(String::from("--event"));
-    words.push(definition.name.to_owned());
+    words.push(shell_quote(definition.name));
 
     for arg in definition.args {
         words.push(arg.flag.to_owned());
         words.push(arg.quoted_tmux_format.to_owned());
     }
 
-    format!("run-shell -b \"{}\"", shell_join(words))
+    format!("run-shell -b \"{}\"", words.join(" "))
 }
 
 fn hook_definitions() -> Vec<HookDefinition> {
@@ -413,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn alert_hook_commands_quote_all_tmux_formats() {
+    fn alert_hook_commands_use_raw_q_tmux_formats() {
         let hooks = installed_hooks(&HookCommandProgram::default());
         let alert_hook = hooks
             .iter()
@@ -425,6 +429,27 @@ mod tests {
         assert!(alert_hook.command.contains(WINDOW_ID_FORMAT));
         assert!(alert_hook.command.contains(WINDOW_INDEX_FORMAT));
         assert!(alert_hook.command.contains(PANE_ID_FORMAT));
+        assert!(
+            !alert_hook
+                .command
+                .contains(&format!("'{TMUX_SOCKET_PATH_FORMAT}'"))
+        );
+        assert!(
+            !alert_hook
+                .command
+                .contains(&format!("'{SESSION_ID_FORMAT}'"))
+        );
+        assert!(
+            !alert_hook
+                .command
+                .contains(&format!("'{WINDOW_ID_FORMAT}'"))
+        );
+        assert!(
+            !alert_hook
+                .command
+                .contains(&format!("'{WINDOW_INDEX_FORMAT}'"))
+        );
+        assert!(!alert_hook.command.contains(&format!("'{PANE_ID_FORMAT}'")));
         assert!(!alert_hook.command.contains("#{socket_path}"));
         assert!(!alert_hook.command.contains("#{session_id}"));
         assert!(!alert_hook.command.contains("#{window_id}"));
@@ -433,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn client_hook_commands_quote_client_name() {
+    fn client_hook_commands_use_q_client_name() {
         let hooks = installed_hooks(&HookCommandProgram::default());
         let client_hook = hooks
             .iter()

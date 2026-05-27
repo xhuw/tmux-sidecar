@@ -168,7 +168,7 @@ Launching `tmux-sidecar` also refreshes the hooks automatically, but the tmux co
 | `install-hooks` | Install or refresh tmux-sidecar-managed hooks for the selected tmux socket |
 | `uninstall-hooks` | Remove tmux-sidecar-managed hooks from the selected tmux socket |
 | `init-plugin` | Print the recommended `run-shell -b 'tmux-sidecar install-hooks'` snippet |
-| `server` | Run the local per-socket sidecar server (normally auto-started) |
+| `server` | Run the local per-socket sidecar server (normally auto-started); use `server --kill` to stop the running server for the selected tmux socket |
 | `hook` | Send one tmux hook event to the sidecar server (normally used by installed hooks) |
 
 ### Options
