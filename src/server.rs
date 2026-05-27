@@ -16,15 +16,20 @@ use anyhow::{Context, Result};
 
 use crate::{
     ipc::{
-        Ack, AckKind, Action, ActionRequest, ActionResult, ActionResultKind, ClientMessage,
-        ErrorMessage, HelloAck, HookEvent, HookName, ProjectionState, ProjectionWindow,
-        ServerMessage, SidecarPaths, StateUpdated,
+        Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
+        ClientMessage, ErrorMessage, HelloAck, HookEvent, HookName, ProjectionSession,
+        ProjectionState, ProjectionWindow, ServerMessage, SidecarPaths, StateUpdated,
     },
     model::WindowTarget,
     tmux::{Tmux, TmuxCli},
 };
 
 const IPC_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+const ACTION_REFRESH_ATTEMPTS: usize = 10;
+const ACTION_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
+const HOOK_REFRESH_ATTEMPTS: usize = 6;
+const HOOK_REFRESH_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const HOOK_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 pub struct ServerOptions {
     pub tmux_socket_path: PathBuf,
@@ -54,6 +59,7 @@ struct SharedState {
 struct Server {
     listener: UnixListener,
     shared: Arc<Mutex<SharedState>>,
+    refresh_lock: Arc<Mutex<()>>,
     shutdown: Arc<AtomicBool>,
     refresh_from_tmux: bool,
     tmux: Arc<dyn ServerTmuxOps>,
@@ -67,7 +73,46 @@ struct CleanupPaths {
 
 trait ServerTmuxOps: Send + Sync {
     fn snapshot_projection(&self, tmux_socket_path: &Path) -> Result<ProjectionState>;
-    fn execute_action(&self, tmux_socket_path: &Path, request: &ActionRequest) -> Result<()>;
+    fn execute_action(
+        &self,
+        tmux_socket_path: &Path,
+        request: &ActionRequest,
+    ) -> Result<ActionEffect>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActionEffect {
+    SwitchedSession {
+        client_name: String,
+        session_id: String,
+    },
+    SwitchedWindow {
+        client_name: String,
+        session_id: String,
+        window_id: String,
+    },
+    CreatedSession {
+        session_id: String,
+    },
+    CreatedWindow {
+        session_id: String,
+        window_id: String,
+    },
+    RenamedSession {
+        session_id: String,
+        name: String,
+    },
+    RenamedWindow {
+        window_id: String,
+        name: String,
+    },
+    ClosedSession {
+        session_id: String,
+    },
+    ClosedWindow {
+        session_id: String,
+        window_id: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -83,7 +128,11 @@ impl ServerTmuxOps for LiveServerTmuxOps {
         ))
     }
 
-    fn execute_action(&self, tmux_socket_path: &Path, request: &ActionRequest) -> Result<()> {
+    fn execute_action(
+        &self,
+        tmux_socket_path: &Path,
+        request: &ActionRequest,
+    ) -> Result<ActionEffect> {
         execute_action_request(&tmux_client(tmux_socket_path), request)
     }
 }
@@ -153,6 +202,7 @@ impl Server {
                 subscribers: BTreeMap::new(),
                 next_subscriber_id: 1,
             })),
+            refresh_lock: Arc::new(Mutex::new(())),
             shutdown: Arc::new(AtomicBool::new(false)),
             refresh_from_tmux,
             tmux,
@@ -168,12 +218,19 @@ impl Server {
             match self.listener.accept() {
                 Ok((stream, _)) => {
                     let shared = Arc::clone(&self.shared);
+                    let refresh_lock = Arc::clone(&self.refresh_lock);
                     let shutdown = Arc::clone(&self.shutdown);
                     let refresh_from_tmux = self.refresh_from_tmux;
                     let tmux = Arc::clone(&self.tmux);
                     thread::spawn(move || {
-                        let _ =
-                            handle_connection(stream, shared, shutdown, refresh_from_tmux, tmux);
+                        let _ = handle_connection(
+                            stream,
+                            shared,
+                            refresh_lock,
+                            shutdown,
+                            refresh_from_tmux,
+                            tmux,
+                        );
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -191,6 +248,7 @@ impl Server {
 fn handle_connection(
     stream: UnixStream,
     shared: Arc<Mutex<SharedState>>,
+    refresh_lock: Arc<Mutex<()>>,
     shutdown: Arc<AtomicBool>,
     refresh_from_tmux: bool,
     tmux: Arc<dyn ServerTmuxOps>,
@@ -246,7 +304,13 @@ fn handle_connection(
                     continue;
                 }
 
-                refresh_state_for_hook(&shared, refresh_from_tmux, tmux.as_ref(), &event)?;
+                refresh_state_for_hook(
+                    &shared,
+                    &refresh_lock,
+                    refresh_from_tmux,
+                    tmux.as_ref(),
+                    &event,
+                )?;
                 send_message(
                     &writer,
                     &ServerMessage::Ack(Ack {
@@ -264,15 +328,29 @@ fn handle_connection(
                 )?;
             }
             ClientMessage::SnapshotRequest => {
-                send_message(
-                    &writer,
-                    &ServerMessage::StateUpdated(current_state_update(&shared)),
-                )?;
+                match refresh_state_for_snapshot_request(
+                    &shared,
+                    &refresh_lock,
+                    refresh_from_tmux,
+                    tmux.as_ref(),
+                ) {
+                    Ok(update) => {
+                        send_message(&writer, &ServerMessage::StateUpdated(update))?;
+                    }
+                    Err(error) => {
+                        send_error(&writer, format!("failed to refresh state: {error:#}"))?;
+                    }
+                }
             }
             ClientMessage::ActionRequest(request) => {
                 let request_id = request.request_id.clone();
-                let result =
-                    handle_action_request(&shared, refresh_from_tmux, tmux.as_ref(), &request);
+                let result = handle_action_request(
+                    &shared,
+                    &refresh_lock,
+                    refresh_from_tmux,
+                    tmux.as_ref(),
+                    &request,
+                );
                 send_message(
                     &writer,
                     &ServerMessage::ActionResult(ActionResult { request_id, result }),
@@ -317,42 +395,148 @@ fn current_state_update(shared: &Arc<Mutex<SharedState>>) -> StateUpdated {
 
 fn refresh_state(
     shared: &Arc<Mutex<SharedState>>,
+    refresh_lock: &Arc<Mutex<()>>,
     refresh_from_tmux: bool,
     tmux: &dyn ServerTmuxOps,
 ) -> Result<StateUpdated> {
-    refresh_state_with_hook(shared, refresh_from_tmux, tmux, None)
+    refresh_state_with_policy(
+        shared,
+        refresh_lock,
+        refresh_from_tmux,
+        tmux,
+        RefreshPolicy::Immediate,
+    )
 }
 
 fn refresh_state_for_hook(
     shared: &Arc<Mutex<SharedState>>,
+    refresh_lock: &Arc<Mutex<()>>,
     refresh_from_tmux: bool,
     tmux: &dyn ServerTmuxOps,
     event: &HookEvent,
 ) -> Result<StateUpdated> {
-    refresh_state_with_hook(shared, refresh_from_tmux, tmux, Some(event))
+    refresh_state_with_policy(
+        shared,
+        refresh_lock,
+        refresh_from_tmux,
+        tmux,
+        RefreshPolicy::Hook(event),
+    )
 }
 
-fn refresh_state_with_hook(
+fn refresh_state_for_action(
     shared: &Arc<Mutex<SharedState>>,
+    refresh_lock: &Arc<Mutex<()>>,
     refresh_from_tmux: bool,
     tmux: &dyn ServerTmuxOps,
-    hook_event: Option<&HookEvent>,
+    effect: &ActionEffect,
 ) -> Result<StateUpdated> {
+    refresh_state_with_policy(
+        shared,
+        refresh_lock,
+        refresh_from_tmux,
+        tmux,
+        RefreshPolicy::Action(effect),
+    )
+}
+
+fn refresh_state_for_snapshot_request(
+    shared: &Arc<Mutex<SharedState>>,
+    refresh_lock: &Arc<Mutex<()>>,
+    refresh_from_tmux: bool,
+    tmux: &dyn ServerTmuxOps,
+) -> Result<StateUpdated> {
+    let _refresh_guard = refresh_lock.lock().expect("refresh lock poisoned");
     let (tmux_socket_path, previous_state) = {
         let guard = shared.lock().expect("shared state poisoned");
         (guard.tmux_socket_path.clone(), guard.state.clone())
     };
-    let next_state = if refresh_from_tmux {
+
+    let mut next_state = if refresh_from_tmux {
         tmux.snapshot_projection(&tmux_socket_path)?
     } else {
         previous_state.clone()
     };
-    let mut next_state = next_state;
-    preserve_cached_bell_flags(&previous_state, &mut next_state, hook_event);
-    if let Some(event) = hook_event {
-        apply_hook_event_overlay(&mut next_state, event);
+    preserve_cached_bell_flags(&previous_state, &mut next_state, None);
+
+    if next_state == previous_state {
+        return Ok(current_state_update(shared));
     }
 
+    Ok(publish_state_update(shared, next_state, false))
+}
+
+enum RefreshPolicy<'a> {
+    Immediate,
+    Hook(&'a HookEvent),
+    Action(&'a ActionEffect),
+}
+
+fn refresh_state_with_policy(
+    shared: &Arc<Mutex<SharedState>>,
+    refresh_lock: &Arc<Mutex<()>>,
+    refresh_from_tmux: bool,
+    tmux: &dyn ServerTmuxOps,
+    policy: RefreshPolicy<'_>,
+) -> Result<StateUpdated> {
+    let _refresh_guard = refresh_lock.lock().expect("refresh lock poisoned");
+    let (tmux_socket_path, previous_state) = {
+        let guard = shared.lock().expect("shared state poisoned");
+        (guard.tmux_socket_path.clone(), guard.state.clone())
+    };
+
+    let attempts = if refresh_from_tmux {
+        policy.max_attempts()
+    } else {
+        1
+    };
+    let mut last_state = previous_state.clone();
+    let mut last_satisfied = false;
+
+    for attempt in 0..attempts {
+        if refresh_from_tmux {
+            if attempt == 0 {
+                if let Some(delay) = policy.initial_delay() {
+                    thread::sleep(delay);
+                }
+            } else if let Some(delay) = policy.retry_delay() {
+                thread::sleep(delay);
+            }
+        }
+
+        let mut next_state = if refresh_from_tmux {
+            tmux.snapshot_projection(&tmux_socket_path)?
+        } else {
+            previous_state.clone()
+        };
+        let hook_event = policy.hook_event();
+        preserve_cached_bell_flags(&previous_state, &mut next_state, hook_event);
+        if let Some(event) = hook_event {
+            apply_hook_event_overlay(&mut next_state, event);
+        }
+
+        last_satisfied = policy.is_satisfied(&previous_state, &next_state);
+        last_state = next_state;
+        if last_satisfied || attempt + 1 == attempts {
+            break;
+        }
+    }
+
+    let update = publish_state_update(shared, last_state, true);
+    if let RefreshPolicy::Action(effect) = policy {
+        if !last_satisfied {
+            anyhow::bail!("{}", effect.unsatisfied_message());
+        }
+    }
+
+    Ok(update)
+}
+
+fn publish_state_update(
+    shared: &Arc<Mutex<SharedState>>,
+    next_state: ProjectionState,
+    broadcast_update: bool,
+) -> StateUpdated {
     let (cache_path, update) = {
         let mut guard = shared.lock().expect("shared state poisoned");
         guard.generation += 1;
@@ -367,8 +551,233 @@ fn refresh_state_with_hook(
     };
     store_state_cache(&cache_path, &update.state);
 
-    broadcast(shared, ServerMessage::StateUpdated(update.clone()));
-    Ok(update)
+    if broadcast_update {
+        broadcast(shared, ServerMessage::StateUpdated(update.clone()));
+    }
+    update
+}
+
+impl RefreshPolicy<'_> {
+    fn max_attempts(&self) -> usize {
+        match self {
+            RefreshPolicy::Immediate => 1,
+            RefreshPolicy::Hook(event) if hook_may_change_projection(event) => {
+                HOOK_REFRESH_ATTEMPTS
+            }
+            RefreshPolicy::Hook(_) => 1,
+            RefreshPolicy::Action(_) => ACTION_REFRESH_ATTEMPTS,
+        }
+    }
+
+    fn initial_delay(&self) -> Option<Duration> {
+        match self {
+            RefreshPolicy::Hook(event) if hook_may_change_projection(event) => {
+                Some(HOOK_REFRESH_SETTLE_DELAY)
+            }
+            RefreshPolicy::Immediate | RefreshPolicy::Action(_) => None,
+            RefreshPolicy::Hook(_) => None,
+        }
+    }
+
+    fn retry_delay(&self) -> Option<Duration> {
+        match self {
+            RefreshPolicy::Hook(event) if hook_may_change_projection(event) => {
+                Some(HOOK_REFRESH_RETRY_DELAY)
+            }
+            RefreshPolicy::Action(_) => Some(ACTION_REFRESH_RETRY_DELAY),
+            RefreshPolicy::Immediate | RefreshPolicy::Hook(_) => None,
+        }
+    }
+
+    fn hook_event(&self) -> Option<&HookEvent> {
+        match self {
+            RefreshPolicy::Hook(event) => Some(event),
+            RefreshPolicy::Immediate | RefreshPolicy::Action(_) => None,
+        }
+    }
+
+    fn is_satisfied(&self, previous_state: &ProjectionState, next_state: &ProjectionState) -> bool {
+        match self {
+            RefreshPolicy::Immediate => true,
+            RefreshPolicy::Hook(event) => {
+                !hook_may_change_projection(event)
+                    || hook_refresh_satisfied(event, previous_state, next_state)
+            }
+            RefreshPolicy::Action(effect) => effect.is_satisfied(next_state),
+        }
+    }
+}
+
+fn hook_may_change_projection(event: &HookEvent) -> bool {
+    matches!(
+        event.event,
+        HookName::SessionCreated
+            | HookName::SessionClosed
+            | HookName::WindowLinked
+            | HookName::WindowUnlinked
+            | HookName::AfterNewSession
+            | HookName::AfterNewWindow
+            | HookName::AfterKillPane
+    )
+}
+
+fn hook_refresh_satisfied(
+    event: &HookEvent,
+    previous_state: &ProjectionState,
+    next_state: &ProjectionState,
+) -> bool {
+    match event.event {
+        HookName::SessionCreated | HookName::AfterNewSession => {
+            next_state.sessions.len() > previous_state.sessions.len()
+        }
+        HookName::SessionClosed => next_state.sessions.len() < previous_state.sessions.len(),
+        HookName::WindowLinked | HookName::AfterNewWindow => {
+            projection_window_count(next_state) > projection_window_count(previous_state)
+        }
+        HookName::WindowUnlinked => {
+            projection_window_count(next_state) < projection_window_count(previous_state)
+                || next_state.sessions.len() < previous_state.sessions.len()
+        }
+        HookName::AfterKillPane => {
+            projection_window_count(next_state) < projection_window_count(previous_state)
+                || next_state.sessions.len() < previous_state.sessions.len()
+                || next_state != previous_state
+        }
+        _ => true,
+    }
+}
+
+fn projection_window_count(state: &ProjectionState) -> usize {
+    state
+        .sessions
+        .iter()
+        .map(|session| session.windows.len())
+        .sum()
+}
+
+impl ActionEffect {
+    fn outcome(&self) -> Option<ActionOutcome> {
+        match self {
+            ActionEffect::CreatedSession { session_id } => Some(ActionOutcome::CreatedSession {
+                session_id: session_id.clone(),
+            }),
+            ActionEffect::CreatedWindow {
+                session_id,
+                window_id,
+            } => Some(ActionOutcome::CreatedWindow {
+                session_id: session_id.clone(),
+                window_id: window_id.clone(),
+            }),
+            ActionEffect::SwitchedSession { .. }
+            | ActionEffect::SwitchedWindow { .. }
+            | ActionEffect::RenamedSession { .. }
+            | ActionEffect::RenamedWindow { .. }
+            | ActionEffect::ClosedSession { .. }
+            | ActionEffect::ClosedWindow { .. } => None,
+        }
+    }
+
+    fn is_satisfied(&self, state: &ProjectionState) -> bool {
+        match self {
+            ActionEffect::SwitchedSession {
+                client_name,
+                session_id,
+            } => state
+                .clients
+                .iter()
+                .any(|client| client.name == *client_name && client.session_id == *session_id),
+            ActionEffect::SwitchedWindow {
+                client_name,
+                session_id,
+                window_id,
+            } => state.clients.iter().any(|client| {
+                client.name == *client_name
+                    && client.session_id == *session_id
+                    && client.current_window_id.as_deref() == Some(window_id.as_str())
+            }),
+            ActionEffect::CreatedSession { session_id } => state
+                .sessions
+                .iter()
+                .any(|session| session.id == *session_id),
+            ActionEffect::CreatedWindow {
+                session_id,
+                window_id,
+            } => projection_session(state, session_id)
+                .map(|session| session.windows.iter().any(|window| window.id == *window_id))
+                .unwrap_or(false),
+            ActionEffect::RenamedSession { session_id, name } => {
+                projection_session(state, session_id)
+                    .map(|session| session.name == *name)
+                    .unwrap_or(false)
+            }
+            ActionEffect::RenamedWindow { window_id, name } => state
+                .sessions
+                .iter()
+                .flat_map(|session| session.windows.iter())
+                .any(|window| window.id == *window_id && window.name == *name),
+            ActionEffect::ClosedSession { session_id } => {
+                projection_session(state, session_id).is_none()
+            }
+            ActionEffect::ClosedWindow {
+                session_id,
+                window_id,
+            } => projection_session(state, session_id)
+                .map(|session| !session.windows.iter().any(|window| window.id == *window_id))
+                .unwrap_or(true),
+        }
+    }
+
+    fn unsatisfied_message(&self) -> String {
+        match self {
+            ActionEffect::SwitchedSession {
+                client_name,
+                session_id,
+            } => format!(
+                "refreshed state did not show client `{client_name}` in session `{session_id}`"
+            ),
+            ActionEffect::SwitchedWindow {
+                client_name,
+                session_id,
+                window_id,
+            } => format!(
+                "refreshed state did not show client `{client_name}` on window `{window_id}` in session `{session_id}`"
+            ),
+            ActionEffect::CreatedSession { session_id } => {
+                format!("refreshed state did not include created session `{session_id}`")
+            }
+            ActionEffect::CreatedWindow {
+                session_id,
+                window_id,
+            } => format!(
+                "refreshed state did not include created window `{window_id}` in session `{session_id}`"
+            ),
+            ActionEffect::RenamedSession { session_id, name } => {
+                format!("refreshed state did not show session `{session_id}` renamed to `{name}`")
+            }
+            ActionEffect::RenamedWindow { window_id, name } => {
+                format!("refreshed state did not show window `{window_id}` renamed to `{name}`")
+            }
+            ActionEffect::ClosedSession { session_id } => {
+                format!("refreshed state still included closed session `{session_id}`")
+            }
+            ActionEffect::ClosedWindow {
+                session_id,
+                window_id,
+            } => format!(
+                "refreshed state still included closed window `{window_id}` in session `{session_id}`"
+            ),
+        }
+    }
+}
+
+fn projection_session<'a>(
+    state: &'a ProjectionState,
+    session_id: &str,
+) -> Option<&'a ProjectionSession> {
+    state
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
 }
 
 fn preserve_cached_bell_flags(
@@ -565,6 +974,7 @@ fn store_state_cache(cache_path: &Path, state: &ProjectionState) {
 
 fn handle_action_request(
     shared: &Arc<Mutex<SharedState>>,
+    refresh_lock: &Arc<Mutex<()>>,
     refresh_from_tmux: bool,
     tmux: &dyn ServerTmuxOps,
     request: &ActionRequest,
@@ -574,14 +984,21 @@ fn handle_action_request(
         guard.tmux_socket_path.clone()
     };
     let action_result = tmux.execute_action(&tmux_socket_path, request);
-    let refresh_result = refresh_state(shared, refresh_from_tmux, tmux);
+    let refresh_result = match &action_result {
+        Ok(effect) => {
+            refresh_state_for_action(shared, refresh_lock, refresh_from_tmux, tmux, effect)
+        }
+        Err(_) => refresh_state(shared, refresh_lock, refresh_from_tmux, tmux),
+    };
 
     match (action_result, refresh_result) {
-        (Ok(()), Ok(_)) => ActionResultKind::Ok,
+        (Ok(effect), Ok(_)) => ActionResultKind::Ok {
+            outcome: effect.outcome(),
+        },
         (Err(action_error), Ok(_)) => ActionResultKind::Error {
             message: action_error.to_string(),
         },
-        (Ok(()), Err(refresh_error)) => ActionResultKind::Error {
+        (Ok(_), Err(refresh_error)) => ActionResultKind::Error {
             message: format!("action succeeded but failed to refresh state: {refresh_error:#}"),
         },
         (Err(action_error), Err(refresh_error)) => ActionResultKind::Error {
@@ -599,8 +1016,8 @@ fn tmux_client(tmux_socket_path: &Path) -> TmuxCli {
     }
 }
 
-fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<()> {
-    match &request.action {
+fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<ActionEffect> {
+    let effect = match &request.action {
         Action::SwitchSession { session_id } => {
             let client = tmux
                 .resolve_target_client(request.target_client.as_deref())
@@ -612,6 +1029,10 @@ fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<(
                         client.0
                     )
                 })?;
+            ActionEffect::SwitchedSession {
+                client_name: client.0,
+                session_id: session_id.clone(),
+            }
         }
         Action::SwitchWindow {
             session_id,
@@ -633,42 +1054,73 @@ fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<(
                     client.0
                 )
             })?;
+            ActionEffect::SwitchedWindow {
+                client_name: client.0,
+                session_id: session_id.clone(),
+                window_id: window_id.clone(),
+            }
         }
         Action::CreateSession { name } => {
-            tmux.create_session(name.as_deref())
+            let session_id = tmux
+                .create_session(name.as_deref())
                 .with_context(|| match name {
                     Some(name) => format!("failed to create session `{name}`"),
                     None => String::from("failed to create session"),
                 })?;
+            ActionEffect::CreatedSession { session_id }
         }
         Action::CreateWindow { session_id, name } => {
-            tmux.create_window(session_id, name.as_deref())
+            let window_id = tmux
+                .create_window(session_id, name.as_deref())
                 .with_context(|| match name {
                     Some(name) => {
                         format!("failed to create window `{name}` in session `{session_id}`")
                     }
                     None => format!("failed to create window in session `{session_id}`"),
                 })?;
+            ActionEffect::CreatedWindow {
+                session_id: session_id.clone(),
+                window_id,
+            }
         }
         Action::RenameSession { session_id, name } => {
             tmux.rename_session(session_id, name)
                 .with_context(|| format!("failed to rename session `{session_id}` to `{name}`"))?;
+            ActionEffect::RenamedSession {
+                session_id: session_id.clone(),
+                name: name.clone(),
+            }
         }
         Action::RenameWindow { window_id, name } => {
             tmux.rename_window(window_id, name)
                 .with_context(|| format!("failed to rename window `{window_id}` to `{name}`"))?;
+            ActionEffect::RenamedWindow {
+                window_id: window_id.clone(),
+                name: name.clone(),
+            }
         }
         Action::CloseSession { session_id } => {
             tmux.close_session(session_id)
                 .with_context(|| format!("failed to close session `{session_id}`"))?;
+            ActionEffect::ClosedSession {
+                session_id: session_id.clone(),
+            }
         }
-        Action::CloseWindow { window_id } => {
-            tmux.close_window(window_id)
-                .with_context(|| format!("failed to close window `{window_id}`"))?;
+        Action::CloseWindow {
+            session_id,
+            window_id,
+        } => {
+            tmux.close_window(session_id, window_id).with_context(|| {
+                format!("failed to close window `{window_id}` in session `{session_id}`")
+            })?;
+            ActionEffect::ClosedWindow {
+                session_id: session_id.clone(),
+                window_id: window_id.clone(),
+            }
         }
-    }
+    };
 
-    Ok(())
+    Ok(effect)
 }
 
 #[cfg(test)]
@@ -686,10 +1138,10 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
 
-    use super::{Server, ServerTmuxOps, execute_action_request};
+    use super::{ActionEffect, Server, ServerTmuxOps, execute_action_request};
     use crate::ipc::{
-        Ack, AckKind, Action, ActionRequest, ActionResult, ActionResultKind, ClientKind,
-        ClientMessage, Hello, HookEvent, HookName, PROTOCOL_VERSION, ProjectionClient,
+        Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
+        ClientKind, ClientMessage, Hello, HookEvent, HookName, PROTOCOL_VERSION, ProjectionClient,
         ProjectionSession, ProjectionState, ProjectionWindow, ServerMessage, SidecarPaths,
         StateUpdated,
     };
@@ -795,6 +1247,7 @@ mod tests {
             session_id: String,
         },
         CloseWindow {
+            session_id: String,
             window_id: String,
         },
     }
@@ -868,9 +1321,10 @@ mod tests {
             Ok(())
         }
 
-        fn close_window(&self, window: &WindowId) -> Result<(), TmuxError> {
+        fn close_window(&self, session: &SessionId, window: &WindowId) -> Result<(), TmuxError> {
             self.calls.lock().expect("tmux call log poisoned").push(
                 RecordedTmuxCall::CloseWindow {
+                    session_id: session.clone(),
                     window_id: window.clone(),
                 },
             );
@@ -901,14 +1355,14 @@ mod tests {
     #[derive(Debug)]
     struct MockServerTmux {
         snapshots: Mutex<VecDeque<ProjectionState>>,
-        action_results: Mutex<VecDeque<std::result::Result<(), String>>>,
+        action_results: Mutex<VecDeque<std::result::Result<ActionEffect, String>>>,
         requests: Mutex<Vec<ActionRequest>>,
     }
 
     impl MockServerTmux {
         fn new(
             snapshots: impl Into<VecDeque<ProjectionState>>,
-            action_results: impl Into<VecDeque<std::result::Result<(), String>>>,
+            action_results: impl Into<VecDeque<std::result::Result<ActionEffect, String>>>,
         ) -> Self {
             Self {
                 snapshots: Mutex::new(snapshots.into()),
@@ -934,7 +1388,11 @@ mod tests {
                 .context("missing mock snapshot response")
         }
 
-        fn execute_action(&self, _tmux_socket_path: &Path, request: &ActionRequest) -> Result<()> {
+        fn execute_action(
+            &self,
+            _tmux_socket_path: &Path,
+            request: &ActionRequest,
+        ) -> Result<ActionEffect> {
             self.requests
                 .lock()
                 .expect("tmux requests poisoned")
@@ -944,9 +1402,9 @@ mod tests {
                 .lock()
                 .expect("tmux action results poisoned")
                 .pop_front()
-                .unwrap_or(Ok(()))
+                .context("missing mock action response")?
             {
-                Ok(()) => Ok(()),
+                Ok(effect) => Ok(effect),
                 Err(message) => Err(anyhow!(message)),
             }
         }
@@ -997,6 +1455,37 @@ mod tests {
             }],
             clients: Vec::new(),
         }
+    }
+
+    fn add_projection_window(
+        state: &mut ProjectionState,
+        session_id: &str,
+        window_id: &str,
+        window_name: &str,
+        index: u32,
+        active: bool,
+    ) {
+        let session = state
+            .sessions
+            .iter_mut()
+            .find(|session| session.id == session_id)
+            .expect("missing projection session");
+        if active {
+            session.active_window_id = Some(window_id.to_owned());
+            for window in &mut session.windows {
+                window.active = false;
+            }
+        }
+        session.windows.push(ProjectionWindow {
+            id: window_id.to_owned(),
+            index,
+            name: window_name.to_owned(),
+            active,
+            activity: 0,
+            activity_flag: false,
+            bell_flag: false,
+            silence_flag: false,
+        });
     }
 
     fn add_projection_client(
@@ -1400,7 +1889,11 @@ mod tests {
         add_projection_client(&mut snapshot_without_alert, "client-1", "$1", "@1");
         let tmux = std::sync::Arc::new(MockServerTmux::new(
             vec![snapshot_without_alert.clone()],
-            vec![Ok(())],
+            vec![Ok(ActionEffect::SwitchedWindow {
+                client_name: String::from("client-1"),
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            })],
         ));
         let server = Server::bind_with_tmux(
             sidecar_paths.clone(),
@@ -1437,7 +1930,7 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id,
-                result: ActionResultKind::Ok,
+                result: ActionResultKind::Ok { outcome: None },
             })
         );
 
@@ -1572,14 +2065,16 @@ mod tests {
                 request_id: String::from("req-8"),
                 target_client: None,
                 action: Action::CloseWindow {
+                    session_id: String::from("$4"),
                     window_id: String::from("@4"),
                 },
             },
         ];
 
-        for request in &requests {
-            execute_action_request(&tmux, request)?;
-        }
+        let effects = requests
+            .iter()
+            .map(|request| execute_action_request(&tmux, request))
+            .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(
             tmux.calls(),
@@ -1616,10 +2111,240 @@ mod tests {
                     session_id: String::from("$3"),
                 },
                 RecordedTmuxCall::CloseWindow {
+                    session_id: String::from("$4"),
                     window_id: String::from("@4"),
                 },
             ]
         );
+        assert_eq!(
+            effects,
+            vec![
+                ActionEffect::SwitchedSession {
+                    client_name: String::from("resolved-client"),
+                    session_id: String::from("$1"),
+                },
+                ActionEffect::SwitchedWindow {
+                    client_name: String::from("resolved-client"),
+                    session_id: String::from("$2"),
+                    window_id: String::from("@2"),
+                },
+                ActionEffect::CreatedSession {
+                    session_id: String::from("$new"),
+                },
+                ActionEffect::CreatedWindow {
+                    session_id: String::from("$2"),
+                    window_id: String::from("@new"),
+                },
+                ActionEffect::RenamedSession {
+                    session_id: String::from("$2"),
+                    name: String::from("renamed"),
+                },
+                ActionEffect::RenamedWindow {
+                    window_id: String::from("@2"),
+                    name: String::from("editor"),
+                },
+                ActionEffect::ClosedSession {
+                    session_id: String::from("$3"),
+                },
+                ActionEffect::ClosedWindow {
+                    session_id: String::from("$4"),
+                    window_id: String::from("@4"),
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn action_refresh_retries_until_created_window_is_projected() -> Result<()> {
+        let sandbox = TestDir::new("server-create-window-retry")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        let stale_state = initial_state.clone();
+        let mut refreshed_state = initial_state.clone();
+        add_projection_window(&mut refreshed_state, "$1", "@2", "created", 1, false);
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![stale_state, refreshed_state.clone()],
+            vec![Ok(ActionEffect::CreatedWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@2"),
+            })],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state.clone(),
+            true,
+            tmux.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut client = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        client.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = client.recv()?;
+
+        let request = ActionRequest {
+            request_id: String::from("req-create-window"),
+            target_client: None,
+            action: Action::CreateWindow {
+                session_id: String::from("$1"),
+                name: Some(String::from("created")),
+            },
+        };
+        client.send(&ClientMessage::ActionRequest(request.clone()))?;
+
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::ActionResult(ActionResult {
+                request_id: request.request_id.clone(),
+                result: ActionResultKind::Ok {
+                    outcome: Some(ActionOutcome::CreatedWindow {
+                        session_id: String::from("$1"),
+                        window_id: String::from("@2"),
+                    }),
+                },
+            })
+        );
+
+        shutdown_server(&sidecar_paths.socket_path)?;
+        drop(client);
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(tmux.requests(), vec![request]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn action_refresh_retries_until_closed_window_leaves_projected_session() -> Result<()> {
+        let sandbox = TestDir::new("server-close-window-retry")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        let stale_state = initial_state.clone();
+        let refreshed_state = projection_state_with_session(&tmux_socket_path, "$1", "work");
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![stale_state, refreshed_state.clone()],
+            vec![Ok(ActionEffect::ClosedWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            })],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state.clone(),
+            true,
+            tmux.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut client = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        client.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = client.recv()?;
+
+        let request = ActionRequest {
+            request_id: String::from("req-close-window"),
+            target_client: None,
+            action: Action::CloseWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            },
+        };
+        client.send(&ClientMessage::ActionRequest(request.clone()))?;
+
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::ActionResult(ActionResult {
+                request_id: request.request_id.clone(),
+                result: ActionResultKind::Ok { outcome: None },
+            })
+        );
+
+        shutdown_server(&sidecar_paths.socket_path)?;
+        drop(client);
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(tmux.requests(), vec![request]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn hook_refresh_retries_when_first_lifecycle_snapshot_is_unchanged() -> Result<()> {
+        let sandbox = TestDir::new("server-hook-retry")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        let stale_state = initial_state.clone();
+        let refreshed_state = projection_state_with_session(&tmux_socket_path, "$1", "work");
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![stale_state, refreshed_state.clone()],
+            vec![],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux,
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::WindowUnlinked,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@0")),
+            window_index: Some(0),
+            pane_id: Some(String::from("%1")),
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
 
         Ok(())
     }
@@ -1632,7 +2357,9 @@ mod tests {
         let refreshed_state = projection_state_with_session(&tmux_socket_path, "$9", "created");
         let tmux = std::sync::Arc::new(MockServerTmux::new(
             vec![refreshed_state.clone()],
-            vec![Ok(())],
+            vec![Ok(ActionEffect::CreatedSession {
+                session_id: String::from("$9"),
+            })],
         ));
         let server = Server::bind_with_tmux(
             sidecar_paths.clone(),
@@ -1674,7 +2401,11 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id.clone(),
-                result: ActionResultKind::Ok,
+                result: ActionResultKind::Ok {
+                    outcome: Some(ActionOutcome::CreatedSession {
+                        session_id: String::from("$9"),
+                    }),
+                },
             })
         );
 

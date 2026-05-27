@@ -25,6 +25,7 @@ use crate::{
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const PROJECTION_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct IpcClient {
@@ -87,9 +88,17 @@ impl IpcClient {
         tmux_socket_path: &Path,
         client_kind: ClientKind,
     ) -> Result<(Self, bool)> {
+        let sidecar_paths = SidecarPaths::from_tmux_socket_path(tmux_socket_path);
         let (stream, started_server) = connect_or_spawn_stream(tmux_socket_path)?;
-        let client = Self::connect_stream(stream, client_kind)?;
-        Ok((client, started_server))
+        match Self::connect_stream(stream, client_kind) {
+            Ok(client) => Ok((client, started_server)),
+            Err(error) if !started_server && is_protocol_mismatch(&error) => {
+                let stale_error = error.to_string();
+                restart_stale_server(&sidecar_paths, tmux_socket_path, client_kind)
+                    .with_context(|| format!("connected sidecar server is stale: {stale_error}"))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn send(&mut self, message: &ClientMessage) -> Result<()> {
@@ -299,6 +308,121 @@ fn connect_or_spawn_stream(tmux_socket_path: &Path) -> Result<(UnixStream, bool)
     }
 
     wait_for_server_socket(&sidecar_paths.socket_path).map(|stream| (stream, true))
+}
+
+fn is_protocol_mismatch(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("protocol mismatch")
+}
+
+fn restart_stale_server(
+    sidecar_paths: &SidecarPaths,
+    tmux_socket_path: &Path,
+    client_kind: ClientKind,
+) -> Result<(IpcClient, bool)> {
+    shutdown_server_without_protocol_check(&sidecar_paths.socket_path)
+        .or_else(|_| terminate_server_from_pid_file(sidecar_paths))?;
+    wait_for_stopped_server(&sidecar_paths.socket_path)?;
+
+    if sidecar_paths.socket_path.exists() {
+        fs::remove_file(&sidecar_paths.socket_path).with_context(|| {
+            format!(
+                "failed to remove stale sidecar socket `{}`",
+                sidecar_paths.socket_path.display()
+            )
+        })?;
+    }
+
+    let (stream, _) = connect_or_spawn_stream(tmux_socket_path)?;
+    let client = IpcClient::connect_stream(stream, client_kind)?;
+    Ok((client, true))
+}
+
+fn shutdown_server_without_protocol_check(sidecar_socket_path: &Path) -> Result<()> {
+    let mut stream = UnixStream::connect(sidecar_socket_path).with_context(|| {
+        format!(
+            "failed to connect to stale sidecar server at `{}`",
+            sidecar_socket_path.display()
+        )
+    })?;
+    let reader_stream = stream
+        .try_clone()
+        .context("failed to clone stale sidecar stream")?;
+    let mut reader = BufReader::new(reader_stream);
+
+    write_message(
+        &mut stream,
+        &ClientMessage::Hello(Hello {
+            client_kind: ClientKind::Control,
+            protocol_version: PROTOCOL_VERSION,
+        }),
+    )
+    .context("failed to send stale sidecar hello")?;
+    let _: Option<serde_json::Value> = crate::ipc::read_message(&mut reader)
+        .context("failed to read stale sidecar hello response")?;
+    write_message(&mut stream, &ClientMessage::Shutdown)
+        .context("failed to send stale sidecar shutdown")?;
+    let _: Option<serde_json::Value> = crate::ipc::read_message(&mut reader)
+        .context("failed to read stale sidecar shutdown response")?;
+    Ok(())
+}
+
+fn terminate_server_from_pid_file(sidecar_paths: &SidecarPaths) -> Result<()> {
+    let pid = fs::read_to_string(&sidecar_paths.pid_path)
+        .with_context(|| format!("failed to read `{}`", sidecar_paths.pid_path.display()))?;
+    let pid = pid.trim();
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!(
+            "sidecar pid file `{}` did not contain a valid pid",
+            sidecar_paths.pid_path.display()
+        );
+    }
+
+    let status = Command::new("kill")
+        .arg(pid)
+        .status()
+        .with_context(|| format!("failed to terminate stale sidecar process `{pid}`"))?;
+    if !status.success() {
+        bail!("failed to terminate stale sidecar process `{pid}`: {status}");
+    }
+
+    Ok(())
+}
+
+fn wait_for_stopped_server(sidecar_socket_path: &Path) -> Result<()> {
+    let deadline = Instant::now() + SERVER_STOP_TIMEOUT;
+
+    loop {
+        match UnixStream::connect(sidecar_socket_path) {
+            Ok(stream) => {
+                drop(stream);
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out waiting for stale sidecar server `{}` to stop",
+                        sidecar_socket_path.display()
+                    );
+                }
+                thread::sleep(CONNECT_RETRY_DELAY);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionAborted
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed while waiting for stale sidecar server `{}` to stop",
+                        sidecar_socket_path.display()
+                    )
+                });
+            }
+        }
+    }
 }
 
 fn wait_for_server_socket(socket_path: &Path) -> Result<UnixStream> {

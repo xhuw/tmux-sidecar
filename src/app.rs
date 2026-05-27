@@ -23,7 +23,10 @@ use crate::{
     client::{self, IpcClient, ReadStatus},
     event::{self, AppEvent},
     input::InputBuffer,
-    ipc::{Action, ActionResult, ActionResultKind, ProjectionState, ServerMessage, StateUpdated},
+    ipc::{
+        Action, ActionOutcome, ActionResult, ActionResultKind, ProjectionState, ServerMessage,
+        StateUpdated,
+    },
     model::{
         ActionError, AppState, ClientName, EditAction, Focus, FocusMove, FocusReconcile, Mode,
         TmuxState, Toast, WindowTarget,
@@ -53,6 +56,34 @@ pub struct App {
 struct StartupContext {
     target_client: ClientName,
     tmux_socket_path: PathBuf,
+}
+
+struct SuccessfulAction {
+    outcome: Option<ActionOutcome>,
+}
+
+enum ActionCompletion {
+    Succeeded(SuccessfulAction),
+    Failed,
+}
+
+impl SuccessfulAction {
+    fn created_session_id(&self) -> Option<String> {
+        match &self.outcome {
+            Some(ActionOutcome::CreatedSession { session_id }) => Some(session_id.clone()),
+            _ => None,
+        }
+    }
+
+    fn created_window_id(&self, expected_session_id: &str) -> Option<String> {
+        match &self.outcome {
+            Some(ActionOutcome::CreatedWindow {
+                session_id,
+                window_id,
+            }) if session_id == expected_session_id => Some(window_id.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl App {
@@ -282,22 +313,22 @@ impl App {
                 self.handle_state_update(update);
                 Ok(())
             }
-            ServerMessage::ActionResult(result) => self.handle_action_result(result),
+            ServerMessage::ActionResult(result) => self.handle_action_result(result).map(|_| ()),
             ServerMessage::Error(error) => bail!(error.message),
             ServerMessage::HelloAck(_) => Ok(()),
             ServerMessage::Ack(_) => Ok(()),
         }
     }
 
-    fn handle_action_result(&mut self, result: ActionResult) -> Result<()> {
+    fn handle_action_result(&mut self, result: ActionResult) -> Result<ActionCompletion> {
         match result.result {
-            ActionResultKind::Ok => {
+            ActionResultKind::Ok { outcome } => {
                 self.state.last_error = None;
-                Ok(())
+                Ok(ActionCompletion::Succeeded(SuccessfulAction { outcome }))
             }
             ActionResultKind::Error { message } => {
                 self.state.last_error = Some(ActionError { message });
-                Ok(())
+                Ok(ActionCompletion::Failed)
             }
         }
     }
@@ -605,7 +636,7 @@ impl App {
                 window_id,
             },
         };
-        let Some(()) = self.try_server_action(Some(client.0), action)? else {
+        let Some(_) = self.try_server_action(Some(client.0), action)? else {
             return Ok(());
         };
 
@@ -645,7 +676,13 @@ impl App {
     fn close_focused_target(&mut self) -> Result<()> {
         let action = match self.state.focus.clone() {
             Focus::Session(session_id) => Action::CloseSession { session_id },
-            Focus::Window { window_id, .. } => Action::CloseWindow { window_id },
+            Focus::Window {
+                session_id,
+                window_id,
+            } => Action::CloseWindow {
+                session_id,
+                window_id,
+            },
             Focus::CreateSession | Focus::CreateWindow(_) => return Ok(()),
         };
 
@@ -703,7 +740,7 @@ impl App {
 
         match mode {
             Mode::RenameSession { id, input, .. } => {
-                let Some(()) = self.try_server_action(
+                let Some(_) = self.try_server_action(
                     None,
                     Action::RenameSession {
                         session_id: id.clone(),
@@ -722,7 +759,7 @@ impl App {
                 input,
                 ..
             } => {
-                let Some(()) = self.try_server_action(
+                let Some(_) = self.try_server_action(
                     None,
                     Action::RenameWindow {
                         window_id: id.clone(),
@@ -741,12 +778,16 @@ impl App {
                 };
                 let name = (!input.is_empty()).then_some(input.as_str().to_owned());
                 let session_ids_before = self.session_ids();
-                let Some(()) =
+                let Some(action_success) =
                     self.try_server_action(None, Action::CreateSession { name: name.clone() })?
                 else {
                     return Ok(());
                 };
-                let session_id = self.created_session_id(&session_ids_before, name.as_deref())?;
+                let session_id = if let Some(session_id) = action_success.created_session_id() {
+                    session_id
+                } else {
+                    self.created_session_id(&session_ids_before, name.as_deref())?
+                };
 
                 self.switch_to_target(client, WindowTarget::Session(session_id.clone()))?;
                 if !self.should_quit {
@@ -759,7 +800,7 @@ impl App {
                 };
                 let name = (!input.is_empty()).then_some(input.as_str().to_owned());
                 let window_ids_before = self.window_ids(&session_id)?;
-                let Some(()) = self.try_server_action(
+                let Some(action_success) = self.try_server_action(
                     None,
                     Action::CreateWindow {
                         session_id: session_id.clone(),
@@ -770,7 +811,11 @@ impl App {
                     return Ok(());
                 };
                 let window_id =
-                    self.created_window_id(&session_id, &window_ids_before, name.as_deref())?;
+                    if let Some(window_id) = action_success.created_window_id(&session_id) {
+                        window_id
+                    } else {
+                        self.created_window_id(&session_id, &window_ids_before, name.as_deref())?
+                    };
 
                 self.switch_to_target(
                     client,
@@ -902,12 +947,13 @@ impl App {
         &mut self,
         target_client: Option<String>,
         action: Action,
-    ) -> Result<Option<()>> {
-        if self.perform_server_action(target_client, action)? {
-            Ok(Some(()))
-        } else {
-            self.state.mode = Mode::Normal;
-            Ok(None)
+    ) -> Result<Option<SuccessfulAction>> {
+        match self.perform_server_action(target_client, action)? {
+            ActionCompletion::Succeeded(success) => Ok(Some(success)),
+            ActionCompletion::Failed => {
+                self.state.mode = Mode::Normal;
+                Ok(None)
+            }
         }
     }
 
@@ -915,9 +961,9 @@ impl App {
         &mut self,
         target_client: Option<String>,
         action: Action,
-    ) -> Result<bool> {
+    ) -> Result<ActionCompletion> {
         let Some(mut subscription) = self.subscription.take() else {
-            return Ok(false);
+            return Ok(ActionCompletion::Failed);
         };
 
         self.state.last_error = None;
@@ -934,9 +980,7 @@ impl App {
                                 result.request_id
                             );
                         }
-                        let succeeded = matches!(result.result, ActionResultKind::Ok);
-                        self.handle_action_result(result)?;
-                        return Ok(succeeded);
+                        return self.handle_action_result(result);
                     }
                     ReadStatus::Message(message) => self.handle_server_message(message)?,
                     ReadStatus::Pending => {
@@ -951,7 +995,7 @@ impl App {
         match (result, reset) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
-            (Ok(succeeded), Ok(())) => Ok(succeeded),
+            (Ok(completion), Ok(())) => Ok(completion),
         }
     }
 }
@@ -1181,7 +1225,7 @@ mod tests {
 
         app.handle_server_message(ServerMessage::ActionResult(ActionResult {
             request_id: String::from("req-2"),
-            result: ActionResultKind::Ok,
+            result: ActionResultKind::Ok { outcome: None },
         }))
         .expect("handle action result");
 

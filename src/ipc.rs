@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::model::{Client, ClientName, Session, TmuxState, Window, WindowAlert};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
@@ -114,6 +114,7 @@ pub enum Action {
         session_id: String,
     },
     CloseWindow {
+        session_id: String,
         window_id: String,
     },
 }
@@ -140,8 +141,20 @@ pub struct ActionResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "status")]
 pub enum ActionResultKind {
-    Ok,
+    Ok { outcome: Option<ActionOutcome> },
     Error { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "outcome")]
+pub enum ActionOutcome {
+    CreatedSession {
+        session_id: String,
+    },
+    CreatedWindow {
+        session_id: String,
+        window_id: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

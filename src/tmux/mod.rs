@@ -41,7 +41,7 @@ pub trait Tmux {
     fn create_window(&self, session: &SessionId, name: Option<&str>)
     -> Result<WindowId, TmuxError>;
     fn close_session(&self, session: &SessionId) -> Result<(), TmuxError>;
-    fn close_window(&self, window: &WindowId) -> Result<(), TmuxError>;
+    fn close_window(&self, session: &SessionId, window: &WindowId) -> Result<(), TmuxError>;
     fn rename_session(&self, session: &SessionId, name: &str) -> Result<(), TmuxError>;
     fn rename_window(&self, window: &WindowId, name: &str) -> Result<(), TmuxError>;
 }
@@ -250,9 +250,10 @@ impl Tmux for TmuxCli {
         Ok(())
     }
 
-    fn close_window(&self, window: &WindowId) -> Result<(), TmuxError> {
+    fn close_window(&self, session: &SessionId, window: &WindowId) -> Result<(), TmuxError> {
         let socket = self.socket_options();
-        command::run_tmux(&socket, ["kill-window", "-t", window.as_str()])?;
+        let target = format!("{session}:{window}");
+        command::run_tmux(&socket, ["kill-window", "-t", target.as_str()])?;
         Ok(())
     }
 

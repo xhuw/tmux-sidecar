@@ -987,6 +987,189 @@ fn closes_focused_window_with_x_without_confirmation() -> Result<(), Box<dyn std
 
 #[test]
 #[serial]
+fn sidecar_close_then_create_window_keeps_tree_in_sync() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_session_id = main_session.id.clone();
+    let closed_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+
+    app.state_mut().focus = window_focus(&main_session_id, &closed_window_id);
+    app.on_key_event(key(KeyCode::Char('x')))?;
+    assert!(app.state().last_error.is_none());
+    assert!(
+        !app.state()
+            .tmux
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .any(|window| window.id == closed_window_id)
+    );
+
+    app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
+    app.on_key_event(key(KeyCode::Enter))?;
+    type_text(&mut app, "after-close")?;
+    app.on_key_event(key(KeyCode::Enter))?;
+
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(app.state().last_error.is_none());
+    let created_window_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after close/create")?
+        .windows
+        .into_iter()
+        .find(|window| window.name == "after-close")
+        .map(|window| window.id)
+        .ok_or("missing replacement window after close/create")?;
+    assert_eq!(server.client_window_id()?, created_window_id);
+    assert_eq!(
+        app.state().focus,
+        window_focus(&main_session_id, &created_window_id)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn external_close_then_sidecar_create_window_keeps_tree_in_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_session_id = main_session.id.clone();
+    let closed_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+
+    run_tmux(
+        &server.socket_name,
+        &["kill-window", "-t", &closed_window_id],
+    )?;
+
+    app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
+    app.on_key_event(key(KeyCode::Enter))?;
+    type_text(&mut app, "after-external-close")?;
+    app.on_key_event(key(KeyCode::Enter))?;
+
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(app.state().last_error.is_none());
+    assert!(
+        !app.state()
+            .tmux
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .any(|window| window.id == closed_window_id)
+    );
+    let created_window_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after external close/create")?
+        .windows
+        .into_iter()
+        .find(|window| window.name == "after-external-close")
+        .map(|window| window.id)
+        .ok_or("missing replacement window after external close/create")?;
+    assert_eq!(server.client_window_id()?, created_window_id);
+    assert_eq!(
+        app.state().focus,
+        window_focus(&main_session_id, &created_window_id)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn close_active_window_then_create_window_keeps_tree_in_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let main_session_id = server.client_session_id()?;
+    let closed_window_id = server.client_window_id()?;
+
+    app.state_mut().focus = window_focus(&main_session_id, &closed_window_id);
+    app.on_key_event(key(KeyCode::Char('x')))?;
+    assert!(app.state().last_error.is_none());
+    assert!(
+        !app.state()
+            .tmux
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .any(|window| window.id == closed_window_id)
+    );
+
+    app.on_key_event(key(KeyCode::Char('c')))?;
+    type_text(&mut app, "after-active-close")?;
+    app.on_key_event(key(KeyCode::Enter))?;
+
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(app.state().last_error.is_none());
+    let created_window_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after active close/create")?
+        .windows
+        .into_iter()
+        .find(|window| window.name == "after-active-close")
+        .map(|window| window.id)
+        .ok_or("missing replacement window after active close/create")?;
+    assert_eq!(server.client_window_id()?, created_window_id);
+    assert_eq!(
+        app.state().focus,
+        window_focus(&main_session_id, &created_window_id)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn closes_focused_session_with_x_without_confirmation() -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {
         eprintln!("skipping integration test: tmux is unavailable");
