@@ -39,8 +39,8 @@ pub enum ReadStatus {
 
 impl IpcClient {
     pub fn connect_or_spawn(tmux_socket_path: &Path, client_kind: ClientKind) -> Result<Self> {
-        let stream = connect_or_spawn_stream(tmux_socket_path)?;
-        Self::connect_stream(stream, client_kind)
+        let (client, _) = Self::connect_or_spawn_with_status(tmux_socket_path, client_kind)?;
+        Ok(client)
     }
 
     fn connect_existing_socket(
@@ -80,6 +80,15 @@ impl IpcClient {
             ServerMessage::Error(error) => bail!(error.message),
             message => bail!("unexpected handshake response: {message:?}"),
         }
+    }
+
+    fn connect_or_spawn_with_status(
+        tmux_socket_path: &Path,
+        client_kind: ClientKind,
+    ) -> Result<(Self, bool)> {
+        let (stream, started_server) = connect_or_spawn_stream(tmux_socket_path)?;
+        let client = Self::connect_stream(stream, client_kind)?;
+        Ok((client, started_server))
     }
 
     pub fn send(&mut self, message: &ClientMessage) -> Result<()> {
@@ -130,9 +139,10 @@ impl IpcClient {
     }
 }
 
-pub fn ensure_server_running(tmux_socket_path: &Path) -> Result<()> {
-    let _client = IpcClient::connect_or_spawn(tmux_socket_path, ClientKind::Control)?;
-    Ok(())
+pub fn ensure_server_running(tmux_socket_path: &Path) -> Result<bool> {
+    let (_client, started_server) =
+        IpcClient::connect_or_spawn_with_status(tmux_socket_path, ClientKind::Control)?;
+    Ok(started_server)
 }
 
 pub fn run_hook(args: HookArgs) -> Result<()> {
@@ -239,19 +249,19 @@ fn parse_tmux_env_socket_path(value: &OsStr) -> Option<PathBuf> {
     socket_path.is_absolute().then_some(socket_path)
 }
 
-fn connect_or_spawn_stream(tmux_socket_path: &Path) -> Result<UnixStream> {
+fn connect_or_spawn_stream(tmux_socket_path: &Path) -> Result<(UnixStream, bool)> {
     let sidecar_paths = SidecarPaths::from_tmux_socket_path(tmux_socket_path);
     fs::create_dir_all(&sidecar_paths.runtime_dir)
         .context("failed to create sidecar runtime dir")?;
 
     if let Ok(stream) = UnixStream::connect(&sidecar_paths.socket_path) {
-        return Ok(stream);
+        return Ok((stream, false));
     }
 
     let spawn_lock = acquire_spawn_lock(&sidecar_paths.lock_path, &sidecar_paths.socket_path)?;
 
     if let Ok(stream) = UnixStream::connect(&sidecar_paths.socket_path) {
-        return Ok(stream);
+        return Ok((stream, true));
     }
 
     if sidecar_paths.socket_path.exists() {
@@ -267,7 +277,7 @@ fn connect_or_spawn_stream(tmux_socket_path: &Path) -> Result<UnixStream> {
         spawn_server_process(tmux_socket_path)?;
     }
 
-    wait_for_server_socket(&sidecar_paths.socket_path)
+    wait_for_server_socket(&sidecar_paths.socket_path).map(|stream| (stream, true))
 }
 
 fn wait_for_server_socket(socket_path: &Path) -> Result<UnixStream> {

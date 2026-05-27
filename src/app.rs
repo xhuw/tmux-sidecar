@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, env, io, panic, path::PathBuf, sync::Once, time::Duration};
+use std::{
+    collections::BTreeSet,
+    env, io, panic,
+    path::PathBuf,
+    sync::Once,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::{
@@ -20,7 +26,7 @@ use crate::{
     ipc::{Action, ActionResult, ActionResultKind, ProjectionState, ServerMessage, StateUpdated},
     model::{
         ActionError, AppState, ClientName, EditAction, Focus, FocusMove, FocusReconcile, Mode,
-        TmuxState, WindowTarget,
+        TmuxState, Toast, WindowTarget,
     },
     tmux::{Tmux, TmuxCli, hooks::HookCommandProgram},
     ui,
@@ -30,6 +36,8 @@ static PANIC_HOOK: Once = Once::new();
 const ACTION_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_millis(1);
 const SERVER_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
+const STARTUP_TOAST_DURATION: Duration = Duration::from_secs(3);
+const STARTUP_TOAST_MESSAGE: &str = "Started tmux-sidecar server";
 
 #[derive(Debug)]
 pub struct App {
@@ -38,6 +46,7 @@ pub struct App {
     tmux: TmuxCli,
     render_tick: Duration,
     subscription: Option<IpcClient>,
+    toast_deadline: Option<Instant>,
     should_quit: bool,
 }
 
@@ -60,6 +69,7 @@ impl App {
             tmux,
             render_tick,
             subscription: None,
+            toast_deadline: None,
             should_quit: false,
         }
     }
@@ -156,12 +166,15 @@ impl App {
             target_client,
             tmux_socket_path,
         } = startup;
-        client::ensure_server_running(&tmux_socket_path)?;
+        let started_server = client::ensure_server_running(&tmux_socket_path)?;
         self.install_hooks()?;
 
         let mut subscription = client::subscribe(&tmux_socket_path, Some(target_client.0.clone()))?;
         self.state.target_client = Some(target_client);
         self.apply_initial_state(&mut subscription)?;
+        if started_server {
+            self.show_toast(STARTUP_TOAST_MESSAGE);
+        }
         self.subscription = Some(subscription);
         Ok(())
     }
@@ -169,6 +182,7 @@ impl App {
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         while !self.should_quit {
             self.drain_server_messages()?;
+            self.expire_toast_if_needed();
             terminal.draw(|frame| ui::render(frame, &self.state))?;
             let event = event::poll_next(self.render_tick)?;
             self.handle_event(event)?;
@@ -323,7 +337,28 @@ impl App {
         self.state.focus_visible_target();
     }
 
+    fn show_toast(&mut self, message: impl Into<String>) {
+        self.state.toast = Some(Toast {
+            message: message.into(),
+        });
+        self.toast_deadline = Some(Instant::now() + STARTUP_TOAST_DURATION);
+    }
+
+    fn expire_toast_if_needed(&mut self) {
+        let Some(deadline) = self.toast_deadline else {
+            return;
+        };
+
+        if Instant::now() < deadline {
+            return;
+        }
+
+        self.toast_deadline = None;
+        self.state.toast = None;
+    }
+
     fn handle_event(&mut self, event: AppEvent) -> Result<()> {
+        self.expire_toast_if_needed();
         match event {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
@@ -988,9 +1023,12 @@ fn restore_terminal() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::App;
     use crate::{
         cli::Cli,
+        event::AppEvent,
         ipc::{
             ActionResult, ActionResultKind, ProjectionClient, ProjectionSession, ProjectionState,
             ProjectionWindow, ServerMessage, StateUpdated,
@@ -1148,5 +1186,18 @@ mod tests {
         .expect("handle action result");
 
         assert!(app.state().last_error.is_none());
+    }
+
+    #[test]
+    fn expired_toast_is_cleared_on_next_event() {
+        let mut app = App::new(test_cli());
+        app.state_mut().toast = Some(crate::model::Toast {
+            message: String::from("Started tmux-sidecar server"),
+        });
+        app.toast_deadline = Some(Instant::now() - Duration::from_millis(1));
+
+        app.handle_event(AppEvent::Tick).expect("handle tick");
+
+        assert!(app.state().toast.is_none());
     }
 }

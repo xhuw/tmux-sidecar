@@ -305,6 +305,28 @@ fn startup_focuses_target_clients_active_window() -> Result<(), Box<dyn std::err
 
 #[test]
 #[serial]
+fn startup_shows_toast_when_sidecar_server_auto_starts() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let app = server.app()?;
+
+    assert_eq!(
+        app.state()
+            .toast
+            .as_ref()
+            .map(|toast| toast.message.as_str()),
+        Some("Started tmux-sidecar server")
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn refresh_syncs_external_create_rename_close_reindex_and_active_changes()
 -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {

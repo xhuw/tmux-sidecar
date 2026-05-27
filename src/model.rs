@@ -346,6 +346,11 @@ pub struct ActionError {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Toast {
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NavigationState {
     pub pending_g: bool,
@@ -486,6 +491,7 @@ pub struct AppState {
     pub navigation: NavigationState,
     pub target_client: Option<ClientName>,
     pub last_error: Option<ActionError>,
+    pub toast: Option<Toast>,
     pub tree_loading: bool,
 }
 
@@ -498,6 +504,7 @@ impl Default for AppState {
             navigation: NavigationState::default(),
             target_client: None,
             last_error: None,
+            toast: None,
             tree_loading: false,
         }
     }

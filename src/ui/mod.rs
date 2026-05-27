@@ -87,6 +87,17 @@ pub fn render_with_options(frame: &mut Frame<'_>, state: &AppState, options: Ren
     let footer = Paragraph::new(Line::from(footer_spans)).style(theme.footer());
     frame.render_widget(footer, chunks[2]);
 
+    if let Some(toast) = &state.toast {
+        let toast_area = toast_rect(area, &toast.message);
+        frame.render_widget(Clear, toast_area);
+        frame.render_widget(
+            Paragraph::new(toast.message.as_str())
+                .style(theme.modal())
+                .block(Block::bordered().border_style(theme.modal_border())),
+            toast_area,
+        );
+    }
+
     if state.mode == Mode::Help {
         let lines = help::modal_lines(options.glyph_mode, theme);
         let help_area = centered_rect(area, 72, lines.len() as u16 + 2);
@@ -102,6 +113,11 @@ pub fn render_with_options(frame: &mut Frame<'_>, state: &AppState, options: Ren
     }
 }
 
+fn toast_rect(area: Rect, message: &str) -> Rect {
+    let content_width = u16::try_from(message.chars().count()).unwrap_or(u16::MAX);
+    bottom_right_rect(area, content_width.saturating_add(4), 3, 1, 1)
+}
+
 fn centered_rect(area: Rect, max_width: u16, height: u16) -> Rect {
     let width = area.width.min(max_width);
     let x = area.x + area.width.saturating_sub(width) / 2;
@@ -112,6 +128,20 @@ fn centered_rect(area: Rect, max_width: u16, height: u16) -> Rect {
         y,
         width,
         height: area.height.min(height),
+    }
+}
+
+fn bottom_right_rect(area: Rect, width: u16, height: u16, margin_x: u16, margin_y: u16) -> Rect {
+    let width = area.width.min(width);
+    let height = area.height.min(height);
+    let x = area.x + area.width.saturating_sub(width.saturating_add(margin_x));
+    let y = area.y + area.height.saturating_sub(height.saturating_add(margin_y));
+
+    Rect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -161,7 +191,8 @@ mod tests {
     use crate::{
         input::InputBuffer,
         model::{
-            AppState, Client, ClientName, Focus, Mode, Session, TmuxState, Window, WindowAlert,
+            AppState, Client, ClientName, Focus, Mode, Session, TmuxState, Toast, Window,
+            WindowAlert,
         },
     };
 
@@ -227,6 +258,30 @@ mod tests {
         assert!(output.contains("c               new window in focused session"));
         assert!(output.contains("x               close focused session/window"));
         assert!(output.contains("Failed actions refresh from tmux."));
+    }
+
+    #[test]
+    fn startup_toast_renders_in_bottom_right_corner() {
+        let mut state = sample_state();
+        state.toast = Some(Toast {
+            message: String::from("Started tmux-sidecar server"),
+        });
+
+        let output = render_ascii(&state, 72, 12);
+        let lines: Vec<_> = output.lines().collect();
+        let toast_row_index = lines
+            .iter()
+            .position(|line| line.contains("Started tmux-sidecar server"))
+            .expect("expected startup toast row");
+        let toast_row = lines[toast_row_index];
+
+        assert!(toast_row_index >= 9);
+        assert!(
+            toast_row
+                .find("Started tmux-sidecar server")
+                .unwrap_or_default()
+                >= 35
+        );
     }
 
     #[test]
