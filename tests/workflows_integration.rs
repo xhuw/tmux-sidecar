@@ -1,5 +1,6 @@
 use std::{
-    env,
+    env, fs,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -154,6 +155,25 @@ impl Drop for IsolatedServer {
     }
 }
 
+struct TempDir {
+    path: PathBuf,
+}
+
+impl TempDir {
+    fn new(name: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let path = env::temp_dir().join(format!("tmux-sidecar-{name}-{unique}"));
+        fs::create_dir_all(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
 fn run_tmux(socket_name: &str, args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("tmux")
         .arg("-L")
@@ -177,6 +197,56 @@ fn wait_for_client_name(socket_name: &str) -> Result<String, Box<dyn std::error:
     }
 
     Err("control-mode client did not attach".into())
+}
+
+fn window_current_path(
+    socket_name: &str,
+    target: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(PathBuf::from(
+        run_tmux(
+            socket_name,
+            &[
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{pane_current_path}",
+            ],
+        )?
+        .trim(),
+    ))
+}
+
+fn set_window_path(
+    socket_name: &str,
+    target: &str,
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path_str = path.to_str().ok_or("window path is not valid utf-8")?;
+    run_tmux(
+        socket_name,
+        &[
+            "send-keys",
+            "-t",
+            target,
+            &format!("cd {path_str}"),
+            "Enter",
+        ],
+    )?;
+
+    for _ in 0..20 {
+        if window_current_path(socket_name, target)? == path {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    Err(format!(
+        "window `{target}` did not change to expected path `{}`",
+        path.display()
+    )
+    .into())
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -851,6 +921,107 @@ fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn s
         .ok_or("missing it-main after cancel")?;
     assert_eq!(retained_window_count, window_count_before_cancel);
     assert_eq!(server.client_window_id()?, first_window_id);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn creates_window_in_shared_session_workdir() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let workdir = TempDir::new("shared-session-workdir")?;
+    set_window_path(&server.socket_name, "it-main:0", &workdir.path)?;
+    set_window_path(&server.socket_name, "it-main:1", &workdir.path)?;
+
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let main_session_id = app
+        .state()
+        .tmux
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-main session")?;
+
+    app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
+    app.on_key_event(key(KeyCode::Enter))?;
+    type_text(&mut app, "cwd-shared")?;
+    app.on_key_event(key(KeyCode::Enter))?;
+
+    let created_window_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after cwd create")?
+        .windows
+        .into_iter()
+        .find(|window| window.name == "cwd-shared")
+        .map(|window| window.id)
+        .ok_or("missing created cwd-shared window")?;
+
+    assert_eq!(
+        window_current_path(&server.socket_name, &created_window_id)?,
+        workdir.path
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn creates_window_in_active_window_workdir_when_session_paths_diverge()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let first_dir = TempDir::new("diverged-workdir-first")?;
+    let active_dir = TempDir::new("diverged-workdir-active")?;
+    set_window_path(&server.socket_name, "it-main:0", &first_dir.path)?;
+    set_window_path(&server.socket_name, "it-main:1", &active_dir.path)?;
+    run_tmux(&server.socket_name, &["select-window", "-t", "it-main:1"])?;
+
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let main_session_id = app
+        .state()
+        .tmux
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-main session")?;
+
+    app.state_mut().focus = Focus::CreateWindow(main_session_id.clone());
+    app.on_key_event(key(KeyCode::Enter))?;
+    type_text(&mut app, "cwd-active")?;
+    app.on_key_event(key(KeyCode::Enter))?;
+
+    let created_window_id = tmux
+        .snapshot()?
+        .sessions
+        .into_iter()
+        .find(|session| session.id == main_session_id)
+        .ok_or("missing it-main after divergent cwd create")?
+        .windows
+        .into_iter()
+        .find(|window| window.name == "cwd-active")
+        .map(|window| window.id)
+        .ok_or("missing created cwd-active window")?;
+
+    assert_eq!(
+        window_current_path(&server.socket_name, &created_window_id)?,
+        active_dir.path
+    );
 
     Ok(())
 }

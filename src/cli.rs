@@ -171,6 +171,9 @@ pub struct HookArgs {
     #[arg(long = "pane-id", value_name = "PANE")]
     pub pane_id: Option<String>,
 
+    #[arg(long = "pane-current-path", value_name = "PATH")]
+    pub pane_current_path: Option<PathBuf>,
+
     #[arg(long = "client-name", value_name = "CLIENT")]
     pub client_name: Option<String>,
 

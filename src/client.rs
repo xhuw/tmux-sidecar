@@ -165,6 +165,7 @@ pub fn run_hook(args: HookArgs) -> Result<()> {
             window_id: args.window_id,
             window_index: args.window_index,
             pane_id: args.pane_id,
+            pane_current_path: args.pane_current_path,
             client_name: args.client_name,
             timestamp_ms: args.timestamp_ms,
         },

@@ -15,12 +15,15 @@ const SESSION_ID_FORMAT: &str = "#{q:session_id}";
 const WINDOW_ID_FORMAT: &str = "#{q:window_id}";
 const WINDOW_INDEX_FORMAT: &str = "#{q:window_index}";
 const PANE_ID_FORMAT: &str = "#{q:pane_id}";
+const PANE_CURRENT_PATH_FORMAT: &str = "#{q:pane_current_path}";
 const CLIENT_NAME_FORMAT: &str = "#{q:client_name}";
 
 const SESSION_ID_ARG: HookArgument = HookArgument::new("--session-id", SESSION_ID_FORMAT);
 const WINDOW_ID_ARG: HookArgument = HookArgument::new("--window-id", WINDOW_ID_FORMAT);
 const WINDOW_INDEX_ARG: HookArgument = HookArgument::new("--window-index", WINDOW_INDEX_FORMAT);
 const PANE_ID_ARG: HookArgument = HookArgument::new("--pane-id", PANE_ID_FORMAT);
+const PANE_CURRENT_PATH_ARG: HookArgument =
+    HookArgument::new("--pane-current-path", PANE_CURRENT_PATH_FORMAT);
 const CLIENT_NAME_ARG: HookArgument = HookArgument::new("--client-name", CLIENT_NAME_FORMAT);
 
 const SESSION_HOOKS: &[HookDefinition] = &[
@@ -29,7 +32,12 @@ const SESSION_HOOKS: &[HookDefinition] = &[
     HookDefinition::new("session-renamed", &[SESSION_ID_ARG]),
     HookDefinition::new(
         "session-window-changed",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
 ];
 
@@ -48,7 +56,13 @@ const WINDOW_HOOKS: &[HookDefinition] = &[
     ),
     HookDefinition::new(
         "window-pane-changed",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::new(
         "window-layout-changed",
@@ -63,7 +77,13 @@ const ALERT_HOOKS: &[HookDefinition] = &[
     ),
     HookDefinition::new(
         "alert-bell",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::disabled(
         "alert-silence",
@@ -74,26 +94,53 @@ const ALERT_HOOKS: &[HookDefinition] = &[
 const CLIENT_HOOKS: &[HookDefinition] = &[
     HookDefinition::new(
         "client-attached",
-        &[CLIENT_NAME_ARG, SESSION_ID_ARG, WINDOW_ID_ARG],
+        &[
+            CLIENT_NAME_ARG,
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::new(
         "client-detached",
-        &[CLIENT_NAME_ARG, SESSION_ID_ARG, WINDOW_ID_ARG],
+        &[
+            CLIENT_NAME_ARG,
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::new(
         "client-session-changed",
-        &[CLIENT_NAME_ARG, SESSION_ID_ARG, WINDOW_ID_ARG],
+        &[
+            CLIENT_NAME_ARG,
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
 ];
 
 const FALLBACK_HOOKS: &[HookDefinition] = &[
     HookDefinition::new(
         "after-new-session",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::new(
         "after-new-window",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::new("after-rename-session", &[SESSION_ID_ARG]),
     HookDefinition::new(
@@ -102,11 +149,23 @@ const FALLBACK_HOOKS: &[HookDefinition] = &[
     ),
     HookDefinition::new(
         "after-kill-pane",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
     HookDefinition::new(
         "after-select-window",
-        &[SESSION_ID_ARG, WINDOW_ID_ARG, WINDOW_INDEX_ARG, PANE_ID_ARG],
+        &[
+            SESSION_ID_ARG,
+            WINDOW_ID_ARG,
+            WINDOW_INDEX_ARG,
+            PANE_ID_ARG,
+            PANE_CURRENT_PATH_ARG,
+        ],
     ),
 ];
 
@@ -393,9 +452,9 @@ fn is_shell_safe(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLIENT_NAME_FORMAT, HookCommandProgram, PANE_ID_FORMAT, SESSION_ID_FORMAT,
-        TMUX_SOCKET_PATH_FORMAT, WINDOW_ID_FORMAT, WINDOW_INDEX_FORMAT, init_plugin_snippet,
-        installed_hooks, managed_hooks,
+        CLIENT_NAME_FORMAT, HookCommandProgram, PANE_CURRENT_PATH_FORMAT, PANE_ID_FORMAT,
+        SESSION_ID_FORMAT, TMUX_SOCKET_PATH_FORMAT, WINDOW_ID_FORMAT, WINDOW_INDEX_FORMAT,
+        init_plugin_snippet, installed_hooks, managed_hooks,
     };
 
     #[test]
@@ -473,6 +532,7 @@ mod tests {
         assert!(alert_hook.command.contains(WINDOW_ID_FORMAT));
         assert!(alert_hook.command.contains(WINDOW_INDEX_FORMAT));
         assert!(alert_hook.command.contains(PANE_ID_FORMAT));
+        assert!(alert_hook.command.contains(PANE_CURRENT_PATH_FORMAT));
         assert!(
             !alert_hook
                 .command
@@ -494,11 +554,17 @@ mod tests {
                 .contains(&format!("'{WINDOW_INDEX_FORMAT}'"))
         );
         assert!(!alert_hook.command.contains(&format!("'{PANE_ID_FORMAT}'")));
+        assert!(
+            !alert_hook
+                .command
+                .contains(&format!("'{PANE_CURRENT_PATH_FORMAT}'"))
+        );
         assert!(!alert_hook.command.contains("#{socket_path}"));
         assert!(!alert_hook.command.contains("#{session_id}"));
         assert!(!alert_hook.command.contains("#{window_id}"));
         assert!(!alert_hook.command.contains("#{window_index}"));
         assert!(!alert_hook.command.contains("#{pane_id}"));
+        assert!(!alert_hook.command.contains("#{pane_current_path}"));
     }
 
     #[test]
@@ -510,7 +576,9 @@ mod tests {
             .expect("missing client-attached hook");
 
         assert!(client_hook.command.contains(CLIENT_NAME_FORMAT));
+        assert!(client_hook.command.contains(PANE_CURRENT_PATH_FORMAT));
         assert!(!client_hook.command.contains("#{client_name}"));
+        assert!(!client_hook.command.contains("#{pane_current_path}"));
     }
 
     #[test]

@@ -3,7 +3,11 @@ pub mod hooks;
 pub mod parse;
 pub mod snapshot;
 
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use thiserror::Error;
 
@@ -38,12 +42,24 @@ pub trait Tmux {
     fn resolve_target_client(&self, cli_override: Option<&str>) -> Result<ClientName, TmuxError>;
     fn switch_to(&self, client: &ClientName, target: WindowTarget) -> Result<(), TmuxError>;
     fn create_session(&self, name: Option<&str>) -> Result<SessionId, TmuxError>;
-    fn create_window(&self, session: &SessionId, name: Option<&str>)
-    -> Result<WindowId, TmuxError>;
+    fn create_window(
+        &self,
+        session: &SessionId,
+        name: Option<&str>,
+        current_path: Option<&Path>,
+    ) -> Result<WindowId, TmuxError>;
     fn close_session(&self, session: &SessionId) -> Result<(), TmuxError>;
     fn close_window(&self, session: &SessionId, window: &WindowId) -> Result<(), TmuxError>;
     fn rename_session(&self, session: &SessionId, name: &str) -> Result<(), TmuxError>;
     fn rename_window(&self, window: &WindowId, name: &str) -> Result<(), TmuxError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowWorkdir {
+    pub window_id: WindowId,
+    pub window_index: u32,
+    pub active: bool,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +130,19 @@ impl TmuxCli {
         }
 
         Ok(value.to_owned())
+    }
+
+    pub fn session_window_workdirs(
+        &self,
+        session: &SessionId,
+    ) -> Result<Vec<WindowWorkdir>, TmuxError> {
+        let socket = self.socket_options();
+        let output =
+            command::run_tmux(&socket, ["list-panes", "-a", "-F", &pane_workdir_format()])?;
+        parse_window_workdirs(&output, session).map_err(|source| TmuxError::Parse {
+            command: "list-panes",
+            source,
+        })
     }
 
     #[allow(dead_code)]
@@ -224,20 +253,26 @@ impl Tmux for TmuxCli {
         &self,
         session: &SessionId,
         name: Option<&str>,
+        current_path: Option<&Path>,
     ) -> Result<WindowId, TmuxError> {
         let socket = self.socket_options();
         let target = format!("{session}:");
         let mut args = vec![
-            "new-window",
-            "-d",
-            "-P",
-            "-F",
-            "#{window_id}",
-            "-t",
-            target.as_str(),
+            OsString::from("new-window"),
+            OsString::from("-d"),
+            OsString::from("-P"),
+            OsString::from("-F"),
+            OsString::from("#{window_id}"),
+            OsString::from("-t"),
+            OsString::from(target.as_str()),
         ];
+        if let Some(current_path) = current_path {
+            args.push(OsString::from("-c"));
+            args.push(current_path.as_os_str().to_os_string());
+        }
         if let Some(name) = name {
-            args.extend(["-n", name]);
+            args.push(OsString::from("-n"));
+            args.push(OsString::from(name));
         }
         let output = command::run_tmux(&socket, args)?;
 
@@ -267,5 +302,83 @@ impl Tmux for TmuxCli {
         let socket = self.socket_options();
         command::run_tmux(&socket, ["rename-window", "-t", window.as_str(), name])?;
         Ok(())
+    }
+}
+
+fn pane_workdir_format() -> String {
+    let separator = parse::FIELD_SEPARATOR;
+    format!(
+        "#{{session_id}}{separator}#{{window_id}}{separator}#{{window_index}}{separator}#{{window_active}}{separator}#{{pane_active}}{separator}#{{pane_current_path}}"
+    )
+}
+
+fn parse_window_workdirs(
+    raw: &str,
+    session_id: &str,
+) -> Result<Vec<WindowWorkdir>, parse::ParseError> {
+    let mut workdirs_by_window = BTreeMap::new();
+
+    for line in raw.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        let fields = parse::split_fields(line);
+        let [
+            record_session_id,
+            window_id,
+            window_index,
+            window_active,
+            pane_active,
+            current_path,
+        ] = fields
+            .try_into()
+            .map_err(|values: Vec<&str>| parse::ParseError::WrongFieldCount {
+                record: "pane",
+                expected: 6,
+                actual: values.len(),
+                line: line.to_owned(),
+            })?;
+
+        if record_session_id != session_id || !parse_bool_field("pane_active", pane_active)? {
+            continue;
+        }
+        if current_path.is_empty() {
+            continue;
+        }
+
+        workdirs_by_window.insert(
+            window_id.to_owned(),
+            WindowWorkdir {
+                window_id: window_id.to_owned(),
+                window_index: parse_u32_field("window_index", window_index)?,
+                active: parse_bool_field("window_active", window_active)?,
+                path: PathBuf::from(current_path),
+            },
+        );
+    }
+
+    let mut workdirs: Vec<_> = workdirs_by_window.into_values().collect();
+    workdirs.sort_by_key(|workdir| workdir.window_index);
+    Ok(workdirs)
+}
+
+fn parse_u32_field(field: &'static str, value: &str) -> Result<u32, parse::ParseError> {
+    value
+        .parse()
+        .map_err(|_| parse::ParseError::InvalidInteger {
+            field,
+            value: value.to_owned(),
+        })
+}
+
+fn parse_bool_field(field: &'static str, value: &str) -> Result<bool, parse::ParseError> {
+    match value {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(parse::ParseError::InvalidBoolean {
+            field,
+            value: value.to_owned(),
+        }),
     }
 }

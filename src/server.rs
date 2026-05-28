@@ -21,7 +21,7 @@ use crate::{
         ProjectionState, ProjectionWindow, ServerMessage, SidecarPaths, StateUpdated,
     },
     model::WindowTarget,
-    tmux::{Tmux, TmuxCli},
+    tmux::{Tmux, TmuxCli, WindowWorkdir},
 };
 
 const IPC_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -52,6 +52,7 @@ struct SharedState {
     cache_path: PathBuf,
     generation: u64,
     state: ProjectionState,
+    workdirs: SessionWorkdirTracker,
     subscribers: BTreeMap<u64, SharedWriter>,
     next_subscriber_id: u64,
 }
@@ -73,11 +74,22 @@ struct CleanupPaths {
 
 trait ServerTmuxOps: Send + Sync {
     fn snapshot_projection(&self, tmux_socket_path: &Path) -> Result<ProjectionState>;
+    fn inspect_session_workdirs(
+        &self,
+        tmux_socket_path: &Path,
+        session_id: &str,
+    ) -> Result<Vec<WindowWorkdir>>;
     fn execute_action(
         &self,
         tmux_socket_path: &Path,
         request: &ActionRequest,
+        options: &ActionExecutionOptions,
     ) -> Result<ActionEffect>;
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ActionExecutionOptions {
+    create_window_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +109,7 @@ enum ActionEffect {
     CreatedWindow {
         session_id: String,
         window_id: String,
+        current_path: Option<PathBuf>,
     },
     RenamedSession {
         session_id: String,
@@ -118,6 +131,24 @@ enum ActionEffect {
 #[derive(Debug, Default)]
 struct LiveServerTmuxOps;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionWorkdirTracker {
+    next_observed_order: u64,
+    sessions: BTreeMap<String, TrackedSessionWorkdirs>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TrackedSessionWorkdirs {
+    windows: BTreeMap<String, TrackedWindowWorkdir>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedWindowWorkdir {
+    path: PathBuf,
+    window_index: Option<u32>,
+    observed_order: u64,
+}
+
 impl ServerTmuxOps for LiveServerTmuxOps {
     fn snapshot_projection(&self, tmux_socket_path: &Path) -> Result<ProjectionState> {
         let tmux = tmux_client(tmux_socket_path);
@@ -128,13 +159,260 @@ impl ServerTmuxOps for LiveServerTmuxOps {
         ))
     }
 
+    fn inspect_session_workdirs(
+        &self,
+        tmux_socket_path: &Path,
+        session_id: &str,
+    ) -> Result<Vec<WindowWorkdir>> {
+        tmux_client(tmux_socket_path)
+            .session_window_workdirs(&session_id.to_owned())
+            .with_context(|| format!("failed to inspect workdirs for session `{session_id}`"))
+    }
+
     fn execute_action(
         &self,
         tmux_socket_path: &Path,
         request: &ActionRequest,
+        options: &ActionExecutionOptions,
     ) -> Result<ActionEffect> {
-        execute_action_request(&tmux_client(tmux_socket_path), request)
+        execute_action_request(&tmux_client(tmux_socket_path), request, options)
     }
+}
+
+impl SessionWorkdirTracker {
+    fn record_hook(&mut self, event: &HookEvent) {
+        let Some(session_id) = non_empty(event.session_id.as_deref()) else {
+            return;
+        };
+        let Some(window_id) = non_empty(event.window_id.as_deref()) else {
+            return;
+        };
+        let Some(path) = non_empty_path(event.pane_current_path.as_deref()) else {
+            return;
+        };
+        let observed_order = self.next_observed_order();
+
+        self.record_window(
+            session_id,
+            window_id,
+            event.window_index,
+            path.to_path_buf(),
+            observed_order,
+        );
+    }
+
+    fn record_session_workdirs(&mut self, session_id: &str, workdirs: &[WindowWorkdir]) {
+        if workdirs.is_empty() {
+            return;
+        }
+
+        let observed_order = self.next_observed_order();
+        for workdir in workdirs {
+            self.record_window(
+                session_id,
+                &workdir.window_id,
+                Some(workdir.window_index),
+                workdir.path.clone(),
+                observed_order,
+            );
+        }
+    }
+
+    fn record_created_window(&mut self, session_id: &str, window_id: &str, path: PathBuf) {
+        let observed_order = self.next_observed_order();
+        self.record_window(session_id, window_id, None, path, observed_order);
+    }
+
+    fn resolve_session_path(
+        &self,
+        state: &ProjectionState,
+        session_id: &str,
+        live_workdirs: &[WindowWorkdir],
+    ) -> Option<PathBuf> {
+        if let Some(path) = resolve_path_from_live_workdirs(live_workdirs) {
+            return Some(path);
+        }
+
+        let session = projection_session(state, session_id);
+        let tracked_session = self.sessions.get(session_id)?;
+        let session_window_ids = session.map(|session| {
+            session
+                .windows
+                .iter()
+                .map(|window| window.id.as_str())
+                .collect::<BTreeSet<_>>()
+        });
+        resolve_path_from_tracked_workdirs(
+            tracked_session,
+            session.and_then(|session| session.active_window_id.as_deref()),
+            session_window_ids.as_ref(),
+        )
+    }
+
+    fn prune_to_projection(&mut self, state: &ProjectionState) {
+        let valid_windows_by_session: BTreeMap<&str, BTreeSet<&str>> = state
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.as_str(),
+                    session
+                        .windows
+                        .iter()
+                        .map(|window| window.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                )
+            })
+            .collect();
+
+        self.sessions.retain(|session_id, tracked_session| {
+            let Some(valid_windows) = valid_windows_by_session.get(session_id.as_str()) else {
+                return false;
+            };
+
+            tracked_session
+                .windows
+                .retain(|window_id, _| valid_windows.contains(window_id.as_str()));
+            !tracked_session.windows.is_empty()
+        });
+    }
+
+    fn next_observed_order(&mut self) -> u64 {
+        let next = self.next_observed_order;
+        self.next_observed_order = self.next_observed_order.saturating_add(1);
+        next
+    }
+
+    fn record_window(
+        &mut self,
+        session_id: &str,
+        window_id: &str,
+        window_index: Option<u32>,
+        path: PathBuf,
+        observed_order: u64,
+    ) {
+        let tracked_session = self.sessions.entry(session_id.to_owned()).or_default();
+        tracked_session.windows.insert(
+            window_id.to_owned(),
+            TrackedWindowWorkdir {
+                path,
+                window_index,
+                observed_order,
+            },
+        );
+    }
+}
+
+fn resolve_path_from_live_workdirs(workdirs: &[WindowWorkdir]) -> Option<PathBuf> {
+    if let Some(active_path) = workdirs
+        .iter()
+        .find(|workdir| workdir.active)
+        .map(|workdir| workdir.path.clone())
+    {
+        return Some(active_path);
+    }
+
+    let candidates = workdirs.iter().map(|workdir| WorkdirCandidate {
+        window_id: workdir.window_id.as_str(),
+        window_index: Some(workdir.window_index),
+        path: &workdir.path,
+        observed_order: 0,
+    });
+    choose_workdir(None, candidates)
+}
+
+fn resolve_path_from_tracked_workdirs(
+    tracked_session: &TrackedSessionWorkdirs,
+    active_window_id: Option<&str>,
+    session_window_ids: Option<&BTreeSet<&str>>,
+) -> Option<PathBuf> {
+    let candidates = tracked_session
+        .windows
+        .iter()
+        .filter(|(window_id, _)| {
+            session_window_ids
+                .map(|window_ids| window_ids.contains(window_id.as_str()))
+                .unwrap_or(true)
+        })
+        .map(|(window_id, tracked_window)| WorkdirCandidate {
+            window_id: window_id.as_str(),
+            window_index: tracked_window.window_index,
+            path: &tracked_window.path,
+            observed_order: tracked_window.observed_order,
+        });
+    choose_workdir(active_window_id, candidates)
+}
+
+#[derive(Clone, Copy)]
+struct WorkdirCandidate<'a> {
+    window_id: &'a str,
+    window_index: Option<u32>,
+    path: &'a Path,
+    observed_order: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkdirPathScore {
+    count: usize,
+    observed_order: u64,
+    lowest_window_index: Option<u32>,
+}
+
+fn choose_workdir<'a>(
+    active_window_id: Option<&str>,
+    candidates: impl IntoIterator<Item = WorkdirCandidate<'a>>,
+) -> Option<PathBuf> {
+    let candidates: Vec<_> = candidates
+        .into_iter()
+        .filter(|candidate| non_empty_path(Some(candidate.path)).is_some())
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(active_path) = active_window_id.and_then(|active_window_id| {
+        candidates
+            .iter()
+            .find(|candidate| candidate.window_id == active_window_id)
+            .map(|candidate| candidate.path.to_path_buf())
+    }) {
+        return Some(active_path);
+    }
+
+    let mut scores = BTreeMap::<PathBuf, WorkdirPathScore>::new();
+    for candidate in &candidates {
+        let score = scores
+            .entry(candidate.path.to_path_buf())
+            .or_insert_with(|| WorkdirPathScore {
+                count: 0,
+                observed_order: candidate.observed_order,
+                lowest_window_index: candidate.window_index,
+            });
+        score.count += 1;
+        score.observed_order = score.observed_order.max(candidate.observed_order);
+        score.lowest_window_index = match (score.lowest_window_index, candidate.window_index) {
+            (Some(current), Some(next)) => Some(current.min(next)),
+            (current @ Some(_), None) => current,
+            (None, next) => next,
+        };
+    }
+
+    scores
+        .into_iter()
+        .max_by(|(left_path, left_score), (right_path, right_score)| {
+            left_score
+                .count
+                .cmp(&right_score.count)
+                .then(left_score.observed_order.cmp(&right_score.observed_order))
+                .then_with(|| {
+                    right_score
+                        .lowest_window_index
+                        .unwrap_or(u32::MAX)
+                        .cmp(&left_score.lowest_window_index.unwrap_or(u32::MAX))
+                })
+                .then_with(|| right_path.cmp(left_path))
+        })
+        .map(|(path, _)| path)
 }
 
 impl Drop for CleanupPaths {
@@ -199,6 +477,7 @@ impl Server {
                 cache_path: sidecar_paths.cache_path,
                 generation: 1,
                 state: initial_state,
+                workdirs: SessionWorkdirTracker::default(),
                 subscribers: BTreeMap::new(),
                 next_subscriber_id: 1,
             })),
@@ -304,6 +583,7 @@ fn handle_connection(
                     continue;
                 }
 
+                record_hook_workdir(&shared, &event);
                 refresh_state_for_hook(
                     &shared,
                     &refresh_lock,
@@ -540,6 +820,7 @@ fn publish_state_update(
     let (cache_path, update) = {
         let mut guard = shared.lock().expect("shared state poisoned");
         guard.generation += 1;
+        guard.workdirs.prune_to_projection(&next_state);
         guard.state = next_state;
         (
             guard.cache_path.clone(),
@@ -664,6 +945,7 @@ impl ActionEffect {
             ActionEffect::CreatedWindow {
                 session_id,
                 window_id,
+                ..
             } => Some(ActionOutcome::CreatedWindow {
                 session_id: session_id.clone(),
                 window_id: window_id.clone(),
@@ -702,6 +984,7 @@ impl ActionEffect {
             ActionEffect::CreatedWindow {
                 session_id,
                 window_id,
+                ..
             } => projection_session(state, session_id)
                 .map(|session| session.windows.iter().any(|window| window.id == *window_id))
                 .unwrap_or(false),
@@ -748,6 +1031,7 @@ impl ActionEffect {
             ActionEffect::CreatedWindow {
                 session_id,
                 window_id,
+                ..
             } => format!(
                 "refreshed state did not include created window `{window_id}` in session `{session_id}`"
             ),
@@ -873,6 +1157,11 @@ fn hook_event_clears_cached_bell(
         || event.window_index == Some(window_index)
 }
 
+fn record_hook_workdir(shared: &Arc<Mutex<SharedState>>, event: &HookEvent) {
+    let mut guard = shared.lock().expect("shared state poisoned");
+    guard.workdirs.record_hook(event);
+}
+
 fn apply_hook_event_overlay(state: &mut ProjectionState, event: &HookEvent) {
     let Some(window) = projection_window_for_hook_event(state, event) else {
         return;
@@ -924,6 +1213,10 @@ fn update_activity_timestamp(window: &mut ProjectionWindow, event: &HookEvent) {
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty())
+}
+
+fn non_empty_path(path: Option<&Path>) -> Option<&Path> {
+    path.filter(|path| !path.as_os_str().is_empty())
 }
 
 fn broadcast(shared: &Arc<Mutex<SharedState>>, message: ServerMessage) {
@@ -983,7 +1276,31 @@ fn handle_action_request(
         let guard = shared.lock().expect("shared state poisoned");
         guard.tmux_socket_path.clone()
     };
-    let action_result = tmux.execute_action(&tmux_socket_path, request);
+    let action_options = match &request.action {
+        Action::CreateWindow { session_id, .. } => {
+            match resolve_create_window_path(shared, tmux, &tmux_socket_path, session_id) {
+                Ok(create_window_path) => ActionExecutionOptions { create_window_path },
+                Err(error) => {
+                    return ActionResultKind::Error {
+                        message: format!("failed to resolve working directory: {error:#}"),
+                    };
+                }
+            }
+        }
+        _ => ActionExecutionOptions::default(),
+    };
+    let action_result = tmux.execute_action(&tmux_socket_path, request, &action_options);
+    if let Ok(ActionEffect::CreatedWindow {
+        session_id,
+        window_id,
+        current_path: Some(current_path),
+    }) = &action_result
+    {
+        let mut guard = shared.lock().expect("shared state poisoned");
+        guard
+            .workdirs
+            .record_created_window(session_id, window_id, current_path.clone());
+    }
     let refresh_result = match &action_result {
         Ok(effect) => {
             refresh_state_for_action(shared, refresh_lock, refresh_from_tmux, tmux, effect)
@@ -1016,7 +1333,27 @@ fn tmux_client(tmux_socket_path: &Path) -> TmuxCli {
     }
 }
 
-fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<ActionEffect> {
+fn resolve_create_window_path(
+    shared: &Arc<Mutex<SharedState>>,
+    tmux: &dyn ServerTmuxOps,
+    tmux_socket_path: &Path,
+    session_id: &str,
+) -> Result<Option<PathBuf>> {
+    let live_workdirs = tmux.inspect_session_workdirs(tmux_socket_path, session_id)?;
+    let mut guard = shared.lock().expect("shared state poisoned");
+    guard
+        .workdirs
+        .record_session_workdirs(session_id, &live_workdirs);
+    Ok(guard
+        .workdirs
+        .resolve_session_path(&guard.state, session_id, &live_workdirs))
+}
+
+fn execute_action_request(
+    tmux: &impl Tmux,
+    request: &ActionRequest,
+    options: &ActionExecutionOptions,
+) -> Result<ActionEffect> {
     let effect = match &request.action {
         Action::SwitchSession { session_id } => {
             let client = tmux
@@ -1071,7 +1408,11 @@ fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<A
         }
         Action::CreateWindow { session_id, name } => {
             let window_id = tmux
-                .create_window(session_id, name.as_deref())
+                .create_window(
+                    session_id,
+                    name.as_deref(),
+                    options.create_window_path.as_deref(),
+                )
                 .with_context(|| match name {
                     Some(name) => {
                         format!("failed to create window `{name}` in session `{session_id}`")
@@ -1081,6 +1422,7 @@ fn execute_action_request(tmux: &impl Tmux, request: &ActionRequest) -> Result<A
             ActionEffect::CreatedWindow {
                 session_id: session_id.clone(),
                 window_id,
+                current_path: options.create_window_path.clone(),
             }
         }
         Action::RenameSession { session_id, name } => {
@@ -1138,7 +1480,9 @@ mod tests {
 
     use anyhow::{Context, Result, anyhow};
 
-    use super::{ActionEffect, Server, ServerTmuxOps, execute_action_request};
+    use super::{
+        ActionEffect, ActionExecutionOptions, Server, ServerTmuxOps, execute_action_request,
+    };
     use crate::ipc::{
         Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
         ClientKind, ClientMessage, Hello, HookEvent, HookName, PROTOCOL_VERSION, ProjectionClient,
@@ -1147,7 +1491,7 @@ mod tests {
     };
     use crate::{
         model::{ClientName, SessionId, WindowId, WindowTarget},
-        tmux::{Tmux, TmuxError},
+        tmux::{Tmux, TmuxError, WindowWorkdir},
     };
 
     struct TestDir {
@@ -1234,6 +1578,7 @@ mod tests {
         CreateWindow {
             session_id: String,
             name: Option<String>,
+            current_path: Option<PathBuf>,
         },
         RenameSession {
             session_id: String,
@@ -1302,11 +1647,13 @@ mod tests {
             &self,
             session: &SessionId,
             name: Option<&str>,
+            current_path: Option<&Path>,
         ) -> Result<WindowId, TmuxError> {
             self.calls.lock().expect("tmux call log poisoned").push(
                 RecordedTmuxCall::CreateWindow {
                     session_id: session.clone(),
                     name: name.map(str::to_owned),
+                    current_path: current_path.map(Path::to_path_buf),
                 },
             );
             Ok(String::from("@new"))
@@ -1355,8 +1702,10 @@ mod tests {
     #[derive(Debug)]
     struct MockServerTmux {
         snapshots: Mutex<VecDeque<ProjectionState>>,
+        session_workdirs: Mutex<VecDeque<std::result::Result<Vec<WindowWorkdir>, String>>>,
         action_results: Mutex<VecDeque<std::result::Result<ActionEffect, String>>>,
         requests: Mutex<Vec<ActionRequest>>,
+        action_options: Mutex<Vec<ActionExecutionOptions>>,
     }
 
     impl MockServerTmux {
@@ -1366,8 +1715,10 @@ mod tests {
         ) -> Self {
             Self {
                 snapshots: Mutex::new(snapshots.into()),
+                session_workdirs: Mutex::new(VecDeque::new()),
                 action_results: Mutex::new(action_results.into()),
                 requests: Mutex::new(Vec::new()),
+                action_options: Mutex::new(Vec::new()),
             }
         }
 
@@ -1376,6 +1727,20 @@ mod tests {
                 .lock()
                 .expect("tmux requests poisoned")
                 .clone()
+        }
+
+        fn action_options(&self) -> Vec<ActionExecutionOptions> {
+            self.action_options
+                .lock()
+                .expect("tmux action options poisoned")
+                .clone()
+        }
+
+        fn push_session_workdirs(&self, result: std::result::Result<Vec<WindowWorkdir>, String>) {
+            self.session_workdirs
+                .lock()
+                .expect("tmux session workdirs poisoned")
+                .push_back(result);
         }
     }
 
@@ -1388,15 +1753,37 @@ mod tests {
                 .context("missing mock snapshot response")
         }
 
+        fn inspect_session_workdirs(
+            &self,
+            _tmux_socket_path: &Path,
+            _session_id: &str,
+        ) -> Result<Vec<WindowWorkdir>> {
+            match self
+                .session_workdirs
+                .lock()
+                .expect("tmux session workdirs poisoned")
+                .pop_front()
+            {
+                Some(Ok(workdirs)) => Ok(workdirs),
+                Some(Err(message)) => Err(anyhow!("{message}")),
+                None => Ok(Vec::new()),
+            }
+        }
+
         fn execute_action(
             &self,
             _tmux_socket_path: &Path,
             request: &ActionRequest,
+            options: &ActionExecutionOptions,
         ) -> Result<ActionEffect> {
             self.requests
                 .lock()
                 .expect("tmux requests poisoned")
                 .push(request.clone());
+            self.action_options
+                .lock()
+                .expect("tmux action options poisoned")
+                .push(options.clone());
             match self
                 .action_results
                 .lock()
@@ -1510,6 +1897,20 @@ mod tests {
         });
     }
 
+    fn window_workdir(
+        path: &Path,
+        window_id: &str,
+        window_index: u32,
+        active: bool,
+    ) -> WindowWorkdir {
+        WindowWorkdir {
+            window_id: window_id.to_owned(),
+            window_index,
+            active,
+            path: path.to_path_buf(),
+        }
+    }
+
     fn shutdown_server(socket_path: &Path) -> Result<()> {
         let mut shutdown = RawClient::connect(socket_path, ClientKind::Control)?;
         shutdown.send(&ClientMessage::Shutdown)?;
@@ -1555,6 +1956,7 @@ mod tests {
             window_id: Some(String::from("@1")),
             window_index: Some(1),
             pane_id: Some(String::from("%1")),
+            pane_current_path: None,
             client_name: None,
             timestamp_ms: Some(42),
         }))?;
@@ -1636,6 +2038,7 @@ mod tests {
             window_id: Some(String::from("@1")),
             window_index: Some(0),
             pane_id: Some(String::from("%1")),
+            pane_current_path: None,
             client_name: None,
             timestamp_ms: Some(1_000),
         }))?;
@@ -1721,6 +2124,7 @@ mod tests {
             window_id: Some(String::from("@1")),
             window_index: Some(0),
             pane_id: Some(String::from("%1")),
+            pane_current_path: None,
             client_name: None,
             timestamp_ms: Some(42_000),
         }))?;
@@ -1786,6 +2190,7 @@ mod tests {
             window_id: None,
             window_index: None,
             pane_id: None,
+            pane_current_path: None,
             client_name: None,
             timestamp_ms: None,
         }))?;
@@ -1850,6 +2255,7 @@ mod tests {
             window_id: Some(String::from("@1")),
             window_index: Some(0),
             pane_id: Some(String::from("%1")),
+            pane_current_path: None,
             client_name: None,
             timestamp_ms: None,
         }))?;
@@ -1978,6 +2384,7 @@ mod tests {
             window_id: Some(String::from("@1")),
             window_index: Some(0),
             pane_id: None,
+            pane_current_path: None,
             client_name: Some(String::from("client-1")),
             timestamp_ms: None,
         }))?;
@@ -2073,7 +2480,9 @@ mod tests {
 
         let effects = requests
             .iter()
-            .map(|request| execute_action_request(&tmux, request))
+            .map(|request| {
+                execute_action_request(&tmux, request, &ActionExecutionOptions::default())
+            })
             .collect::<Result<Vec<_>>>()?;
 
         assert_eq!(
@@ -2098,6 +2507,7 @@ mod tests {
                 RecordedTmuxCall::CreateWindow {
                     session_id: String::from("$2"),
                     name: Some(String::from("shell")),
+                    current_path: None,
                 },
                 RecordedTmuxCall::RenameSession {
                     session_id: String::from("$2"),
@@ -2134,6 +2544,7 @@ mod tests {
                 ActionEffect::CreatedWindow {
                     session_id: String::from("$2"),
                     window_id: String::from("@new"),
+                    current_path: None,
                 },
                 ActionEffect::RenamedSession {
                     session_id: String::from("$2"),
@@ -2157,6 +2568,121 @@ mod tests {
     }
 
     #[test]
+    fn tracked_session_workdirs_prefer_active_window_paths() {
+        let tmux_socket_path = Path::new("/tmp/tmux.sock");
+        let mut tracker = super::SessionWorkdirTracker::default();
+        let mut projection =
+            projection_state_with_window(tmux_socket_path, "$1", "work", "@1", "shell");
+        add_projection_window(&mut projection, "$1", "@2", "editor", 1, true);
+        tracker.record_hook(&HookEvent {
+            tmux_socket_path: tmux_socket_path.to_path_buf(),
+            event: HookName::AfterSelectWindow,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_index: Some(0),
+            pane_id: Some(String::from("%1")),
+            pane_current_path: Some(Path::new("/tmp/one").to_path_buf()),
+            client_name: None,
+            timestamp_ms: None,
+        });
+        tracker.record_hook(&HookEvent {
+            tmux_socket_path: tmux_socket_path.to_path_buf(),
+            event: HookName::AfterSelectWindow,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@2")),
+            window_index: Some(1),
+            pane_id: Some(String::from("%2")),
+            pane_current_path: Some(Path::new("/tmp/two").to_path_buf()),
+            client_name: None,
+            timestamp_ms: None,
+        });
+
+        assert_eq!(
+            tracker.resolve_session_path(&projection, "$1", &[]),
+            Some(Path::new("/tmp/two").to_path_buf())
+        );
+    }
+
+    #[test]
+    fn create_window_actions_use_resolved_session_workdirs() -> Result<()> {
+        let sandbox = TestDir::new("server-create-window-workdir")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        add_projection_window(&mut initial_state, "$1", "@2", "tests", 1, true);
+        let mut refreshed_state = initial_state.clone();
+        add_projection_window(&mut refreshed_state, "$1", "@3", "created", 2, false);
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![refreshed_state.clone()],
+            vec![Ok(ActionEffect::CreatedWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@3"),
+                current_path: Some(Path::new("/tmp/active").to_path_buf()),
+            })],
+        ));
+        tmux.push_session_workdirs(Ok(vec![
+            window_workdir(Path::new("/tmp/other"), "@1", 0, false),
+            window_workdir(Path::new("/tmp/active"), "@2", 1, true),
+        ]));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut client = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        client.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = client.recv()?;
+
+        let request = ActionRequest {
+            request_id: String::from("req-create-window-workdir"),
+            target_client: None,
+            action: Action::CreateWindow {
+                session_id: String::from("$1"),
+                name: Some(String::from("created")),
+            },
+        };
+        client.send(&ClientMessage::ActionRequest(request.clone()))?;
+
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::ActionResult(ActionResult {
+                request_id: request.request_id,
+                result: ActionResultKind::Ok {
+                    outcome: Some(ActionOutcome::CreatedWindow {
+                        session_id: String::from("$1"),
+                        window_id: String::from("@3"),
+                    }),
+                },
+            })
+        );
+
+        shutdown_server(&sidecar_paths.socket_path)?;
+        drop(client);
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(
+            tmux.action_options(),
+            vec![ActionExecutionOptions {
+                create_window_path: Some(Path::new("/tmp/active").to_path_buf()),
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn action_refresh_retries_until_created_window_is_projected() -> Result<()> {
         let sandbox = TestDir::new("server-create-window-retry")?;
         let tmux_socket_path = sandbox.path.join("tmux.sock");
@@ -2171,6 +2697,7 @@ mod tests {
             vec![Ok(ActionEffect::CreatedWindow {
                 session_id: String::from("$1"),
                 window_id: String::from("@2"),
+                current_path: None,
             })],
         ));
         let server = Server::bind_with_tmux(
@@ -2323,6 +2850,7 @@ mod tests {
             window_id: Some(String::from("@0")),
             window_index: Some(0),
             pane_id: Some(String::from("%1")),
+            pane_current_path: None,
             client_name: None,
             timestamp_ms: None,
         }))?;

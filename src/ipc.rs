@@ -69,6 +69,7 @@ pub struct HookEvent {
     pub window_id: Option<String>,
     pub window_index: Option<u32>,
     pub pane_id: Option<String>,
+    pub pane_current_path: Option<PathBuf>,
     pub client_name: Option<String>,
     pub timestamp_ms: Option<u64>,
 }
@@ -478,6 +479,7 @@ mod tests {
             window_id: Some(String::from("@2")),
             window_index: Some(3),
             pane_id: Some(String::from("%4")),
+            pane_current_path: Some(Path::new("/tmp/worktree").to_path_buf()),
             client_name: Some(String::from("client-1")),
             timestamp_ms: Some(1234),
         });

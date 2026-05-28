@@ -1,5 +1,5 @@
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     io,
     path::PathBuf,
     process::{Command, ExitStatus},
@@ -75,11 +75,11 @@ pub fn tmux_command(socket: &SocketOptions) -> Command {
 pub fn run_tmux<I, S>(socket: &SocketOptions, args: I) -> Result<String, CommandError>
 where
     I: IntoIterator<Item = S>,
-    S: AsRef<str>,
+    S: AsRef<OsStr>,
 {
-    let args: Vec<String> = args
+    let args: Vec<OsString> = args
         .into_iter()
-        .map(|arg| arg.as_ref().to_owned())
+        .map(|arg| arg.as_ref().to_os_string())
         .collect();
 
     let mut command = tmux_command(socket);
@@ -110,14 +110,14 @@ where
     })
 }
 
-fn display_tmux_command(socket: &SocketOptions, args: &[String]) -> String {
+fn display_tmux_command(socket: &SocketOptions, args: &[OsString]) -> String {
     let mut parts = vec![String::from("tmux")];
 
     for arg in socket.as_args() {
         parts.push(arg.to_string_lossy().into_owned());
     }
 
-    parts.extend(args.iter().cloned());
+    parts.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
     parts.join(" ")
 }
 
