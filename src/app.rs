@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::VecDeque,
     env, io, panic,
     path::PathBuf,
     sync::Once,
@@ -21,11 +21,11 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use crate::{
     cli::Cli,
     client::{self, IpcClient, ReadStatus},
-    event::{self, AppEvent},
+    event::AppEvent,
     input::InputBuffer,
     ipc::{
-        Action, ActionOutcome, ActionResult, ActionResultKind, ProjectionState, ServerMessage,
-        StateUpdated,
+        Action, ActionOutcome, ActionResult, ActionResultKind, ClientKind, ProjectionState,
+        ServerMessage, StateUpdated,
     },
     model::{
         ActionError, AppState, ClientName, EditAction, Focus, FocusMove, FocusReconcile, Mode,
@@ -33,11 +33,11 @@ use crate::{
     },
     tmux::{Tmux, TmuxCli, hooks::HookCommandProgram},
     ui,
+    ui_app::runtime::{UiEvent, UiRuntime},
 };
 
 static PANIC_HOOK: Once = Once::new();
 const ACTION_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
-const SERVER_DRAIN_TIMEOUT: Duration = Duration::from_millis(1);
 const SERVER_SETTLE_TIMEOUT: Duration = Duration::from_millis(50);
 const STARTUP_TOAST_DURATION: Duration = Duration::from_secs(3);
 const STARTUP_TOAST_MESSAGE: &str = "Started tmux-sidecar server";
@@ -46,9 +46,11 @@ const STARTUP_TOAST_MESSAGE: &str = "Started tmux-sidecar server";
 pub struct App {
     cli: Cli,
     state: AppState,
+    server_generation: u64,
     tmux: TmuxCli,
-    render_tick: Duration,
     subscription: Option<IpcClient>,
+    runtime: Option<UiRuntime>,
+    tmux_socket_path: Option<PathBuf>,
     toast_deadline: Option<Instant>,
     should_quit: bool,
 }
@@ -60,6 +62,11 @@ struct StartupContext {
 
 struct SuccessfulAction {
     outcome: Option<ActionOutcome>,
+}
+
+struct CompletedAction {
+    generation: u64,
+    completion: ActionCompletion,
 }
 
 enum ActionCompletion {
@@ -88,7 +95,6 @@ impl SuccessfulAction {
 
 impl App {
     pub fn new(cli: Cli) -> Self {
-        let render_tick = cli.poll_interval();
         let tmux = TmuxCli {
             socket_name: cli.socket_name.clone(),
             socket_path: cli.socket_path.clone(),
@@ -97,9 +103,11 @@ impl App {
         Self {
             cli,
             state: AppState::default(),
+            server_generation: 0,
             tmux,
-            render_tick,
             subscription: None,
+            runtime: None,
+            tmux_socket_path: None,
             toast_deadline: None,
             should_quit: false,
         }
@@ -197,6 +205,7 @@ impl App {
             target_client,
             tmux_socket_path,
         } = startup;
+        self.tmux_socket_path = Some(tmux_socket_path.clone());
         let started_server = client::ensure_server_running(&tmux_socket_path)?;
         self.install_hooks()?;
 
@@ -211,18 +220,34 @@ impl App {
     }
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-        while !self.should_quit {
-            self.drain_server_messages()?;
-            self.expire_toast_if_needed();
-            terminal.draw(|frame| ui::render(frame, &self.state))?;
-            let event = event::poll_next(self.render_tick)?;
-            self.handle_event(event)?;
-        }
+        self.start_runtime()?;
+        let result = (|| {
+            let mut dirty = true;
+            while !self.should_quit {
+                if dirty {
+                    terminal.draw(|frame| ui::render(frame, &self.state))?;
+                }
 
-        Ok(())
+                dirty = match self.recv_runtime_event()? {
+                    Some(event) => {
+                        self.handle_ui_event(event)?;
+                        true
+                    }
+                    None => self.expire_toast_if_needed(),
+                };
+            }
+
+            Ok(())
+        })();
+        self.runtime = None;
+        result
     }
 
     pub fn sync_with_server(&mut self, timeout: Duration) -> Result<bool> {
+        if self.runtime.is_some() {
+            return self.sync_with_runtime(timeout);
+        }
+
         let Some(mut subscription) = self.subscription.take() else {
             return Ok(false);
         };
@@ -259,32 +284,6 @@ impl App {
         result
     }
 
-    fn install_hooks(&self) -> Result<()> {
-        let program = HookCommandProgram::new(vec![hook_program_path()?.display().to_string()]);
-        self.tmux.install_hooks(&program)?;
-        Ok(())
-    }
-
-    fn drain_server_messages(&mut self) -> Result<()> {
-        let Some(mut subscription) = self.subscription.take() else {
-            return Ok(());
-        };
-
-        let result = (|| {
-            subscription.set_read_timeout(Some(SERVER_DRAIN_TIMEOUT))?;
-            loop {
-                match subscription.read_status()? {
-                    ReadStatus::Message(message) => self.handle_server_message(message)?,
-                    ReadStatus::Pending => break Ok(()),
-                    ReadStatus::Closed => break Err(anyhow!("sidecar server disconnected")),
-                }
-            }
-        })();
-        let reset = subscription.set_read_timeout(None);
-        self.subscription = Some(subscription);
-        result.and(reset)
-    }
-
     fn sync_with_server_inner(
         &mut self,
         subscription: &mut IpcClient,
@@ -307,6 +306,50 @@ impl App {
         Ok(received_message)
     }
 
+    fn sync_with_runtime(&mut self, timeout: Duration) -> Result<bool> {
+        let Some(_) = self.runtime else {
+            return Ok(false);
+        };
+
+        let mut deadline = Instant::now() + timeout;
+        let mut received_server_message = false;
+        let mut deferred_events = VecDeque::new();
+
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = {
+                let runtime = self.runtime.as_mut().expect("runtime checked above");
+                runtime.recv_timeout(remaining)?
+            };
+            let Some(event) = event else {
+                break;
+            };
+
+            match event {
+                UiEvent::Server(message) => {
+                    received_server_message = true;
+                    self.handle_server_message(message)?;
+                    deadline = Instant::now() + SERVER_SETTLE_TIMEOUT;
+                }
+                UiEvent::ServerDisconnected => bail!("sidecar server disconnected"),
+                UiEvent::RuntimeError(message) => bail!(message),
+                other => deferred_events.push_back(other),
+            }
+        }
+
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.prepend_pending(deferred_events);
+        }
+
+        Ok(received_server_message)
+    }
+
+    fn install_hooks(&self) -> Result<()> {
+        let program = HookCommandProgram::new(vec![hook_program_path()?.display().to_string()]);
+        self.tmux.install_hooks(&program)?;
+        Ok(())
+    }
+
     fn handle_server_message(&mut self, message: ServerMessage) -> Result<()> {
         match message {
             ServerMessage::StateUpdated(update) => {
@@ -320,22 +363,27 @@ impl App {
         }
     }
 
-    fn handle_action_result(&mut self, result: ActionResult) -> Result<ActionCompletion> {
-        match result.result {
+    fn handle_action_result(&mut self, result: ActionResult) -> Result<CompletedAction> {
+        let completion = match result.result {
             ActionResultKind::Ok { outcome } => {
                 self.state.last_error = None;
-                Ok(ActionCompletion::Succeeded(SuccessfulAction { outcome }))
+                ActionCompletion::Succeeded(SuccessfulAction { outcome })
             }
             ActionResultKind::Error { message } => {
                 self.state.last_error = Some(ActionError { message });
-                Ok(ActionCompletion::Failed)
+                ActionCompletion::Failed
             }
-        }
+        };
+        Ok(CompletedAction {
+            generation: result.generation,
+            completion,
+        })
     }
 
     fn handle_state_update(&mut self, update: StateUpdated) {
         let should_focus_visible_target = self.state.is_tree_loading();
         self.state.tree_loading = false;
+        self.server_generation = update.generation;
         self.apply_projection(update.state);
         if should_focus_visible_target {
             self.state.focus_visible_target();
@@ -349,23 +397,6 @@ impl App {
     fn prepare_first_paint_state(&mut self, startup: &StartupContext) {
         self.state.tree_loading = true;
         self.state.target_client = Some(startup.target_client.clone());
-        let sidecar_paths =
-            crate::ipc::SidecarPaths::from_tmux_socket_path(&startup.tmux_socket_path);
-
-        match crate::state_cache::load(&sidecar_paths) {
-            Ok(Some(projection)) => {
-                self.apply_cached_projection(projection, startup.target_client.clone())
-            }
-            Ok(None) => {}
-            Err(error) => eprintln!("warning: failed to load sidecar state cache: {error:#}"),
-        }
-    }
-
-    fn apply_cached_projection(&mut self, projection: ProjectionState, target_client: ClientName) {
-        self.state.target_client = Some(target_client);
-        self.state.tree_loading = false;
-        self.apply_projection(projection);
-        self.state.focus_visible_target();
     }
 
     fn show_toast(&mut self, message: impl Into<String>) {
@@ -375,21 +406,22 @@ impl App {
         self.toast_deadline = Some(Instant::now() + STARTUP_TOAST_DURATION);
     }
 
-    fn expire_toast_if_needed(&mut self) {
+    fn expire_toast_if_needed(&mut self) -> bool {
         let Some(deadline) = self.toast_deadline else {
-            return;
+            return false;
         };
 
         if Instant::now() < deadline {
-            return;
+            return false;
         }
 
         self.toast_deadline = None;
         self.state.toast = None;
+        true
     }
 
     fn handle_event(&mut self, event: AppEvent) -> Result<()> {
-        self.expire_toast_if_needed();
+        let _ = self.expire_toast_if_needed();
         match event {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse),
@@ -777,17 +809,14 @@ impl App {
                     return Ok(());
                 };
                 let name = (!input.is_empty()).then_some(input.as_str().to_owned());
-                let session_ids_before = self.session_ids();
                 let Some(action_success) =
                     self.try_server_action(None, Action::CreateSession { name: name.clone() })?
                 else {
                     return Ok(());
                 };
-                let session_id = if let Some(session_id) = action_success.created_session_id() {
-                    session_id
-                } else {
-                    self.created_session_id(&session_ids_before, name.as_deref())?
-                };
+                let session_id = action_success.created_session_id().ok_or_else(|| {
+                    anyhow!("create-session action completed without a created session id")
+                })?;
 
                 self.switch_to_target(client, WindowTarget::Session(session_id.clone()))?;
                 if !self.should_quit {
@@ -799,7 +828,6 @@ impl App {
                     return Ok(());
                 };
                 let name = (!input.is_empty()).then_some(input.as_str().to_owned());
-                let window_ids_before = self.window_ids(&session_id)?;
                 let Some(action_success) = self.try_server_action(
                     None,
                     Action::CreateWindow {
@@ -810,12 +838,13 @@ impl App {
                 else {
                     return Ok(());
                 };
-                let window_id =
-                    if let Some(window_id) = action_success.created_window_id(&session_id) {
-                        window_id
-                    } else {
-                        self.created_window_id(&session_id, &window_ids_before, name.as_deref())?
-                    };
+                let window_id = action_success
+                    .created_window_id(&session_id)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "create-window action completed without a created window id for session `{session_id}`"
+                        )
+                    })?;
 
                 self.switch_to_target(
                     client,
@@ -853,96 +882,6 @@ impl App {
             .map(|window| window.name.clone())
     }
 
-    fn session_ids(&self) -> BTreeSet<String> {
-        self.state
-            .tmux
-            .sessions
-            .iter()
-            .map(|session| session.id.clone())
-            .collect()
-    }
-
-    fn window_ids(&self, session_id: &str) -> Result<BTreeSet<String>> {
-        let session = self
-            .state
-            .tmux
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .ok_or_else(|| anyhow!("missing session `{session_id}` in current state"))?;
-        Ok(session
-            .windows
-            .iter()
-            .map(|window| window.id.clone())
-            .collect())
-    }
-
-    fn created_session_id(
-        &self,
-        previous_session_ids: &BTreeSet<String>,
-        requested_name: Option<&str>,
-    ) -> Result<String> {
-        self.created_row_id(
-            self.state
-                .tmux
-                .sessions
-                .iter()
-                .filter(|session| !previous_session_ids.contains(&session.id))
-                .map(|session| (session.id.as_str(), session.name.as_str())),
-            requested_name,
-            "session",
-        )
-    }
-
-    fn created_window_id(
-        &self,
-        session_id: &str,
-        previous_window_ids: &BTreeSet<String>,
-        requested_name: Option<&str>,
-    ) -> Result<String> {
-        let session = self
-            .state
-            .tmux
-            .sessions
-            .iter()
-            .find(|session| session.id == session_id)
-            .ok_or_else(|| anyhow!("missing session `{session_id}` after create-window"))?;
-        self.created_row_id(
-            session
-                .windows
-                .iter()
-                .filter(|window| !previous_window_ids.contains(&window.id))
-                .map(|window| (window.id.as_str(), window.name.as_str())),
-            requested_name,
-            "window",
-        )
-    }
-
-    fn created_row_id<'a>(
-        &self,
-        rows: impl Iterator<Item = (&'a str, &'a str)>,
-        requested_name: Option<&str>,
-        kind: &str,
-    ) -> Result<String> {
-        let created: Vec<_> = rows.collect();
-
-        if let Some(requested_name) = requested_name {
-            let matching: Vec<_> = created
-                .iter()
-                .filter(|(_, name)| *name == requested_name)
-                .collect();
-            if matching.len() == 1 {
-                return Ok(matching[0].0.to_owned());
-            }
-        }
-
-        match created.as_slice() {
-            [(id, _)] => Ok((*id).to_owned()),
-            [] => bail!("action succeeded but created {kind} was missing from the refreshed state"),
-            _ => bail!("action succeeded but created {kind} was ambiguous in the refreshed state"),
-        }
-    }
-
     fn try_server_action(
         &mut self,
         target_client: Option<String>,
@@ -962,6 +901,10 @@ impl App {
         target_client: Option<String>,
         action: Action,
     ) -> Result<ActionCompletion> {
+        if self.runtime.is_some() {
+            return self.perform_runtime_action(target_client, action);
+        }
+
         let Some(mut subscription) = self.subscription.take() else {
             return Ok(ActionCompletion::Failed);
         };
@@ -980,7 +923,12 @@ impl App {
                                 result.request_id
                             );
                         }
-                        return self.handle_action_result(result);
+                        let completed = self.handle_action_result(result)?;
+                        self.wait_for_subscription_generation(
+                            &mut subscription,
+                            completed.generation,
+                        )?;
+                        return Ok(completed.completion);
                     }
                     ReadStatus::Message(message) => self.handle_server_message(message)?,
                     ReadStatus::Pending => {
@@ -996,6 +944,160 @@ impl App {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
             (Ok(completion), Ok(())) => Ok(completion),
+        }
+    }
+
+    fn perform_runtime_action(
+        &mut self,
+        target_client: Option<String>,
+        action: Action,
+    ) -> Result<ActionCompletion> {
+        let tmux_socket_path = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.tmux_socket_path().to_path_buf())
+            .or_else(|| self.tmux_socket_path.clone())
+            .ok_or_else(|| anyhow!("missing tmux socket path for action request"))?;
+
+        let mut action_client =
+            IpcClient::connect_or_spawn(&tmux_socket_path, ClientKind::Control)?;
+        self.state.last_error = None;
+        let result = (|| {
+            let request_id = action_client.send_action_request(target_client, action)?;
+            action_client.set_read_timeout(Some(ACTION_SYNC_TIMEOUT))?;
+
+            loop {
+                match action_client.read_status()? {
+                    ReadStatus::Message(ServerMessage::ActionResult(result)) => {
+                        if result.request_id != request_id {
+                            bail!(
+                                "received unexpected action result `{}` while waiting for `{request_id}`",
+                                result.request_id
+                            );
+                        }
+                        let completed = self.handle_action_result(result)?;
+                        self.wait_for_runtime_generation(
+                            completed.generation,
+                            ACTION_SYNC_TIMEOUT,
+                        )?;
+                        return Ok(completed.completion);
+                    }
+                    ReadStatus::Message(message) => self.handle_server_message(message)?,
+                    ReadStatus::Pending => {
+                        bail!("timed out waiting for action result `{request_id}`")
+                    }
+                    ReadStatus::Closed => bail!("sidecar server disconnected"),
+                }
+            }
+        })();
+        let reset = action_client.set_read_timeout(None);
+        match (result, reset) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(completion), Ok(())) => Ok(completion),
+        }
+    }
+
+    fn wait_for_subscription_generation(
+        &mut self,
+        subscription: &mut IpcClient,
+        generation: u64,
+    ) -> Result<()> {
+        if self.server_generation >= generation {
+            return Ok(());
+        }
+
+        loop {
+            match subscription.read_status()? {
+                ReadStatus::Message(message) => {
+                    self.handle_server_message(message)?;
+                    if self.server_generation >= generation {
+                        return Ok(());
+                    }
+                }
+                ReadStatus::Pending => {
+                    bail!("timed out waiting for sidecar state generation `{generation}`")
+                }
+                ReadStatus::Closed => bail!("sidecar server disconnected"),
+            }
+        }
+    }
+
+    fn wait_for_runtime_generation(&mut self, generation: u64, timeout: Duration) -> Result<()> {
+        if self.server_generation >= generation {
+            return Ok(());
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut deferred_events = VecDeque::new();
+
+        while self.server_generation < generation {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let event = {
+                let runtime = self.runtime.as_mut().expect("runtime checked above");
+                runtime.recv_timeout(remaining)?
+            };
+            let Some(event) = event else {
+                bail!("timed out waiting for sidecar state generation `{generation}`");
+            };
+            match event {
+                UiEvent::Server(message) => {
+                    self.handle_server_message(message)?;
+                }
+                UiEvent::ServerDisconnected => bail!("sidecar server disconnected"),
+                UiEvent::RuntimeError(message) => bail!(message),
+                other => deferred_events.push_back(other),
+            }
+        }
+
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.prepend_pending(deferred_events);
+        }
+
+        Ok(())
+    }
+
+    fn start_runtime(&mut self) -> Result<()> {
+        if self.runtime.is_some() {
+            return Ok(());
+        }
+
+        let subscription = self
+            .subscription
+            .take()
+            .ok_or_else(|| anyhow!("missing sidecar subscription for UI runtime"))?;
+        let tmux_socket_path = self
+            .tmux_socket_path
+            .clone()
+            .ok_or_else(|| anyhow!("missing tmux socket path for UI runtime"))?;
+        self.runtime = Some(UiRuntime::spawn(subscription, tmux_socket_path));
+        Ok(())
+    }
+
+    fn recv_runtime_event(&mut self) -> Result<Option<UiEvent>> {
+        let timeout = self.next_timer_timeout();
+        let Some(runtime) = self.runtime.as_mut() else {
+            return Ok(None);
+        };
+
+        if let Some(timeout) = timeout {
+            runtime.recv_timeout(timeout)
+        } else {
+            runtime.recv().map(Some)
+        }
+    }
+
+    fn next_timer_timeout(&self) -> Option<Duration> {
+        self.toast_deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+    }
+
+    fn handle_ui_event(&mut self, event: UiEvent) -> Result<()> {
+        match event {
+            UiEvent::Terminal(event) => self.handle_event(event),
+            UiEvent::Server(message) => self.handle_server_message(message),
+            UiEvent::ServerDisconnected => bail!("sidecar server disconnected"),
+            UiEvent::RuntimeError(message) => bail!(message),
         }
     }
 }
@@ -1067,9 +1169,13 @@ fn restore_terminal() {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        path::PathBuf,
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
 
-    use super::App;
+    use super::{App, StartupContext};
     use crate::{
         cli::Cli,
         event::AppEvent,
@@ -1077,7 +1183,8 @@ mod tests {
             ActionResult, ActionResultKind, ProjectionClient, ProjectionSession, ProjectionState,
             ProjectionWindow, ServerMessage, StateUpdated,
         },
-        model::{ClientName, Focus},
+        model::{ClientName, Focus, WinlinkKey},
+        ui_app::runtime::{UiEvent, UiRuntime},
     };
 
     fn test_cli() -> Cli {
@@ -1150,20 +1257,18 @@ mod tests {
     }
 
     #[test]
-    fn cached_projection_populates_first_paint_state() {
+    fn prepare_first_paint_state_uses_loading_state_until_subscription() {
         let mut app = App::new(test_cli());
+        let target_client = ClientName(String::from("client-1"));
 
-        app.apply_cached_projection(
-            projection_state(&[("$1", "main", &[("@1", "win", true)])]),
-            ClientName(String::from("client-1")),
-        );
+        app.prepare_first_paint_state(&StartupContext {
+            target_client: target_client.clone(),
+            tmux_socket_path: PathBuf::from("/tmux.sock"),
+        });
 
-        assert_eq!(
-            app.state().target_client,
-            Some(ClientName(String::from("client-1")))
-        );
-        assert_eq!(app.state().focus, Focus::window("$1", "@1"));
-        assert!(!app.state().is_tree_loading());
+        assert_eq!(app.state().target_client, Some(target_client));
+        assert!(app.state().is_tree_loading());
+        assert!(app.state().tmux.sessions.is_empty());
     }
 
     #[test]
@@ -1196,11 +1301,59 @@ mod tests {
     }
 
     #[test]
+    fn pushed_state_updates_visible_target_without_manual_sync() {
+        let mut app = App::new(test_cli());
+        app.state_mut().target_client = Some(ClientName(String::from("client-1")));
+
+        app.handle_server_message(ServerMessage::StateUpdated(StateUpdated {
+            generation: 1,
+            state: projection_state(&[
+                ("$1", "main", &[("@1", "win-1", true)]),
+                ("$2", "other", &[("@2", "win-2", true)]),
+            ]),
+        }))
+        .expect("apply initial state");
+
+        let mut switched_target = projection_state(&[
+            ("$1", "main", &[("@1", "win-1", true)]),
+            ("$2", "other", &[("@2", "win-2", true)]),
+        ]);
+        switched_target.clients[0].session_id = String::from("$2");
+        switched_target.clients[0].current_window_id = Some(String::from("@2"));
+
+        app.handle_server_message(ServerMessage::StateUpdated(StateUpdated {
+            generation: 2,
+            state: switched_target,
+        }))
+        .expect("apply pushed target switch");
+
+        let rows = app.state().tree_rows();
+        let initial_window = rows
+            .iter()
+            .find(|row| row.focus == Focus::window("$1", "@1"))
+            .expect("expected initial target row");
+        let switched_window = rows
+            .iter()
+            .find(|row| row.focus == Focus::window("$2", "@2"))
+            .expect("expected switched target row");
+
+        assert!(!initial_window.active());
+        assert!(switched_window.active());
+        assert_eq!(
+            app.state()
+                .tmux
+                .visible_window_key(app.state().target_client.as_ref()),
+            Some(WinlinkKey::new("$2", "@2"))
+        );
+    }
+
+    #[test]
     fn action_result_errors_surface_in_ui_state() {
         let mut app = App::new(test_cli());
 
         app.handle_server_message(ServerMessage::ActionResult(ActionResult {
             request_id: String::from("req-1"),
+            generation: 1,
             result: ActionResultKind::Error {
                 message: String::from("boom"),
             },
@@ -1225,11 +1378,89 @@ mod tests {
 
         app.handle_server_message(ServerMessage::ActionResult(ActionResult {
             request_id: String::from("req-2"),
+            generation: 1,
             result: ActionResultKind::Ok { outcome: None },
         }))
         .expect("handle action result");
 
         assert!(app.state().last_error.is_none());
+    }
+
+    #[test]
+    fn runtime_generation_wait_applies_target_update_and_preserves_other_events() {
+        let mut app = App::new(test_cli());
+        app.state_mut().target_client = Some(ClientName(String::from("client-1")));
+        let (sender, receiver) = mpsc::channel();
+        app.runtime = Some(UiRuntime::for_test(PathBuf::from("/tmux.sock"), receiver));
+
+        let mut switched_target = projection_state(&[
+            ("$1", "main", &[("@1", "win-1", true)]),
+            ("$2", "other", &[("@2", "win-2", true)]),
+        ]);
+        switched_target.clients[0].session_id = String::from("$2");
+        switched_target.clients[0].current_window_id = Some(String::from("@2"));
+
+        sender
+            .send(UiEvent::Terminal(AppEvent::Tick))
+            .expect("send tick");
+        sender
+            .send(UiEvent::Server(ServerMessage::StateUpdated(StateUpdated {
+                generation: 1,
+                state: projection_state(&[
+                    ("$1", "main", &[("@1", "win-1", true)]),
+                    ("$2", "other", &[("@2", "win-2", true)]),
+                ]),
+            })))
+            .expect("send first runtime update");
+        sender
+            .send(UiEvent::Server(ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: switched_target,
+            })))
+            .expect("send second runtime update");
+
+        app.wait_for_runtime_generation(2, Duration::from_millis(25))
+            .expect("wait for runtime generation");
+
+        assert_eq!(app.server_generation, 2);
+        assert_eq!(
+            app.state()
+                .tmux
+                .visible_window_key(app.state().target_client.as_ref()),
+            Some(WinlinkKey::new("$2", "@2"))
+        );
+        assert!(matches!(
+            app.runtime
+                .as_mut()
+                .expect("runtime is present")
+                .recv()
+                .expect("read deferred runtime event"),
+            UiEvent::Terminal(AppEvent::Tick)
+        ));
+    }
+
+    #[test]
+    fn runtime_channel_sync_applies_pushed_state_without_socket_polling() {
+        let mut app = App::new(test_cli());
+        app.state_mut().target_client = Some(ClientName(String::from("client-1")));
+        let (sender, receiver) = mpsc::channel();
+        app.runtime = Some(UiRuntime::for_test(PathBuf::from("/tmux.sock"), receiver));
+
+        sender
+            .send(UiEvent::Server(ServerMessage::StateUpdated(StateUpdated {
+                generation: 1,
+                state: projection_state(&[
+                    ("$1", "main", &[("@1", "win-1", true)]),
+                    ("$2", "other", &[("@2", "win-2", false)]),
+                ]),
+            })))
+            .expect("send runtime update");
+
+        assert!(
+            app.sync_with_server(Duration::from_millis(1))
+                .expect("sync through runtime channel")
+        );
+        assert_eq!(app.state().focus, Focus::window("$1", "@1"));
     }
 
     #[test]

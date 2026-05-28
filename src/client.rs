@@ -460,14 +460,14 @@ fn spawn_server_process(tmux_socket_path: &Path) -> Result<()> {
         .unwrap_or(env::current_exe().context("failed to resolve current executable")?);
 
     Command::new(executable)
-        .arg("server")
+        .arg("daemon")
         .arg("--socket-path")
         .arg(tmux_socket_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn sidecar server")?;
+        .context("failed to spawn sidecar daemon")?;
 
     Ok(())
 }

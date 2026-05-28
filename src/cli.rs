@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::path::PathBuf;
 
 use clap::{ArgGroup, Args, Parser, Subcommand};
 
@@ -24,11 +24,12 @@ pub struct Cli {
     #[arg(long = "target-client", value_name = "CLIENT")]
     pub target_client: Option<String>,
 
-    /// UI render/input poll interval in milliseconds.
+    /// Legacy compatibility knob retained for older scripts; ignored by the event-driven UI runtime.
     #[arg(
         long = "poll-interval-ms",
         value_name = "MILLIS",
-        default_value_t = 500
+        default_value_t = 500,
+        hide = true
     )]
     pub poll_interval_ms: u64,
 
@@ -44,23 +45,20 @@ pub struct Cli {
     pub command: Option<CliCommand>,
 }
 
-impl Cli {
-    pub fn poll_interval(&self) -> Duration {
-        Duration::from_millis(self.poll_interval_ms.max(1))
-    }
-}
-
 #[derive(Debug, Clone, Subcommand)]
 pub enum CliCommand {
-    /// Install or refresh tmux-sidecar hooks for the current tmux server.
-    InstallHooks(InstallHooksArgs),
+    /// Install or refresh tmux-sidecar hooks and monitoring for the current tmux server.
+    #[command(alias = "install-hooks")]
+    Setup(SetupArgs),
     /// Remove tmux-sidecar-managed hooks from the current tmux server.
-    UninstallHooks(UninstallHooksArgs),
+    #[command(alias = "uninstall-hooks")]
+    Teardown(TeardownArgs),
     /// Print a tmux.conf snippet that installs tmux-sidecar hooks.
     InitPlugin,
-    /// Run the per-tmux-socket sidecar server.
-    Server(ServerArgs),
-    /// Send a single tmux hook event to the sidecar server.
+    /// Run the per-tmux-socket sidecar daemon.
+    #[command(alias = "server")]
+    Daemon(DaemonArgs),
+    /// Send a single tmux hook event to the sidecar daemon.
     Hook(HookArgs),
     /// Query current sidecar state for scripts and status lines.
     Query(QueryArgs),
@@ -99,16 +97,16 @@ pub enum QueryCommand {
 
 #[derive(Debug, Clone, Args)]
 #[command(group(
-    ArgGroup::new("server_socket")
+    ArgGroup::new("daemon_socket")
         .args(["socket_name", "socket_path"])
         .multiple(false)
 ))]
-pub struct ServerArgs {
-    /// Stop the running sidecar server for the selected tmux socket.
-    #[arg(long = "kill")]
-    pub kill: bool,
+pub struct DaemonArgs {
+    /// Stop the running sidecar daemon for the selected tmux socket.
+    #[arg(long = "stop", alias = "kill")]
+    pub stop: bool,
 
-    /// tmux socket name passed with `tmux -L` when using `--kill`.
+    /// tmux socket name passed with `tmux -L` when using `--stop`.
     #[arg(long = "socket-name", value_name = "SOCKET")]
     pub socket_name: Option<String>,
 
@@ -123,7 +121,7 @@ pub struct ServerArgs {
         .args(["socket_name", "socket_path"])
         .multiple(false)
 ))]
-pub struct InstallHooksArgs {
+pub struct SetupArgs {
     /// tmux socket name passed with `tmux -L`.
     #[arg(long = "socket-name", value_name = "SOCKET")]
     pub socket_name: Option<String>,
@@ -139,7 +137,7 @@ pub struct InstallHooksArgs {
         .args(["socket_name", "socket_path"])
         .multiple(false)
 ))]
-pub struct UninstallHooksArgs {
+pub struct TeardownArgs {
     /// tmux socket name passed with `tmux -L`.
     #[arg(long = "socket-name", value_name = "SOCKET")]
     pub socket_name: Option<String>,
@@ -188,27 +186,44 @@ mod tests {
     use super::{Cli, CliCommand, QueryCommand};
 
     #[test]
-    fn parses_hook_management_subcommands() {
-        let install = Cli::try_parse_from(["tmux-sidecar", "install-hooks"]).unwrap();
-        assert!(matches!(install.command, Some(CliCommand::InstallHooks(_))));
+    fn parses_public_surface_subcommands() {
+        let setup = Cli::try_parse_from(["tmux-sidecar", "setup"]).unwrap();
+        assert!(matches!(setup.command, Some(CliCommand::Setup(_))));
 
-        let uninstall = Cli::try_parse_from(["tmux-sidecar", "uninstall-hooks"]).unwrap();
-        assert!(matches!(
-            uninstall.command,
-            Some(CliCommand::UninstallHooks(_))
-        ));
+        let teardown = Cli::try_parse_from(["tmux-sidecar", "teardown"]).unwrap();
+        assert!(matches!(teardown.command, Some(CliCommand::Teardown(_))));
 
         let init_plugin = Cli::try_parse_from(["tmux-sidecar", "init-plugin"]).unwrap();
         assert!(matches!(init_plugin.command, Some(CliCommand::InitPlugin)));
+
+        let daemon = Cli::try_parse_from([
+            "tmux-sidecar",
+            "daemon",
+            "--socket-path",
+            "/tmp/tmux/default",
+        ])
+        .unwrap();
+        assert!(matches!(daemon.command, Some(CliCommand::Daemon(_))));
     }
 
     #[test]
-    fn install_hooks_accepts_socket_selection_flags() {
-        let cli = Cli::try_parse_from(["tmux-sidecar", "install-hooks", "--socket-name", "work"])
-            .unwrap();
+    fn legacy_command_aliases_still_parse() {
+        let setup = Cli::try_parse_from(["tmux-sidecar", "install-hooks"]).unwrap();
+        assert!(matches!(setup.command, Some(CliCommand::Setup(_))));
 
-        let Some(CliCommand::InstallHooks(args)) = cli.command else {
-            panic!("expected install-hooks command");
+        let teardown = Cli::try_parse_from(["tmux-sidecar", "uninstall-hooks"]).unwrap();
+        assert!(matches!(teardown.command, Some(CliCommand::Teardown(_))));
+
+        let daemon = Cli::try_parse_from(["tmux-sidecar", "server", "--kill"]).unwrap();
+        assert!(matches!(daemon.command, Some(CliCommand::Daemon(_))));
+    }
+
+    #[test]
+    fn setup_accepts_socket_selection_flags() {
+        let cli = Cli::try_parse_from(["tmux-sidecar", "setup", "--socket-name", "work"]).unwrap();
+
+        let Some(CliCommand::Setup(args)) = cli.command else {
+            panic!("expected setup command");
         };
 
         assert_eq!(args.socket_name.as_deref(), Some("work"));
@@ -252,26 +267,34 @@ mod tests {
     }
 
     #[test]
-    fn server_kill_accepts_optional_socket_selection_flags() {
-        let cli = Cli::try_parse_from(["tmux-sidecar", "server", "--kill"]).unwrap();
+    fn daemon_stop_accepts_optional_socket_selection_flags() {
+        let cli = Cli::try_parse_from(["tmux-sidecar", "daemon", "--stop"]).unwrap();
 
-        let Some(CliCommand::Server(args)) = cli.command else {
-            panic!("expected server command");
+        let Some(CliCommand::Daemon(args)) = cli.command else {
+            panic!("expected daemon command");
         };
 
-        assert!(args.kill);
+        assert!(args.stop);
         assert!(args.socket_name.is_none());
         assert!(args.socket_path.is_none());
 
         let cli =
-            Cli::try_parse_from(["tmux-sidecar", "server", "--kill", "--socket-name", "work"])
+            Cli::try_parse_from(["tmux-sidecar", "daemon", "--stop", "--socket-name", "work"])
                 .unwrap();
 
-        let Some(CliCommand::Server(args)) = cli.command else {
-            panic!("expected server command");
+        let Some(CliCommand::Daemon(args)) = cli.command else {
+            panic!("expected daemon command");
         };
 
-        assert!(args.kill);
+        assert!(args.stop);
         assert_eq!(args.socket_name.as_deref(), Some("work"));
+
+        let cli = Cli::try_parse_from(["tmux-sidecar", "server", "--kill"]).unwrap();
+
+        let Some(CliCommand::Daemon(args)) = cli.command else {
+            panic!("expected daemon alias command");
+        };
+
+        assert!(args.stop);
     }
 }

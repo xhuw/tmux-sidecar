@@ -1,15 +1,17 @@
 pub mod app;
 pub mod cli;
 pub mod client;
+pub mod domain;
 pub mod event;
 pub mod input;
 pub mod ipc;
 pub mod model;
+pub mod projection;
 pub mod query;
 pub mod server;
-pub mod state_cache;
 pub mod tmux;
 pub mod ui;
+mod ui_app;
 
 use std::{env, path::PathBuf};
 
@@ -17,8 +19,8 @@ use anyhow::{Context, Result, bail};
 
 pub fn run(cli: cli::Cli) -> Result<()> {
     match cli.command.clone() {
-        Some(cli::CliCommand::InstallHooks(command)) => install_hooks(&command),
-        Some(cli::CliCommand::UninstallHooks(command)) => uninstall_hooks(&command),
+        Some(cli::CliCommand::Setup(command)) => setup(&command),
+        Some(cli::CliCommand::Teardown(command)) => teardown(&command),
         Some(cli::CliCommand::InitPlugin) => {
             print!(
                 "{}",
@@ -26,7 +28,7 @@ pub fn run(cli: cli::Cli) -> Result<()> {
             );
             Ok(())
         }
-        Some(cli::CliCommand::Server(command)) => run_server(&command),
+        Some(cli::CliCommand::Daemon(command)) => run_daemon(&command),
         Some(cli::CliCommand::Hook(command)) => client::run_hook(command),
         Some(cli::CliCommand::Query(command)) => run_query(&cli, &command),
         None => run_app(cli),
@@ -38,13 +40,13 @@ fn run_app(cli: cli::Cli) -> Result<()> {
     app.run()
 }
 
-fn install_hooks(command: &cli::InstallHooksArgs) -> Result<()> {
+fn setup(command: &cli::SetupArgs) -> Result<()> {
     tmux_cli(command.socket_name.clone(), command.socket_path.clone())
         .install_hooks(&hook_command_program()?)?;
     Ok(())
 }
 
-fn uninstall_hooks(command: &cli::UninstallHooksArgs) -> Result<()> {
+fn teardown(command: &cli::TeardownArgs) -> Result<()> {
     tmux_cli(command.socket_name.clone(), command.socket_path.clone()).uninstall_hooks()?;
     Ok(())
 }
@@ -64,8 +66,8 @@ fn run_query(cli: &cli::Cli, command: &cli::QueryArgs) -> Result<()> {
     query::write_result(command, &state, &mut std::io::stdout())
 }
 
-fn run_server(command: &cli::ServerArgs) -> Result<()> {
-    if command.kill {
+fn run_daemon(command: &cli::DaemonArgs) -> Result<()> {
+    if command.stop {
         let tmux_socket_path = client::resolve_tmux_socket_path(
             command.socket_name.clone(),
             command.socket_path.clone(),
@@ -74,10 +76,10 @@ fn run_server(command: &cli::ServerArgs) -> Result<()> {
     }
 
     let Some(socket_path) = command.socket_path.clone() else {
-        bail!("server requires --socket-path unless --kill is set");
+        bail!("daemon requires --socket-path unless --stop is set");
     };
     if command.socket_name.is_some() {
-        bail!("server can only be started with --socket-path");
+        bail!("daemon can only be started with --socket-path");
     }
 
     server::run(server::ServerOptions {

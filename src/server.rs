@@ -7,29 +7,31 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 
 use crate::{
+    domain::{DomainState, WinlinkKey},
     ipc::{
         Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
-        ClientMessage, ErrorMessage, HelloAck, HookEvent, HookName, ProjectionSession,
-        ProjectionState, ProjectionWindow, ServerMessage, SidecarPaths, StateUpdated,
+        ClientMessage, ErrorMessage, HelloAck, HookEvent, HookName, ProjectionState, ServerMessage,
+        SidecarPaths, StateUpdated,
     },
     model::WindowTarget,
     tmux::{Tmux, TmuxCli, WindowWorkdir},
 };
 
 const IPC_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
-const ACTION_REFRESH_ATTEMPTS: usize = 10;
-const ACTION_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
-const HOOK_REFRESH_ATTEMPTS: usize = 6;
-const HOOK_REFRESH_SETTLE_DELAY: Duration = Duration::from_millis(50);
-const HOOK_REFRESH_RETRY_DELAY: Duration = Duration::from_millis(25);
+const ACTION_RECONCILE_ATTEMPTS: usize = 10;
+const ACTION_RECONCILE_RETRY_DELAY: Duration = Duration::from_millis(25);
+const HOOK_RECONCILE_ATTEMPTS: usize = 6;
+const HOOK_RECONCILE_SETTLE_DELAY: Duration = Duration::from_millis(50);
+const HOOK_RECONCILE_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 pub struct ServerOptions {
     pub tmux_socket_path: PathBuf,
@@ -46,24 +48,64 @@ pub fn run(options: ServerOptions) -> Result<()> {
 
 type SharedWriter = Arc<Mutex<UnixStream>>;
 
-struct SharedState {
-    server_id: String,
+type ServerReply<T> = mpsc::Sender<T>;
+
+struct ServerCoreState {
     tmux_socket_path: PathBuf,
-    cache_path: PathBuf,
     generation: u64,
-    state: ProjectionState,
+    state: DomainState,
     workdirs: SessionWorkdirTracker,
+    pending_reconcile: Option<PendingReconcile>,
     subscribers: BTreeMap<u64, SharedWriter>,
     next_subscriber_id: u64,
 }
 
-struct Server {
-    listener: UnixListener,
-    shared: Arc<Mutex<SharedState>>,
-    refresh_lock: Arc<Mutex<()>>,
-    shutdown: Arc<AtomicBool>,
+struct ServerCore {
+    state: ServerCoreState,
     refresh_from_tmux: bool,
     tmux: Arc<dyn ServerTmuxOps>,
+    shutdown: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct ServerCoreHandle {
+    sender: mpsc::Sender<ServerInput>,
+}
+
+enum ServerInput {
+    Subscribe {
+        writer: SharedWriter,
+        reply: ServerReply<(u64, StateUpdated)>,
+    },
+    CurrentState {
+        reply: ServerReply<StateUpdated>,
+    },
+    HookEvent {
+        event: HookEvent,
+        reply: ServerReply<Result<()>>,
+    },
+    SnapshotRequest {
+        reply: ServerReply<Result<StateUpdated>>,
+    },
+    ActionRequest {
+        request: ActionRequest,
+        reply: ServerReply<ActionResult>,
+    },
+    Unsubscribe {
+        subscriber_id: u64,
+    },
+    Shutdown {
+        reply: ServerReply<()>,
+    },
+}
+
+struct Server {
+    listener: UnixListener,
+    server_id: String,
+    tmux_socket_path: PathBuf,
+    core: ServerCoreHandle,
+    core_thread: thread::JoinHandle<Result<()>>,
+    shutdown: Arc<AtomicBool>,
     cleanup: CleanupPaths,
 }
 
@@ -149,6 +191,46 @@ struct TrackedWindowWorkdir {
     observed_order: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DirtyScopes {
+    all: bool,
+    alerts: bool,
+    clients: bool,
+    sessions: BTreeSet<String>,
+    winlinks: BTreeSet<WinlinkKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DirtyScope {
+    All,
+    Alerts,
+    Clients,
+    Session(String),
+    Winlink(WinlinkKey),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct BellClearHint {
+    session_id: String,
+    window_id: Option<String>,
+    window_index: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingReconcile {
+    dirty_scopes: DirtyScopes,
+    clear_bell_hints: BTreeSet<BellClearHint>,
+    deadline: Instant,
+    attempts_remaining: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReconcileResult {
+    update: StateUpdated,
+    changed: bool,
+    snapshot_changed: bool,
+}
+
 impl ServerTmuxOps for LiveServerTmuxOps {
     fn snapshot_projection(&self, tmux_socket_path: &Path) -> Result<ProjectionState> {
         let tmux = tmux_client(tmux_socket_path);
@@ -176,6 +258,132 @@ impl ServerTmuxOps for LiveServerTmuxOps {
         options: &ActionExecutionOptions,
     ) -> Result<ActionEffect> {
         execute_action_request(&tmux_client(tmux_socket_path), request, options)
+    }
+}
+
+impl ServerCoreHandle {
+    fn subscribe(&self, writer: SharedWriter) -> Result<(u64, StateUpdated)> {
+        self.call(|reply| ServerInput::Subscribe { writer, reply })
+    }
+
+    fn current_state_update(&self) -> Result<StateUpdated> {
+        self.call(|reply| ServerInput::CurrentState { reply })
+    }
+
+    fn handle_hook_event(&self, event: HookEvent) -> Result<()> {
+        self.call(|reply| ServerInput::HookEvent { event, reply })?
+    }
+
+    fn snapshot_request(&self) -> Result<StateUpdated> {
+        self.call(|reply| ServerInput::SnapshotRequest { reply })?
+    }
+
+    fn handle_action_request(&self, request: ActionRequest) -> Result<ActionResult> {
+        self.call(|reply| ServerInput::ActionRequest { request, reply })
+    }
+
+    fn unsubscribe(&self, subscriber_id: u64) {
+        let _ = self.sender.send(ServerInput::Unsubscribe { subscriber_id });
+    }
+
+    fn shutdown(&self) -> Result<()> {
+        self.call(|reply| ServerInput::Shutdown { reply })
+    }
+
+    fn call<T: Send + 'static>(
+        &self,
+        build_input: impl FnOnce(ServerReply<T>) -> ServerInput,
+    ) -> Result<T> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.sender
+            .send(build_input(reply_tx))
+            .context("failed to send request to server core")?;
+        reply_rx
+            .recv()
+            .context("server core stopped before replying")
+    }
+}
+
+impl ServerCore {
+    fn spawn(
+        state: ServerCoreState,
+        refresh_from_tmux: bool,
+        tmux: Arc<dyn ServerTmuxOps>,
+        shutdown: Arc<AtomicBool>,
+    ) -> (ServerCoreHandle, thread::JoinHandle<Result<()>>) {
+        let (sender, receiver) = mpsc::channel();
+        let handle = ServerCoreHandle { sender };
+        let join_handle = thread::spawn(move || {
+            Self {
+                state,
+                refresh_from_tmux,
+                tmux,
+                shutdown,
+            }
+            .run(receiver)
+        });
+        (handle, join_handle)
+    }
+
+    fn run(mut self, receiver: mpsc::Receiver<ServerInput>) -> Result<()> {
+        loop {
+            let next_input = if let Some(timeout) = self.reconcile_timeout() {
+                match receiver.recv_timeout(timeout) {
+                    Ok(input) => Some(input),
+                    Err(mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match receiver.recv() {
+                    Ok(input) => Some(input),
+                    Err(_) => break,
+                }
+            };
+
+            if let Some(input) = next_input {
+                if self.handle_input(input) {
+                    break;
+                }
+                continue;
+            }
+
+            self.run_scheduled_reconcile()?;
+        }
+        Ok(())
+    }
+
+    fn handle_input(&mut self, input: ServerInput) -> bool {
+        match input {
+            ServerInput::Subscribe { writer, reply } => {
+                let _ = reply.send(self.register_subscriber(writer));
+            }
+            ServerInput::CurrentState { reply } => {
+                let _ = reply.send(self.current_state_update());
+            }
+            ServerInput::HookEvent { event, reply } => {
+                let _ = reply.send(self.handle_hook_event(&event));
+            }
+            ServerInput::SnapshotRequest { reply } => {
+                let _ = reply.send(self.refresh_state_for_snapshot_request());
+            }
+            ServerInput::ActionRequest { request, reply } => {
+                let _ = reply.send(self.handle_action_request(&request));
+            }
+            ServerInput::Unsubscribe { subscriber_id } => {
+                self.state.subscribers.remove(&subscriber_id);
+            }
+            ServerInput::Shutdown { reply } => {
+                self.shutdown.store(true, Ordering::SeqCst);
+                let _ = reply.send(());
+                return true;
+            }
+        }
+        false
+    }
+
+    fn reconcile_timeout(&self) -> Option<Duration> {
+        let deadline = self.state.pending_reconcile.as_ref()?.deadline;
+        Some(deadline.saturating_duration_since(Instant::now()))
     }
 }
 
@@ -225,7 +433,7 @@ impl SessionWorkdirTracker {
 
     fn resolve_session_path(
         &self,
-        state: &ProjectionState,
+        state: &DomainState,
         session_id: &str,
         live_workdirs: &[WindowWorkdir],
     ) -> Option<PathBuf> {
@@ -233,13 +441,13 @@ impl SessionWorkdirTracker {
             return Some(path);
         }
 
-        let session = projection_session(state, session_id);
+        let session = state.session(session_id);
         let tracked_session = self.sessions.get(session_id)?;
         let session_window_ids = session.map(|session| {
-            session
-                .windows
-                .iter()
-                .map(|window| window.id.as_str())
+            state
+                .session_windows(&session.id)
+                .into_iter()
+                .map(|(key, _)| key.window_id)
                 .collect::<BTreeSet<_>>()
         });
         resolve_path_from_tracked_workdirs(
@@ -249,21 +457,14 @@ impl SessionWorkdirTracker {
         )
     }
 
-    fn prune_to_projection(&mut self, state: &ProjectionState) {
-        let valid_windows_by_session: BTreeMap<&str, BTreeSet<&str>> = state
-            .sessions
-            .iter()
-            .map(|session| {
-                (
-                    session.id.as_str(),
-                    session
-                        .windows
-                        .iter()
-                        .map(|window| window.id.as_str())
-                        .collect::<BTreeSet<_>>(),
-                )
-            })
-            .collect();
+    fn prune_to_projection(&mut self, state: &DomainState) {
+        let mut valid_windows_by_session: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for key in state.winlinks.keys() {
+            valid_windows_by_session
+                .entry(key.session_id.as_str())
+                .or_default()
+                .insert(key.window_id.as_str());
+        }
 
         self.sessions.retain(|session_id, tracked_session| {
             let Some(valid_windows) = valid_windows_by_session.get(session_id.as_str()) else {
@@ -324,7 +525,7 @@ fn resolve_path_from_live_workdirs(workdirs: &[WindowWorkdir]) -> Option<PathBuf
 fn resolve_path_from_tracked_workdirs(
     tracked_session: &TrackedSessionWorkdirs,
     active_window_id: Option<&str>,
-    session_window_ids: Option<&BTreeSet<&str>>,
+    session_window_ids: Option<&BTreeSet<String>>,
 ) -> Option<PathBuf> {
     let candidates = tracked_session
         .windows
@@ -445,6 +646,8 @@ impl Server {
         refresh_from_tmux: bool,
         tmux: Arc<dyn ServerTmuxOps>,
     ) -> Result<Self> {
+        let initial_domain = initial_state.clone().into_domain_state();
+        let server_id = format!("tmux-sidecar-{}", std::process::id());
         fs::create_dir_all(&sidecar_paths.runtime_dir)
             .context("failed to create sidecar runtime dir")?;
         if sidecar_paths.socket_path.exists() {
@@ -467,24 +670,29 @@ impl Server {
             .context("failed to configure sidecar listener")?;
         fs::write(&sidecar_paths.pid_path, format!("{}\n", std::process::id()))
             .context("failed to write sidecar pid file")?;
-        store_state_cache(&sidecar_paths.cache_path, &initial_state);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (core, core_thread) = ServerCore::spawn(
+            ServerCoreState {
+                tmux_socket_path: tmux_socket_path.clone(),
+                generation: 1,
+                state: initial_domain,
+                workdirs: SessionWorkdirTracker::default(),
+                pending_reconcile: None,
+                subscribers: BTreeMap::new(),
+                next_subscriber_id: 1,
+            },
+            refresh_from_tmux,
+            tmux,
+            Arc::clone(&shutdown),
+        );
 
         Ok(Self {
             listener,
-            shared: Arc::new(Mutex::new(SharedState {
-                server_id: format!("tmux-sidecar-{}", std::process::id()),
-                tmux_socket_path,
-                cache_path: sidecar_paths.cache_path,
-                generation: 1,
-                state: initial_state,
-                workdirs: SessionWorkdirTracker::default(),
-                subscribers: BTreeMap::new(),
-                next_subscriber_id: 1,
-            })),
-            refresh_lock: Arc::new(Mutex::new(())),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            refresh_from_tmux,
-            tmux,
+            server_id,
+            tmux_socket_path,
+            core,
+            core_thread,
+            shutdown,
             cleanup: CleanupPaths {
                 socket_path: sidecar_paths.socket_path,
                 pid_path: sidecar_paths.pid_path,
@@ -493,23 +701,24 @@ impl Server {
     }
 
     fn run(self) -> Result<()> {
-        while !self.shutdown.load(Ordering::SeqCst) {
-            match self.listener.accept() {
+        let Self {
+            listener,
+            server_id,
+            tmux_socket_path,
+            core,
+            core_thread,
+            shutdown,
+            cleanup,
+        } = self;
+
+        while !shutdown.load(Ordering::SeqCst) {
+            match listener.accept() {
                 Ok((stream, _)) => {
-                    let shared = Arc::clone(&self.shared);
-                    let refresh_lock = Arc::clone(&self.refresh_lock);
-                    let shutdown = Arc::clone(&self.shutdown);
-                    let refresh_from_tmux = self.refresh_from_tmux;
-                    let tmux = Arc::clone(&self.tmux);
+                    let server_id = server_id.clone();
+                    let tmux_socket_path = tmux_socket_path.clone();
+                    let core = core.clone();
                     thread::spawn(move || {
-                        let _ = handle_connection(
-                            stream,
-                            shared,
-                            refresh_lock,
-                            shutdown,
-                            refresh_from_tmux,
-                            tmux,
-                        );
+                        let _ = handle_connection(stream, server_id, tmux_socket_path, core);
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -519,18 +728,20 @@ impl Server {
             }
         }
 
-        drop(self.cleanup);
+        drop(core);
+        core_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("server core thread panicked"))??;
+        drop(cleanup);
         Ok(())
     }
 }
 
 fn handle_connection(
     stream: UnixStream,
-    shared: Arc<Mutex<SharedState>>,
-    refresh_lock: Arc<Mutex<()>>,
-    shutdown: Arc<AtomicBool>,
-    refresh_from_tmux: bool,
-    tmux: Arc<dyn ServerTmuxOps>,
+    server_id: String,
+    tmux_socket_path: PathBuf,
+    core: ServerCoreHandle,
 ) -> Result<()> {
     stream
         .set_write_timeout(Some(IPC_WRITE_TIMEOUT))
@@ -545,15 +756,11 @@ fn handle_connection(
         if !hello_complete {
             match message {
                 ClientMessage::Hello(_hello) => {
-                    let server_id = {
-                        let guard = shared.lock().expect("shared state poisoned");
-                        guard.server_id.clone()
-                    };
                     send_message(
                         &writer,
                         &ServerMessage::HelloAck(HelloAck {
                             protocol_version: crate::ipc::PROTOCOL_VERSION,
-                            server_id,
+                            server_id: server_id.clone(),
                         }),
                     )?;
                     hello_complete = true;
@@ -571,11 +778,7 @@ fn handle_connection(
                 send_error(&writer, "duplicate hello is not allowed")?;
             }
             ClientMessage::HookEvent(event) => {
-                let expected_tmux_socket = {
-                    let guard = shared.lock().expect("shared state poisoned");
-                    guard.tmux_socket_path.clone()
-                };
-                if event.tmux_socket_path != expected_tmux_socket {
+                if event.tmux_socket_path != tmux_socket_path {
                     send_error(
                         &writer,
                         "hook event tmux socket path did not match this server",
@@ -583,14 +786,7 @@ fn handle_connection(
                     continue;
                 }
 
-                record_hook_workdir(&shared, &event);
-                refresh_state_for_hook(
-                    &shared,
-                    &refresh_lock,
-                    refresh_from_tmux,
-                    tmux.as_ref(),
-                    &event,
-                )?;
+                core.handle_hook_event(event)?;
                 send_message(
                     &writer,
                     &ServerMessage::Ack(Ack {
@@ -600,44 +796,37 @@ fn handle_connection(
             }
             ClientMessage::Subscribe(_) => {
                 if subscriber_id.is_none() {
-                    subscriber_id = Some(register_subscriber(&shared, Arc::clone(&writer)));
+                    let (registered_id, update) = core.subscribe(Arc::clone(&writer))?;
+                    subscriber_id = Some(registered_id);
+                    send_message(&writer, &ServerMessage::StateUpdated(update))?;
+                    continue;
                 }
                 send_message(
                     &writer,
-                    &ServerMessage::StateUpdated(current_state_update(&shared)),
+                    &ServerMessage::StateUpdated(core.current_state_update()?),
                 )?;
             }
-            ClientMessage::SnapshotRequest => {
-                match refresh_state_for_snapshot_request(
-                    &shared,
-                    &refresh_lock,
-                    refresh_from_tmux,
-                    tmux.as_ref(),
-                ) {
-                    Ok(update) => {
-                        send_message(&writer, &ServerMessage::StateUpdated(update))?;
-                    }
-                    Err(error) => {
-                        send_error(&writer, format!("failed to refresh state: {error:#}"))?;
-                    }
+            ClientMessage::SnapshotRequest => match core.snapshot_request() {
+                Ok(update) => {
+                    send_message(&writer, &ServerMessage::StateUpdated(update))?;
                 }
-            }
-            ClientMessage::ActionRequest(request) => {
-                let request_id = request.request_id.clone();
-                let result = handle_action_request(
-                    &shared,
-                    &refresh_lock,
-                    refresh_from_tmux,
-                    tmux.as_ref(),
-                    &request,
-                );
-                send_message(
-                    &writer,
-                    &ServerMessage::ActionResult(ActionResult { request_id, result }),
-                )?;
-            }
+                Err(error) => {
+                    send_error(&writer, format!("failed to refresh state: {error:#}"))?;
+                }
+            },
+            ClientMessage::ActionRequest(request) => match core.handle_action_request(request) {
+                Ok(result) => {
+                    send_message(&writer, &ServerMessage::ActionResult(result))?;
+                }
+                Err(error) => {
+                    send_error(
+                        &writer,
+                        format!("failed to process action request: {error:#}"),
+                    )?;
+                }
+            },
             ClientMessage::Shutdown => {
-                shutdown.store(true, Ordering::SeqCst);
+                core.shutdown()?;
                 send_message(
                     &writer,
                     &ServerMessage::Ack(Ack {
@@ -650,290 +839,440 @@ fn handle_connection(
     }
 
     if let Some(subscriber_id) = subscriber_id {
-        let mut guard = shared.lock().expect("shared state poisoned");
-        guard.subscribers.remove(&subscriber_id);
+        core.unsubscribe(subscriber_id);
     }
 
     Ok(())
 }
 
-fn register_subscriber(shared: &Arc<Mutex<SharedState>>, writer: SharedWriter) -> u64 {
-    let mut guard = shared.lock().expect("shared state poisoned");
-    let subscriber_id = guard.next_subscriber_id;
-    guard.next_subscriber_id += 1;
-    guard.subscribers.insert(subscriber_id, writer);
-    subscriber_id
-}
-
-fn current_state_update(shared: &Arc<Mutex<SharedState>>) -> StateUpdated {
-    let guard = shared.lock().expect("shared state poisoned");
-    StateUpdated {
-        generation: guard.generation,
-        state: guard.state.clone(),
-    }
-}
-
-fn refresh_state(
-    shared: &Arc<Mutex<SharedState>>,
-    refresh_lock: &Arc<Mutex<()>>,
-    refresh_from_tmux: bool,
-    tmux: &dyn ServerTmuxOps,
-) -> Result<StateUpdated> {
-    refresh_state_with_policy(
-        shared,
-        refresh_lock,
-        refresh_from_tmux,
-        tmux,
-        RefreshPolicy::Immediate,
-    )
-}
-
-fn refresh_state_for_hook(
-    shared: &Arc<Mutex<SharedState>>,
-    refresh_lock: &Arc<Mutex<()>>,
-    refresh_from_tmux: bool,
-    tmux: &dyn ServerTmuxOps,
-    event: &HookEvent,
-) -> Result<StateUpdated> {
-    refresh_state_with_policy(
-        shared,
-        refresh_lock,
-        refresh_from_tmux,
-        tmux,
-        RefreshPolicy::Hook(event),
-    )
-}
-
-fn refresh_state_for_action(
-    shared: &Arc<Mutex<SharedState>>,
-    refresh_lock: &Arc<Mutex<()>>,
-    refresh_from_tmux: bool,
-    tmux: &dyn ServerTmuxOps,
-    effect: &ActionEffect,
-) -> Result<StateUpdated> {
-    refresh_state_with_policy(
-        shared,
-        refresh_lock,
-        refresh_from_tmux,
-        tmux,
-        RefreshPolicy::Action(effect),
-    )
-}
-
-fn refresh_state_for_snapshot_request(
-    shared: &Arc<Mutex<SharedState>>,
-    refresh_lock: &Arc<Mutex<()>>,
-    refresh_from_tmux: bool,
-    tmux: &dyn ServerTmuxOps,
-) -> Result<StateUpdated> {
-    let _refresh_guard = refresh_lock.lock().expect("refresh lock poisoned");
-    let (tmux_socket_path, previous_state) = {
-        let guard = shared.lock().expect("shared state poisoned");
-        (guard.tmux_socket_path.clone(), guard.state.clone())
-    };
-
-    let mut next_state = if refresh_from_tmux {
-        tmux.snapshot_projection(&tmux_socket_path)?
-    } else {
-        previous_state.clone()
-    };
-    preserve_cached_bell_flags(&previous_state, &mut next_state, None);
-
-    if next_state == previous_state {
-        return Ok(current_state_update(shared));
+impl ServerCore {
+    fn register_subscriber(&mut self, writer: SharedWriter) -> (u64, StateUpdated) {
+        let subscriber_id = self.state.next_subscriber_id;
+        self.state.next_subscriber_id += 1;
+        self.state.subscribers.insert(subscriber_id, writer);
+        (subscriber_id, self.current_state_update())
     }
 
-    Ok(publish_state_update(shared, next_state, false))
-}
-
-enum RefreshPolicy<'a> {
-    Immediate,
-    Hook(&'a HookEvent),
-    Action(&'a ActionEffect),
-}
-
-fn refresh_state_with_policy(
-    shared: &Arc<Mutex<SharedState>>,
-    refresh_lock: &Arc<Mutex<()>>,
-    refresh_from_tmux: bool,
-    tmux: &dyn ServerTmuxOps,
-    policy: RefreshPolicy<'_>,
-) -> Result<StateUpdated> {
-    let _refresh_guard = refresh_lock.lock().expect("refresh lock poisoned");
-    let (tmux_socket_path, previous_state) = {
-        let guard = shared.lock().expect("shared state poisoned");
-        (guard.tmux_socket_path.clone(), guard.state.clone())
-    };
-
-    let attempts = if refresh_from_tmux {
-        policy.max_attempts()
-    } else {
-        1
-    };
-    let mut last_state = previous_state.clone();
-    let mut last_satisfied = false;
-
-    for attempt in 0..attempts {
-        if refresh_from_tmux {
-            if attempt == 0 {
-                if let Some(delay) = policy.initial_delay() {
-                    thread::sleep(delay);
-                }
-            } else if let Some(delay) = policy.retry_delay() {
-                thread::sleep(delay);
-            }
+    fn current_state_update(&self) -> StateUpdated {
+        StateUpdated {
+            generation: self.state.generation,
+            state: ProjectionState::from_domain(&self.state.state),
         }
+    }
 
-        let mut next_state = if refresh_from_tmux {
-            tmux.snapshot_projection(&tmux_socket_path)?
-        } else {
-            previous_state.clone()
+    fn handle_hook_event(&mut self, event: &HookEvent) -> Result<()> {
+        self.state.workdirs.record_hook(event);
+        self.apply_hook_overlay(event);
+        self.schedule_hook_reconciliation(event);
+        Ok(())
+    }
+
+    fn refresh_state(&mut self) -> Result<StateUpdated> {
+        let clear_bell_hints = self
+            .take_pending_reconcile()
+            .map(|pending| pending.clear_bell_hints)
+            .unwrap_or_default();
+        self.reconcile_from_snapshot(&clear_bell_hints, true)
+            .map(|result| result.update)
+    }
+
+    fn refresh_state_for_snapshot_request(&mut self) -> Result<StateUpdated> {
+        let clear_bell_hints = self
+            .take_pending_reconcile()
+            .map(|pending| pending.clear_bell_hints)
+            .unwrap_or_default();
+        self.reconcile_from_snapshot(&clear_bell_hints, false)
+            .map(|result| result.update)
+    }
+
+    fn run_scheduled_reconcile(&mut self) -> Result<()> {
+        let Some(mut pending) = self.take_pending_reconcile() else {
+            return Ok(());
         };
-        let hook_event = policy.hook_event();
-        preserve_cached_bell_flags(&previous_state, &mut next_state, hook_event);
-        if let Some(event) = hook_event {
-            apply_hook_event_overlay(&mut next_state, event);
+
+        let result = self.reconcile_from_snapshot(&pending.clear_bell_hints, true)?;
+        if !result.changed
+            && !result.snapshot_changed
+            && pending.dirty_scopes.requires_confirmation()
+            && pending.attempts_remaining > 1
+        {
+            pending.attempts_remaining -= 1;
+            pending.deadline = Instant::now() + HOOK_RECONCILE_RETRY_DELAY;
+            self.state.pending_reconcile = Some(pending);
+        }
+        Ok(())
+    }
+
+    fn reconcile_after_action(&mut self, effect: &ActionEffect) -> Result<StateUpdated> {
+        let clear_bell_hints = self
+            .take_pending_reconcile()
+            .map(|pending| pending.clear_bell_hints)
+            .unwrap_or_default();
+        if !self.refresh_from_tmux {
+            return Ok(self.current_state_update());
         }
 
-        last_satisfied = policy.is_satisfied(&previous_state, &next_state);
-        last_state = next_state;
-        if last_satisfied || attempt + 1 == attempts {
-            break;
+        for attempt in 0..ACTION_RECONCILE_ATTEMPTS {
+            if attempt > 0 {
+                thread::sleep(ACTION_RECONCILE_RETRY_DELAY);
+            }
+
+            let result = self.reconcile_from_snapshot(&clear_bell_hints, true)?;
+            if effect.is_satisfied(&self.state.state) {
+                return Ok(result.update);
+            }
+        }
+
+        anyhow::bail!("{}", effect.unsatisfied_message())
+    }
+
+    fn reconcile_from_snapshot(
+        &mut self,
+        clear_bell_hints: &BTreeSet<BellClearHint>,
+        broadcast_update: bool,
+    ) -> Result<ReconcileResult> {
+        if !self.refresh_from_tmux {
+            return Ok(ReconcileResult {
+                update: self.current_state_update(),
+                changed: false,
+                snapshot_changed: false,
+            });
+        }
+
+        let previous_state = self.state.state.clone();
+        let tmux_socket_path = self.state.tmux_socket_path.clone();
+        let mut next_state = self
+            .tmux
+            .snapshot_projection(&tmux_socket_path)?
+            .into_domain_state();
+        let snapshot_changed = next_state != previous_state;
+        preserve_cached_bell_overlays(&previous_state, &mut next_state, clear_bell_hints);
+        let (update, changed) = self.publish_state_update(next_state, broadcast_update);
+        Ok(ReconcileResult {
+            update,
+            changed,
+            snapshot_changed,
+        })
+    }
+
+    fn take_pending_reconcile(&mut self) -> Option<PendingReconcile> {
+        self.state.pending_reconcile.take()
+    }
+
+    fn apply_hook_overlay(&mut self, event: &HookEvent) {
+        let mut next_state = self.state.state.clone();
+        if !apply_hook_event_overlay(&mut next_state, event) {
+            return;
+        }
+        let _ = self.publish_state_update(next_state, true);
+    }
+
+    fn schedule_hook_reconciliation(&mut self, event: &HookEvent) {
+        if !self.refresh_from_tmux {
+            return;
+        }
+
+        let dirty_scopes = dirty_scopes_for_hook(event);
+        if dirty_scopes.is_empty() {
+            return;
+        }
+
+        let deadline = Instant::now() + HOOK_RECONCILE_SETTLE_DELAY;
+        let clear_bell_hints = bell_clear_hint_for_hook(event).into_iter().collect();
+        match &mut self.state.pending_reconcile {
+            Some(pending) => {
+                pending.dirty_scopes.merge(dirty_scopes);
+                pending.clear_bell_hints.extend(clear_bell_hints);
+                pending.deadline = pending.deadline.max(deadline);
+                pending.attempts_remaining = HOOK_RECONCILE_ATTEMPTS;
+            }
+            None => {
+                self.state.pending_reconcile = Some(PendingReconcile {
+                    dirty_scopes,
+                    clear_bell_hints,
+                    deadline,
+                    attempts_remaining: HOOK_RECONCILE_ATTEMPTS,
+                });
+            }
         }
     }
 
-    let update = publish_state_update(shared, last_state, true);
-    if let RefreshPolicy::Action(effect) = policy {
-        if !last_satisfied {
-            anyhow::bail!("{}", effect.unsatisfied_message());
+    fn publish_state_update(
+        &mut self,
+        next_state: DomainState,
+        broadcast_update: bool,
+    ) -> (StateUpdated, bool) {
+        if next_state == self.state.state {
+            return (self.current_state_update(), false);
+        }
+
+        self.state.generation += 1;
+        self.state.workdirs.prune_to_projection(&next_state);
+        self.state.state = next_state;
+        let update = StateUpdated {
+            generation: self.state.generation,
+            state: ProjectionState::from_domain(&self.state.state),
+        };
+
+        if broadcast_update {
+            self.broadcast(ServerMessage::StateUpdated(update.clone()));
+        }
+        (update, true)
+    }
+
+    fn broadcast(&mut self, message: ServerMessage) {
+        let mut stale_subscribers = Vec::new();
+        for (subscriber_id, writer) in &self.state.subscribers {
+            if send_message(writer, &message).is_err() {
+                stale_subscribers.push(*subscriber_id);
+            }
+        }
+
+        for subscriber_id in stale_subscribers {
+            self.state.subscribers.remove(&subscriber_id);
         }
     }
 
-    Ok(update)
-}
+    fn handle_action_request(&mut self, request: &ActionRequest) -> ActionResult {
+        let tmux_socket_path = self.state.tmux_socket_path.clone();
+        let result = match &request.action {
+            Action::CreateWindow { session_id, .. } => {
+                match self.resolve_create_window_path(&tmux_socket_path, session_id) {
+                    Ok(create_window_path) => self.handle_action_request_with_options(
+                        request,
+                        tmux_socket_path,
+                        ActionExecutionOptions { create_window_path },
+                    ),
+                    Err(error) => ActionResultKind::Error {
+                        message: format!("failed to resolve working directory: {error:#}"),
+                    },
+                }
+            }
+            _ => self.handle_action_request_with_options(
+                request,
+                tmux_socket_path,
+                ActionExecutionOptions::default(),
+            ),
+        };
 
-fn publish_state_update(
-    shared: &Arc<Mutex<SharedState>>,
-    next_state: ProjectionState,
-    broadcast_update: bool,
-) -> StateUpdated {
-    let (cache_path, update) = {
-        let mut guard = shared.lock().expect("shared state poisoned");
-        guard.generation += 1;
-        guard.workdirs.prune_to_projection(&next_state);
-        guard.state = next_state;
-        (
-            guard.cache_path.clone(),
-            StateUpdated {
-                generation: guard.generation,
-                state: guard.state.clone(),
+        ActionResult {
+            request_id: request.request_id.clone(),
+            generation: self.state.generation,
+            result,
+        }
+    }
+
+    fn handle_action_request_with_options(
+        &mut self,
+        request: &ActionRequest,
+        tmux_socket_path: PathBuf,
+        action_options: ActionExecutionOptions,
+    ) -> ActionResultKind {
+        let action_result = self
+            .tmux
+            .execute_action(&tmux_socket_path, request, &action_options);
+        if let Ok(ActionEffect::CreatedWindow {
+            session_id,
+            window_id,
+            current_path: Some(current_path),
+        }) = &action_result
+        {
+            self.state
+                .workdirs
+                .record_created_window(session_id, window_id, current_path.clone());
+        };
+        let refresh_result = match &action_result {
+            Ok(effect) => self.reconcile_after_action(effect),
+            Err(_) => self.refresh_state(),
+        };
+
+        match (action_result, refresh_result) {
+            (Ok(effect), Ok(_)) => ActionResultKind::Ok {
+                outcome: effect.outcome(),
             },
-        )
-    };
-    store_state_cache(&cache_path, &update.state);
-
-    if broadcast_update {
-        broadcast(shared, ServerMessage::StateUpdated(update.clone()));
-    }
-    update
-}
-
-impl RefreshPolicy<'_> {
-    fn max_attempts(&self) -> usize {
-        match self {
-            RefreshPolicy::Immediate => 1,
-            RefreshPolicy::Hook(event) if hook_may_change_projection(event) => {
-                HOOK_REFRESH_ATTEMPTS
-            }
-            RefreshPolicy::Hook(_) => 1,
-            RefreshPolicy::Action(_) => ACTION_REFRESH_ATTEMPTS,
+            (Err(action_error), Ok(_)) => ActionResultKind::Error {
+                message: action_error.to_string(),
+            },
+            (Ok(_), Err(refresh_error)) => ActionResultKind::Error {
+                message: format!("action succeeded but failed to refresh state: {refresh_error:#}"),
+            },
+            (Err(action_error), Err(refresh_error)) => ActionResultKind::Error {
+                message: format!(
+                    "{action_error:#}; additionally failed to refresh state: {refresh_error:#}"
+                ),
+            },
         }
     }
 
-    fn initial_delay(&self) -> Option<Duration> {
-        match self {
-            RefreshPolicy::Hook(event) if hook_may_change_projection(event) => {
-                Some(HOOK_REFRESH_SETTLE_DELAY)
-            }
-            RefreshPolicy::Immediate | RefreshPolicy::Action(_) => None,
-            RefreshPolicy::Hook(_) => None,
-        }
-    }
-
-    fn retry_delay(&self) -> Option<Duration> {
-        match self {
-            RefreshPolicy::Hook(event) if hook_may_change_projection(event) => {
-                Some(HOOK_REFRESH_RETRY_DELAY)
-            }
-            RefreshPolicy::Action(_) => Some(ACTION_REFRESH_RETRY_DELAY),
-            RefreshPolicy::Immediate | RefreshPolicy::Hook(_) => None,
-        }
-    }
-
-    fn hook_event(&self) -> Option<&HookEvent> {
-        match self {
-            RefreshPolicy::Hook(event) => Some(event),
-            RefreshPolicy::Immediate | RefreshPolicy::Action(_) => None,
-        }
-    }
-
-    fn is_satisfied(&self, previous_state: &ProjectionState, next_state: &ProjectionState) -> bool {
-        match self {
-            RefreshPolicy::Immediate => true,
-            RefreshPolicy::Hook(event) => {
-                !hook_may_change_projection(event)
-                    || hook_refresh_satisfied(event, previous_state, next_state)
-            }
-            RefreshPolicy::Action(effect) => effect.is_satisfied(next_state),
-        }
+    fn resolve_create_window_path(
+        &mut self,
+        tmux_socket_path: &Path,
+        session_id: &str,
+    ) -> Result<Option<PathBuf>> {
+        let live_workdirs = self
+            .tmux
+            .inspect_session_workdirs(tmux_socket_path, session_id)?;
+        self.state
+            .workdirs
+            .record_session_workdirs(session_id, &live_workdirs);
+        Ok(self
+            .state
+            .workdirs
+            .resolve_session_path(&self.state.state, session_id, &live_workdirs))
     }
 }
 
-fn hook_may_change_projection(event: &HookEvent) -> bool {
-    matches!(
-        event.event,
-        HookName::SessionCreated
-            | HookName::SessionClosed
-            | HookName::WindowLinked
-            | HookName::WindowUnlinked
-            | HookName::AfterNewSession
-            | HookName::AfterNewWindow
-            | HookName::AfterKillPane
-    )
+impl DirtyScopes {
+    fn is_empty(&self) -> bool {
+        !self.all
+            && !self.alerts
+            && !self.clients
+            && self.sessions.is_empty()
+            && self.winlinks.is_empty()
+    }
+
+    fn requires_confirmation(&self) -> bool {
+        self.all || self.clients || !self.sessions.is_empty() || !self.winlinks.is_empty()
+    }
+
+    fn mark(&mut self, scope: DirtyScope) {
+        if self.all {
+            return;
+        }
+
+        match scope {
+            DirtyScope::All => {
+                self.all = true;
+                self.alerts = false;
+                self.clients = false;
+                self.sessions.clear();
+                self.winlinks.clear();
+            }
+            DirtyScope::Alerts => self.alerts = true,
+            DirtyScope::Clients => self.clients = true,
+            DirtyScope::Session(session_id) => {
+                self.sessions.insert(session_id);
+            }
+            DirtyScope::Winlink(key) => {
+                self.winlinks.insert(key);
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if self.all {
+            return;
+        }
+        if other.all {
+            self.mark(DirtyScope::All);
+            return;
+        }
+
+        self.alerts |= other.alerts;
+        self.clients |= other.clients;
+        self.sessions.extend(other.sessions);
+        self.winlinks.extend(other.winlinks);
+    }
 }
 
-fn hook_refresh_satisfied(
-    event: &HookEvent,
-    previous_state: &ProjectionState,
-    next_state: &ProjectionState,
-) -> bool {
+impl BellClearHint {
+    fn matches(&self, key: &WinlinkKey, window_index: u32) -> bool {
+        if self.session_id != key.session_id {
+            return false;
+        }
+
+        self.window_id.as_deref() == Some(key.window_id.as_str())
+            || self.window_index == Some(window_index)
+    }
+}
+
+fn dirty_scopes_for_hook(event: &HookEvent) -> DirtyScopes {
+    let mut dirty = DirtyScopes::default();
     match event.event {
-        HookName::SessionCreated | HookName::AfterNewSession => {
-            next_state.sessions.len() > previous_state.sessions.len()
+        HookName::AlertBell => {
+            dirty.mark(DirtyScope::Alerts);
         }
-        HookName::SessionClosed => next_state.sessions.len() < previous_state.sessions.len(),
-        HookName::WindowLinked | HookName::AfterNewWindow => {
-            projection_window_count(next_state) > projection_window_count(previous_state)
+        HookName::ClientAttached | HookName::ClientDetached | HookName::ClientSessionChanged => {
+            dirty.mark(DirtyScope::Clients);
+            if let Some(session_id) = non_empty(event.session_id.as_deref()) {
+                dirty.mark(DirtyScope::Session(session_id.to_owned()));
+            }
+            if let Some(key) = hook_window_key(event) {
+                dirty.mark(DirtyScope::Winlink(key));
+            }
         }
-        HookName::WindowUnlinked => {
-            projection_window_count(next_state) < projection_window_count(previous_state)
-                || next_state.sessions.len() < previous_state.sessions.len()
+        HookName::SessionWindowChanged | HookName::AfterSelectWindow => {
+            dirty.mark(DirtyScope::Clients);
+            if let Some(key) = hook_window_key(event) {
+                dirty.mark(DirtyScope::Winlink(key));
+            } else if let Some(session_id) = non_empty(event.session_id.as_deref()) {
+                dirty.mark(DirtyScope::Session(session_id.to_owned()));
+            } else {
+                dirty.mark(DirtyScope::All);
+            }
         }
-        HookName::AfterKillPane => {
-            projection_window_count(next_state) < projection_window_count(previous_state)
-                || next_state.sessions.len() < previous_state.sessions.len()
-                || next_state != previous_state
+        HookName::SessionRenamed | HookName::AfterRenameSession => {
+            if let Some(session_id) = non_empty(event.session_id.as_deref()) {
+                dirty.mark(DirtyScope::Session(session_id.to_owned()));
+            } else {
+                dirty.mark(DirtyScope::All);
+            }
         }
-        _ => true,
+        HookName::WindowRenamed | HookName::AfterRenameWindow => {
+            if let Some(key) = hook_window_key(event) {
+                dirty.mark(DirtyScope::Winlink(key));
+            } else if let Some(session_id) = non_empty(event.session_id.as_deref()) {
+                dirty.mark(DirtyScope::Session(session_id.to_owned()));
+            } else {
+                dirty.mark(DirtyScope::All);
+            }
+        }
+        HookName::SessionCreated
+        | HookName::SessionClosed
+        | HookName::WindowLinked
+        | HookName::WindowUnlinked
+        | HookName::AfterNewSession
+        | HookName::AfterNewWindow
+        | HookName::AfterKillPane => {
+            dirty.mark(DirtyScope::All);
+        }
+        HookName::WindowPaneChanged
+        | HookName::WindowLayoutChanged
+        | HookName::AlertActivity
+        | HookName::AlertSilence => {}
     }
+    dirty
 }
 
-fn projection_window_count(state: &ProjectionState) -> usize {
-    state
-        .sessions
-        .iter()
-        .map(|session| session.windows.len())
-        .sum()
+fn bell_clear_hint_for_hook(event: &HookEvent) -> Option<BellClearHint> {
+    if !matches!(
+        event.event,
+        HookName::AfterSelectWindow
+            | HookName::ClientSessionChanged
+            | HookName::SessionWindowChanged
+    ) {
+        return None;
+    }
+
+    let session_id = non_empty(event.session_id.as_deref())?.to_owned();
+    let window_id = non_empty(event.window_id.as_deref()).map(str::to_owned);
+    let window_index = event.window_index;
+    if window_id.is_none() && window_index.is_none() {
+        return None;
+    }
+
+    Some(BellClearHint {
+        session_id,
+        window_id,
+        window_index,
+    })
+}
+
+fn hook_window_key(event: &HookEvent) -> Option<WinlinkKey> {
+    Some(WinlinkKey::new(
+        non_empty(event.session_id.as_deref())?.to_owned(),
+        non_empty(event.window_id.as_deref())?.to_owned(),
+    ))
 }
 
 impl ActionEffect {
@@ -959,54 +1298,43 @@ impl ActionEffect {
         }
     }
 
-    fn is_satisfied(&self, state: &ProjectionState) -> bool {
+    fn is_satisfied(&self, state: &DomainState) -> bool {
         match self {
             ActionEffect::SwitchedSession {
                 client_name,
                 session_id,
             } => state
                 .clients
-                .iter()
-                .any(|client| client.name == *client_name && client.session_id == *session_id),
+                .values()
+                .any(|client| client.name.0 == *client_name && client.session_id == *session_id),
             ActionEffect::SwitchedWindow {
                 client_name,
                 session_id,
                 window_id,
-            } => state.clients.iter().any(|client| {
-                client.name == *client_name
+            } => state.clients.values().any(|client| {
+                client.name.0 == *client_name
                     && client.session_id == *session_id
                     && client.current_window_id.as_deref() == Some(window_id.as_str())
             }),
-            ActionEffect::CreatedSession { session_id } => state
-                .sessions
-                .iter()
-                .any(|session| session.id == *session_id),
+            ActionEffect::CreatedSession { session_id } => state.session(session_id).is_some(),
             ActionEffect::CreatedWindow {
                 session_id,
                 window_id,
                 ..
-            } => projection_session(state, session_id)
-                .map(|session| session.windows.iter().any(|window| window.id == *window_id))
+            } => state.session_window(session_id, window_id).is_some(),
+            ActionEffect::RenamedSession { session_id, name } => state
+                .session(session_id)
+                .map(|session| session.name == *name)
                 .unwrap_or(false),
-            ActionEffect::RenamedSession { session_id, name } => {
-                projection_session(state, session_id)
-                    .map(|session| session.name == *name)
-                    .unwrap_or(false)
-            }
             ActionEffect::RenamedWindow { window_id, name } => state
-                .sessions
-                .iter()
-                .flat_map(|session| session.windows.iter())
+                .winlinks
+                .values()
                 .any(|window| window.id == *window_id && window.name == *name),
-            ActionEffect::ClosedSession { session_id } => {
-                projection_session(state, session_id).is_none()
-            }
+            ActionEffect::ClosedSession { session_id } => state.session(session_id).is_none(),
             ActionEffect::ClosedWindow {
                 session_id,
                 window_id,
-            } => projection_session(state, session_id)
-                .map(|session| !session.windows.iter().any(|window| window.id == *window_id))
-                .unwrap_or(true),
+            } => state.session_window(session_id, window_id).is_none(),
         }
     }
 
@@ -1054,132 +1382,59 @@ impl ActionEffect {
     }
 }
 
-fn projection_session<'a>(
-    state: &'a ProjectionState,
-    session_id: &str,
-) -> Option<&'a ProjectionSession> {
-    state
-        .sessions
-        .iter()
-        .find(|session| session.id == session_id)
-}
-
-fn preserve_cached_bell_flags(
-    previous_state: &ProjectionState,
-    next_state: &mut ProjectionState,
-    hook_event: Option<&HookEvent>,
+fn preserve_cached_bell_overlays(
+    previous_state: &DomainState,
+    next_state: &mut DomainState,
+    clear_bell_hints: &BTreeSet<BellClearHint>,
 ) {
-    let viewed_windows = viewed_projection_windows(next_state);
+    let viewed_windows = next_state.viewed_window_keys();
 
-    for previous_session in &previous_state.sessions {
-        let Some(next_session) = next_state
-            .sessions
-            .iter_mut()
-            .find(|session| session.id == previous_session.id)
-        else {
+    for (key, previous_window) in previous_state
+        .winlinks
+        .iter()
+        .filter(|(_, window)| window.bell_flag)
+    {
+        let Some(next_window) = next_state.winlinks.get_mut(key) else {
             continue;
         };
 
-        for previous_window in previous_session
-            .windows
-            .iter()
-            .filter(|window| window.bell_flag)
+        if next_window.bell_flag
+            || viewed_windows.contains(key)
+            || clear_bell_hints
+                .iter()
+                .any(|hint| hint.matches(key, previous_window.index))
         {
-            let Some(next_window) = next_session
-                .windows
-                .iter_mut()
-                .find(|window| window.id == previous_window.id)
-            else {
-                continue;
-            };
-
-            if next_window.bell_flag
-                || viewed_windows
-                    .contains(&(previous_session.id.clone(), previous_window.id.clone()))
-                || hook_event_clears_cached_bell(
-                    hook_event,
-                    &previous_session.id,
-                    &previous_window.id,
-                    previous_window.index,
-                )
-            {
-                continue;
-            }
-
-            next_window.bell_flag = true;
+            continue;
         }
+
+        next_window.bell_flag = true;
+        next_window.activity = next_window.activity.max(previous_window.activity);
     }
 }
 
-fn viewed_projection_windows(state: &ProjectionState) -> BTreeSet<(String, String)> {
-    let active_window_by_session: BTreeMap<&str, &str> = state
-        .sessions
-        .iter()
-        .filter_map(|session| Some((session.id.as_str(), session.active_window_id.as_deref()?)))
-        .collect();
-
-    state
-        .clients
-        .iter()
-        .filter_map(|client| {
-            let window_id = client.current_window_id.as_deref().or_else(|| {
-                active_window_by_session
-                    .get(client.session_id.as_str())
-                    .copied()
-            })?;
-            Some((client.session_id.clone(), window_id.to_owned()))
-        })
-        .collect()
-}
-
-fn hook_event_clears_cached_bell(
-    hook_event: Option<&HookEvent>,
-    session_id: &str,
-    window_id: &str,
-    window_index: u32,
-) -> bool {
-    let Some(event) = hook_event else {
+fn apply_hook_event_overlay(state: &mut DomainState, event: &HookEvent) -> bool {
+    let Some(window) = domain_window_for_hook_event(state, event) else {
         return false;
-    };
-    if !matches!(
-        event.event,
-        HookName::AfterSelectWindow
-            | HookName::ClientSessionChanged
-            | HookName::SessionWindowChanged
-    ) {
-        return false;
-    }
-    if non_empty(event.session_id.as_deref()) != Some(session_id) {
-        return false;
-    }
-
-    non_empty(event.window_id.as_deref()) == Some(window_id)
-        || event.window_index == Some(window_index)
-}
-
-fn record_hook_workdir(shared: &Arc<Mutex<SharedState>>, event: &HookEvent) {
-    let mut guard = shared.lock().expect("shared state poisoned");
-    guard.workdirs.record_hook(event);
-}
-
-fn apply_hook_event_overlay(state: &mut ProjectionState, event: &HookEvent) {
-    let Some(window) = projection_window_for_hook_event(state, event) else {
-        return;
     };
 
     match event.event {
         HookName::AlertBell => {
-            window.bell_flag = true;
-            update_activity_timestamp(window, event);
+            let mut changed = false;
+            if !window.bell_flag {
+                window.bell_flag = true;
+                changed = true;
+            }
+            let activity_changed = update_activity_timestamp(window, event);
+            changed || activity_changed
         }
-        _ => {}
+        _ => false,
     }
 }
 
-fn projection_window_for_hook_event<'a>(
-    state: &'a mut ProjectionState,
+fn domain_window_for_hook_event<'a>(
+    state: &'a mut DomainState,
     event: &HookEvent,
-) -> Option<&'a mut ProjectionWindow> {
+) -> Option<&'a mut crate::domain::WindowState> {
     let session_id = non_empty(event.session_id.as_deref())?;
     let window_id = non_empty(event.window_id.as_deref());
     let window_index = event.window_index;
@@ -1187,28 +1442,22 @@ fn projection_window_for_hook_event<'a>(
         return None;
     }
 
-    let session = state
-        .sessions
-        .iter_mut()
-        .find(|session| session.id == session_id)?;
     if let Some(window_id) = window_id {
-        return session
-            .windows
-            .iter_mut()
-            .find(|window| window.id == window_id);
+        return state.session_window_mut(session_id, window_id);
     }
 
-    session.windows.iter_mut().find(|window| {
-        window_index
-            .map(|index| window.index == index)
-            .unwrap_or(false)
-    })
+    state.session_window_by_index_mut(session_id, window_index?)
 }
 
-fn update_activity_timestamp(window: &mut ProjectionWindow, event: &HookEvent) {
+fn update_activity_timestamp(window: &mut crate::domain::WindowState, event: &HookEvent) -> bool {
     if let Some(timestamp_ms) = event.timestamp_ms {
-        window.activity = timestamp_ms / 1000;
+        let activity = timestamp_ms / 1000;
+        if window.activity != activity {
+            window.activity = activity;
+            return true;
+        }
     }
+    false
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -1217,33 +1466,6 @@ fn non_empty(value: Option<&str>) -> Option<&str> {
 
 fn non_empty_path(path: Option<&Path>) -> Option<&Path> {
     path.filter(|path| !path.as_os_str().is_empty())
-}
-
-fn broadcast(shared: &Arc<Mutex<SharedState>>, message: ServerMessage) {
-    let subscribers: Vec<(u64, SharedWriter)> = {
-        let guard = shared.lock().expect("shared state poisoned");
-        guard
-            .subscribers
-            .iter()
-            .map(|(subscriber_id, writer)| (*subscriber_id, Arc::clone(writer)))
-            .collect()
-    };
-
-    let mut stale_subscribers = Vec::new();
-    for (subscriber_id, writer) in subscribers {
-        if send_message(&writer, &message).is_err() {
-            stale_subscribers.push(subscriber_id);
-        }
-    }
-
-    if stale_subscribers.is_empty() {
-        return;
-    }
-
-    let mut guard = shared.lock().expect("shared state poisoned");
-    for subscriber_id in stale_subscribers {
-        guard.subscribers.remove(&subscriber_id);
-    }
 }
 
 fn send_message(writer: &SharedWriter, message: &ServerMessage) -> Result<()> {
@@ -1260,93 +1482,11 @@ fn send_error(writer: &SharedWriter, message: impl Into<String>) -> Result<()> {
     )
 }
 
-fn store_state_cache(cache_path: &Path, state: &ProjectionState) {
-    // The cache only accelerates the next UI launch; live tmux synchronization must not depend on it.
-    let _ = crate::state_cache::store_path(cache_path, state);
-}
-
-fn handle_action_request(
-    shared: &Arc<Mutex<SharedState>>,
-    refresh_lock: &Arc<Mutex<()>>,
-    refresh_from_tmux: bool,
-    tmux: &dyn ServerTmuxOps,
-    request: &ActionRequest,
-) -> ActionResultKind {
-    let tmux_socket_path = {
-        let guard = shared.lock().expect("shared state poisoned");
-        guard.tmux_socket_path.clone()
-    };
-    let action_options = match &request.action {
-        Action::CreateWindow { session_id, .. } => {
-            match resolve_create_window_path(shared, tmux, &tmux_socket_path, session_id) {
-                Ok(create_window_path) => ActionExecutionOptions { create_window_path },
-                Err(error) => {
-                    return ActionResultKind::Error {
-                        message: format!("failed to resolve working directory: {error:#}"),
-                    };
-                }
-            }
-        }
-        _ => ActionExecutionOptions::default(),
-    };
-    let action_result = tmux.execute_action(&tmux_socket_path, request, &action_options);
-    if let Ok(ActionEffect::CreatedWindow {
-        session_id,
-        window_id,
-        current_path: Some(current_path),
-    }) = &action_result
-    {
-        let mut guard = shared.lock().expect("shared state poisoned");
-        guard
-            .workdirs
-            .record_created_window(session_id, window_id, current_path.clone());
-    }
-    let refresh_result = match &action_result {
-        Ok(effect) => {
-            refresh_state_for_action(shared, refresh_lock, refresh_from_tmux, tmux, effect)
-        }
-        Err(_) => refresh_state(shared, refresh_lock, refresh_from_tmux, tmux),
-    };
-
-    match (action_result, refresh_result) {
-        (Ok(effect), Ok(_)) => ActionResultKind::Ok {
-            outcome: effect.outcome(),
-        },
-        (Err(action_error), Ok(_)) => ActionResultKind::Error {
-            message: action_error.to_string(),
-        },
-        (Ok(_), Err(refresh_error)) => ActionResultKind::Error {
-            message: format!("action succeeded but failed to refresh state: {refresh_error:#}"),
-        },
-        (Err(action_error), Err(refresh_error)) => ActionResultKind::Error {
-            message: format!(
-                "{action_error:#}; additionally failed to refresh state: {refresh_error:#}"
-            ),
-        },
-    }
-}
-
 fn tmux_client(tmux_socket_path: &Path) -> TmuxCli {
     TmuxCli {
         socket_name: None,
         socket_path: Some(tmux_socket_path.to_path_buf()),
     }
-}
-
-fn resolve_create_window_path(
-    shared: &Arc<Mutex<SharedState>>,
-    tmux: &dyn ServerTmuxOps,
-    tmux_socket_path: &Path,
-    session_id: &str,
-) -> Result<Option<PathBuf>> {
-    let live_workdirs = tmux.inspect_session_workdirs(tmux_socket_path, session_id)?;
-    let mut guard = shared.lock().expect("shared state poisoned");
-    guard
-        .workdirs
-        .record_session_workdirs(session_id, &live_workdirs);
-    Ok(guard
-        .workdirs
-        .resolve_session_path(&guard.state, session_id, &live_workdirs))
 }
 
 fn execute_action_request(
@@ -1549,6 +1689,36 @@ mod tests {
                 .context("failed to read test client message")?
                 .context("server closed test connection")
         }
+
+        fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<ServerMessage>> {
+            self.reader
+                .get_mut()
+                .set_read_timeout(Some(timeout))
+                .context("failed to configure test client read timeout")?;
+            let result = match crate::ipc::read_message(&mut self.reader) {
+                Ok(message) => Ok(message),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error).context("failed to read test client message"),
+            };
+            let reset = self
+                .reader
+                .get_mut()
+                .set_read_timeout(None)
+                .context("failed to reset test client read timeout");
+
+            match (result, reset) {
+                (Err(error), _) => Err(error),
+                (Ok(_), Err(error)) => Err(error),
+                (Ok(message), Ok(())) => Ok(message),
+            }
+        }
     }
 
     fn wait_for_stream(socket_path: &Path) -> Result<UnixStream> {
@@ -1702,6 +1872,7 @@ mod tests {
     #[derive(Debug)]
     struct MockServerTmux {
         snapshots: Mutex<VecDeque<ProjectionState>>,
+        snapshot_calls: Mutex<usize>,
         session_workdirs: Mutex<VecDeque<std::result::Result<Vec<WindowWorkdir>, String>>>,
         action_results: Mutex<VecDeque<std::result::Result<ActionEffect, String>>>,
         requests: Mutex<Vec<ActionRequest>>,
@@ -1715,6 +1886,7 @@ mod tests {
         ) -> Self {
             Self {
                 snapshots: Mutex::new(snapshots.into()),
+                snapshot_calls: Mutex::new(0),
                 session_workdirs: Mutex::new(VecDeque::new()),
                 action_results: Mutex::new(action_results.into()),
                 requests: Mutex::new(Vec::new()),
@@ -1736,6 +1908,13 @@ mod tests {
                 .clone()
         }
 
+        fn snapshot_calls(&self) -> usize {
+            *self
+                .snapshot_calls
+                .lock()
+                .expect("tmux snapshot call counter poisoned")
+        }
+
         fn push_session_workdirs(&self, result: std::result::Result<Vec<WindowWorkdir>, String>) {
             self.session_workdirs
                 .lock()
@@ -1746,6 +1925,10 @@ mod tests {
 
     impl ServerTmuxOps for MockServerTmux {
         fn snapshot_projection(&self, _tmux_socket_path: &Path) -> Result<ProjectionState> {
+            *self
+                .snapshot_calls
+                .lock()
+                .expect("tmux snapshot call counter poisoned") += 1;
             self.snapshots
                 .lock()
                 .expect("tmux snapshots poisoned")
@@ -1923,6 +2106,73 @@ mod tests {
         Ok(())
     }
 
+    fn assert_hook_refresh_retries_until_active_window_projected(event: HookName) -> Result<()> {
+        let sandbox = TestDir::new("server-active-window-hook-retry")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        add_projection_window(&mut initial_state, "$1", "@2", "editor", 1, false);
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let stale_state = initial_state.clone();
+        let mut refreshed_state = initial_state.clone();
+        refreshed_state.sessions[0].active_window_id = Some(String::from("@2"));
+        refreshed_state.sessions[0].windows[0].active = false;
+        refreshed_state.sessions[0].windows[1].active = true;
+        refreshed_state.clients[0].current_window_id = Some(String::from("@2"));
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![stale_state, refreshed_state.clone()],
+            vec![],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux,
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@2")),
+            window_index: Some(1),
+            pane_id: Some(String::from("%2")),
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+
+        Ok(())
+    }
+
     #[test]
     fn server_handles_subscribe_hook_and_shutdown_flows() -> Result<()> {
         let sandbox = TestDir::new("server-ipc")?;
@@ -1966,13 +2216,7 @@ mod tests {
                 kind: AckKind::HookEvent,
             })
         );
-        assert_eq!(
-            subscriber.recv()?,
-            ServerMessage::StateUpdated(StateUpdated {
-                generation: 2,
-                state: ProjectionState::empty(&tmux_socket_path),
-            })
-        );
+        assert_eq!(subscriber.recv_timeout(Duration::from_millis(150))?, None);
 
         drop(hook);
         drop(subscriber);
@@ -2047,16 +2291,16 @@ mod tests {
         alerted_state.sessions[0].windows[0].bell_flag = true;
         alerted_state.sessions[0].windows[0].activity = 1;
         assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
             subscriber.recv()?,
             ServerMessage::StateUpdated(StateUpdated {
                 generation: 2,
                 state: alerted_state,
-            })
-        );
-        assert_eq!(
-            hook.recv()?,
-            ServerMessage::Ack(Ack {
-                kind: AckKind::HookEvent,
             })
         );
 
@@ -2107,7 +2351,7 @@ mod tests {
             tmux_socket_path.clone(),
             snapshot_without_alert.clone(),
             true,
-            tmux,
+            tmux.clone(),
         )?;
 
         let server_thread = thread::spawn(move || server.run());
@@ -2133,29 +2377,31 @@ mod tests {
         expected_state.sessions[0].windows[0].bell_flag = true;
         expected_state.sessions[0].windows[0].activity = 42;
         assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
             subscriber.recv()?,
             ServerMessage::StateUpdated(StateUpdated {
                 generation: 2,
                 state: expected_state,
             })
         );
-        assert_eq!(
-            hook.recv()?,
-            ServerMessage::Ack(Ack {
-                kind: AckKind::HookEvent,
-            })
-        );
+        assert_eq!(subscriber.recv_timeout(Duration::from_millis(150))?, None);
 
         drop(hook);
         drop(subscriber);
         shutdown_server(&sidecar_paths.socket_path)?;
         server_thread.join().expect("server thread panicked")?;
+        assert_eq!(tmux.snapshot_calls(), 1);
 
         Ok(())
     }
 
     #[test]
-    fn cached_bell_alert_survives_later_non_alert_hook_refresh() -> Result<()> {
+    fn retained_bell_alert_survives_later_non_alert_hook_refresh() -> Result<()> {
         let sandbox = TestDir::new("server-alert-preserve")?;
         let tmux_socket_path = sandbox.path.join("tmux.sock");
         let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
@@ -2173,7 +2419,7 @@ mod tests {
             tmux_socket_path.clone(),
             initial_state.clone(),
             true,
-            tmux,
+            tmux.clone(),
         )?;
 
         let server_thread = thread::spawn(move || server.run());
@@ -2195,32 +2441,25 @@ mod tests {
             timestamp_ms: None,
         }))?;
 
-        let mut expected_state = snapshot_without_alert;
-        expected_state.sessions[0].windows[0].bell_flag = true;
-        assert_eq!(
-            subscriber.recv()?,
-            ServerMessage::StateUpdated(StateUpdated {
-                generation: 2,
-                state: expected_state,
-            })
-        );
         assert_eq!(
             hook.recv()?,
             ServerMessage::Ack(Ack {
                 kind: AckKind::HookEvent,
             })
         );
+        assert_eq!(subscriber.recv_timeout(Duration::from_millis(150))?, None);
 
         drop(hook);
         drop(subscriber);
         shutdown_server(&sidecar_paths.socket_path)?;
         server_thread.join().expect("server thread panicked")?;
+        assert_eq!(tmux.snapshot_calls(), 1);
 
         Ok(())
     }
 
     #[test]
-    fn cached_bell_alert_clears_on_select_hook_when_snapshot_has_no_alert() -> Result<()> {
+    fn retained_bell_alert_clears_on_select_hook_when_snapshot_has_no_alert() -> Result<()> {
         let sandbox = TestDir::new("server-alert-clear")?;
         let tmux_socket_path = sandbox.path.join("tmux.sock");
         let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
@@ -2261,16 +2500,16 @@ mod tests {
         }))?;
 
         assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
             subscriber.recv()?,
             ServerMessage::StateUpdated(StateUpdated {
                 generation: 2,
                 state: snapshot_without_alert,
-            })
-        );
-        assert_eq!(
-            hook.recv()?,
-            ServerMessage::Ack(Ack {
-                kind: AckKind::HookEvent,
             })
         );
 
@@ -2283,7 +2522,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_bell_alert_clears_on_action_refresh_when_client_views_window() -> Result<()> {
+    fn retained_bell_alert_clears_on_action_refresh_when_client_views_window() -> Result<()> {
         let sandbox = TestDir::new("server-alert-action-clear")?;
         let tmux_socket_path = sandbox.path.join("tmux.sock");
         let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
@@ -2336,6 +2575,7 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id,
+                generation: 2,
                 result: ActionResultKind::Ok { outcome: None },
             })
         );
@@ -2348,7 +2588,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_bell_alert_clears_on_hook_refresh_when_client_views_window() -> Result<()> {
+    fn retained_bell_alert_clears_on_hook_refresh_when_client_views_window() -> Result<()> {
         let sandbox = TestDir::new("server-alert-client-view-clear")?;
         let tmux_socket_path = sandbox.path.join("tmux.sock");
         let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
@@ -2390,16 +2630,16 @@ mod tests {
         }))?;
 
         assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
             subscriber.recv()?,
             ServerMessage::StateUpdated(StateUpdated {
                 generation: 2,
                 state: snapshot_without_alert,
-            })
-        );
-        assert_eq!(
-            hook.recv()?,
-            ServerMessage::Ack(Ack {
-                kind: AckKind::HookEvent,
             })
         );
 
@@ -2597,8 +2837,9 @@ mod tests {
             timestamp_ms: None,
         });
 
+        let domain = projection.to_domain_state();
         assert_eq!(
-            tracker.resolve_session_path(&projection, "$1", &[]),
+            tracker.resolve_session_path(&domain, "$1", &[]),
             Some(Path::new("/tmp/two").to_path_buf())
         );
     }
@@ -2660,6 +2901,7 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id,
+                generation: 2,
                 result: ActionResultKind::Ok {
                     outcome: Some(ActionOutcome::CreatedWindow {
                         session_id: String::from("$1"),
@@ -2735,6 +2977,7 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id.clone(),
+                generation: 2,
                 result: ActionResultKind::Ok {
                     outcome: Some(ActionOutcome::CreatedWindow {
                         session_id: String::from("$1"),
@@ -2803,6 +3046,7 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id.clone(),
+                generation: 2,
                 result: ActionResultKind::Ok { outcome: None },
             })
         );
@@ -2878,6 +3122,103 @@ mod tests {
     }
 
     #[test]
+    fn hook_reconciliation_coalesces_multiple_dirty_scopes() -> Result<()> {
+        let sandbox = TestDir::new("server-hook-coalesce")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        add_projection_window(&mut initial_state, "$1", "@2", "editor", 1, false);
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let mut reconciled_state = initial_state.clone();
+        reconciled_state.sessions[0].name = String::from("renamed");
+        reconciled_state.sessions[0].active_window_id = Some(String::from("@2"));
+        reconciled_state.sessions[0].windows[0].active = false;
+        reconciled_state.sessions[0].windows[1].active = true;
+        reconciled_state.clients[0].current_window_id = Some(String::from("@2"));
+        let tmux = std::sync::Arc::new(MockServerTmux::new(vec![reconciled_state.clone()], vec![]));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut rename_hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        rename_hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::SessionRenamed,
+            session_id: Some(String::from("$1")),
+            window_id: None,
+            window_index: None,
+            pane_id: None,
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        let mut select_hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        select_hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::AfterSelectWindow,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@2")),
+            window_index: Some(1),
+            pane_id: Some(String::from("%2")),
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        assert_eq!(
+            rename_hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
+            select_hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: reconciled_state,
+            })
+        );
+        assert_eq!(subscriber.recv_timeout(Duration::from_millis(150))?, None);
+
+        drop(rename_hook);
+        drop(select_hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(tmux.snapshot_calls(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn after_select_window_hook_retries_until_active_window_is_projected() -> Result<()> {
+        assert_hook_refresh_retries_until_active_window_projected(HookName::AfterSelectWindow)
+    }
+
+    #[test]
+    fn session_window_changed_hook_retries_until_active_window_is_projected() -> Result<()> {
+        assert_hook_refresh_retries_until_active_window_projected(HookName::SessionWindowChanged)
+    }
+
+    #[test]
     fn server_broadcasts_refreshed_state_before_action_success() -> Result<()> {
         let sandbox = TestDir::new("server-action-success")?;
         let tmux_socket_path = sandbox.path.join("tmux.sock");
@@ -2929,6 +3270,7 @@ mod tests {
             client.recv()?,
             ServerMessage::ActionResult(ActionResult {
                 request_id: request.request_id.clone(),
+                generation: 2,
                 result: ActionResultKind::Ok {
                     outcome: Some(ActionOutcome::CreatedSession {
                         session_id: String::from("$9"),
@@ -2989,6 +3331,7 @@ mod tests {
         match client.recv()? {
             ServerMessage::ActionResult(ActionResult {
                 request_id,
+                generation: 2,
                 result: ActionResultKind::Error { message },
             }) => {
                 assert_eq!(request_id, request.request_id);

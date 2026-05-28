@@ -9,8 +9,16 @@ use std::{
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::model::{Client, ClientName, Session, TmuxState, Window, WindowAlert};
+pub use crate::projection::{
+    ProjectionClient, ProjectionSession, ProjectionState, ProjectionWindow,
+};
 
+/// Runtime protocol stays on v2 while the rewrite stages the public CLI first.
+///
+/// The intended clean-break follow-up keeps newline-delimited JSON and local Unix
+/// sockets, but renames the envelopes around explicit client/server request,
+/// query, snapshot, and problem message families. See `ARCHITECTURE.md` for the
+/// target protocol direction.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
@@ -63,6 +71,11 @@ pub struct HelloAck {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HookEvent {
+    /// Current shell-safe hook payload.
+    ///
+    /// The rewrite direction is to narrow this into `HookNotify` plus a typed
+    /// hook scope that carries only stable IDs, indexes, paths, client names,
+    /// and timestamps—never shell-expanded session or window names.
     pub tmux_socket_path: PathBuf,
     pub event: HookName,
     pub session_id: Option<String>,
@@ -136,6 +149,8 @@ impl ActionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionResult {
     pub request_id: String,
+    /// Server projection generation after the action's reconcile attempt.
+    pub generation: u64,
     pub result: ActionResultKind,
 }
 
@@ -184,6 +199,10 @@ pub struct ErrorMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type", content = "payload")]
 pub enum ClientMessage {
+    /// Current v2 client-to-server message envelope.
+    ///
+    /// A later clean-break protocol can rename these variants without changing
+    /// the current staged runtime behavior.
     Hello(Hello),
     HookEvent(HookEvent),
     Subscribe(Subscribe),
@@ -195,171 +214,15 @@ pub enum ClientMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type", content = "payload")]
 pub enum ServerMessage {
+    /// Current v2 server-to-client message envelope.
+    ///
+    /// The rewrite direction is to split subscription snapshots, action/query
+    /// replies, and problems into more explicit result types.
     HelloAck(HelloAck),
     Ack(Ack),
     StateUpdated(StateUpdated),
     ActionResult(ActionResult),
     Error(ErrorMessage),
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectionState {
-    pub tmux_socket_path: PathBuf,
-    pub sessions: Vec<ProjectionSession>,
-    pub clients: Vec<ProjectionClient>,
-}
-
-impl ProjectionState {
-    pub fn empty(tmux_socket_path: impl Into<PathBuf>) -> Self {
-        Self {
-            tmux_socket_path: tmux_socket_path.into(),
-            sessions: Vec::new(),
-            clients: Vec::new(),
-        }
-    }
-
-    pub fn from_tmux(tmux_socket_path: impl Into<PathBuf>, tmux_state: TmuxState) -> Self {
-        Self {
-            tmux_socket_path: tmux_socket_path.into(),
-            sessions: tmux_state
-                .sessions
-                .into_iter()
-                .map(|session| ProjectionSession {
-                    id: session.id,
-                    name: session.name,
-                    attached_count: session.attached_count,
-                    active_window_id: session.active_window_id,
-                    windows: session
-                        .windows
-                        .into_iter()
-                        .map(|window| {
-                            let state = window.window_state();
-                            ProjectionWindow {
-                                id: state.id,
-                                index: state.index,
-                                name: state.name,
-                                active: state.active,
-                                activity: state.activity,
-                                activity_flag: state.activity_flag,
-                                bell_flag: state.bell_flag,
-                                silence_flag: state.silence_flag,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-            clients: tmux_state
-                .clients
-                .into_iter()
-                .map(|client| ProjectionClient {
-                    name: client.name.0,
-                    session_id: client.session_id,
-                    current_window_id: client.current_window_id,
-                    activity: client.activity,
-                    tty: client.tty,
-                })
-                .collect(),
-        }
-    }
-
-    pub fn into_tmux_state(self) -> TmuxState {
-        TmuxState {
-            sessions: self
-                .sessions
-                .into_iter()
-                .map(|session| Session {
-                    id: session.id,
-                    name: session.name,
-                    attached_count: session.attached_count,
-                    active_window_id: session.active_window_id,
-                    windows: session
-                        .windows
-                        .into_iter()
-                        .map(|window| {
-                            let mut flags = String::new();
-                            if window.active {
-                                flags.push('*');
-                            }
-                            if window.activity_flag {
-                                flags.push('#');
-                            }
-                            if window.bell_flag {
-                                flags.push('!');
-                            }
-                            if window.silence_flag {
-                                flags.push('~');
-                            }
-
-                            Window {
-                                id: window.id,
-                                index: window.index,
-                                name: window.name,
-                                active: window.active,
-                                flags,
-                                alert: WindowAlert::from_indicators(
-                                    window.activity_flag,
-                                    window.bell_flag,
-                                    window.silence_flag,
-                                ),
-                                activity: window.activity,
-                                activity_flag: window.activity_flag,
-                                silence_flag: window.silence_flag,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-            clients: self
-                .clients
-                .into_iter()
-                .map(|client| Client {
-                    name: ClientName(client.name),
-                    session_id: client.session_id,
-                    current_window_id: client.current_window_id,
-                    activity: client.activity,
-                    tty: client.tty,
-                })
-                .collect(),
-        }
-    }
-
-    pub fn active_alert_count(&self) -> usize {
-        self.sessions
-            .iter()
-            .flat_map(|session| &session.windows)
-            .filter(|window| window.bell_flag)
-            .count()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectionSession {
-    pub id: String,
-    pub name: String,
-    pub attached_count: u32,
-    pub active_window_id: Option<String>,
-    pub windows: Vec<ProjectionWindow>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectionWindow {
-    pub id: String,
-    pub index: u32,
-    pub name: String,
-    pub active: bool,
-    pub activity: u64,
-    pub activity_flag: bool,
-    pub bell_flag: bool,
-    pub silence_flag: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProjectionClient {
-    pub name: String,
-    pub session_id: String,
-    pub current_window_id: Option<String>,
-    pub activity: u64,
-    pub tty: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,7 +231,6 @@ pub struct SidecarPaths {
     pub socket_path: PathBuf,
     pub lock_path: PathBuf,
     pub pid_path: PathBuf,
-    pub cache_path: PathBuf,
 }
 
 impl SidecarPaths {
@@ -396,7 +258,6 @@ impl SidecarPaths {
             socket_path: runtime_dir.join(format!("{stem}.sock")),
             lock_path: runtime_dir.join(format!("{stem}.lock")),
             pid_path: runtime_dir.join(format!("{stem}.pid")),
-            cache_path: runtime_dir.join(format!("{stem}.state.json")),
         }
     }
 }
@@ -507,7 +368,6 @@ mod tests {
         );
         assert_eq!(first.lock_path.file_name(), second.lock_path.file_name());
         assert_eq!(first.pid_path.file_name(), second.pid_path.file_name());
-        assert_eq!(first.cache_path.file_name(), second.cache_path.file_name());
         assert_eq!(
             first.runtime_dir,
             Path::new("/run/user/1000").join("tmux-sidecar")

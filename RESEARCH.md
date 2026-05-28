@@ -1,5 +1,7 @@
 # Research
 
+> Historical note: this document captures pre-rewrite investigation and MVP trade-offs. The current shipped runtime is the hook-driven sidecar daemon described in `README.md` and `ARCHITECTURE.md`.
+
 Research date: 2026-05-20.
 
 ## Decisions

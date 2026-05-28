@@ -1,61 +1,12 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::PathBuf};
 
+pub use crate::domain::{
+    ClientName, ClientNode, DomainState, Focus, SessionId, SessionNode, SessionState, TreeRow,
+    TreeRowKind, WindowAlert, WindowId, WindowState, WinlinkKey,
+};
 use crate::input::InputBuffer;
 
-pub type SessionId = String;
-pub type WindowId = String;
-
 const JUMP_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnmASDFGHJKLQWERTYUIOPZXCVBNM";
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct WinlinkKey {
-    pub session_id: SessionId,
-    pub window_id: WindowId,
-}
-
-impl WinlinkKey {
-    pub fn new(session_id: impl Into<SessionId>, window_id: impl Into<WindowId>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            window_id: window_id.into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SessionState {
-    pub id: SessionId,
-    pub name: String,
-    pub attached_count: u32,
-    pub active_window_id: Option<WindowId>,
-    pub windows: BTreeMap<WinlinkKey, WindowState>,
-}
-
-impl SessionState {
-    pub fn active_window_key(&self) -> Option<WinlinkKey> {
-        self.active_window_id
-            .as_ref()
-            .map(|window_id| WinlinkKey::new(self.id.clone(), window_id.clone()))
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct WindowState {
-    pub id: WindowId,
-    pub index: u32,
-    pub name: String,
-    pub active: bool,
-    pub activity: u64,
-    pub activity_flag: bool,
-    pub bell_flag: bool,
-    pub silence_flag: bool,
-}
-
-impl WindowState {
-    pub fn alert(&self) -> WindowAlert {
-        WindowAlert::from_indicators(self.activity_flag, self.bell_flag, self.silence_flag)
-    }
-}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxState {
@@ -64,82 +15,123 @@ pub struct TmuxState {
 }
 
 impl TmuxState {
+    pub fn to_domain_state(&self) -> DomainState {
+        let mut state = DomainState::empty(PathBuf::new());
+
+        for (order, session) in self.sessions.iter().enumerate() {
+            state.sessions.insert(
+                session.id.clone(),
+                SessionNode {
+                    id: session.id.clone(),
+                    name: session.name.clone(),
+                    attached_count: session.attached_count,
+                    active_window_id: session.active_window_id.clone(),
+                    order,
+                },
+            );
+
+            for window in &session.windows {
+                state.winlinks.insert(
+                    window.winlink_key(session.id.clone()),
+                    window.window_state(),
+                );
+            }
+        }
+
+        for (order, client) in self.clients.iter().enumerate() {
+            state.clients.insert(
+                client.name.clone(),
+                ClientNode {
+                    name: client.name.clone(),
+                    session_id: client.session_id.clone(),
+                    current_window_id: client.current_window_id.clone(),
+                    activity: client.activity,
+                    tty: client.tty.clone(),
+                    order,
+                },
+            );
+        }
+
+        state
+    }
+
+    pub fn from_domain_state(state: DomainState) -> Self {
+        let sessions = state
+            .ordered_sessions()
+            .into_iter()
+            .map(|session| Session {
+                id: session.id.clone(),
+                name: session.name.clone(),
+                attached_count: session.attached_count,
+                active_window_id: session.active_window_id.clone(),
+                windows: state
+                    .session_windows(&session.id)
+                    .into_iter()
+                    .map(|(_, window)| Window::from_window_state(window))
+                    .collect(),
+            })
+            .collect();
+        let clients = state
+            .ordered_clients()
+            .into_iter()
+            .map(|client| Client {
+                name: client.name.clone(),
+                session_id: client.session_id.clone(),
+                current_window_id: client.current_window_id.clone(),
+                activity: client.activity,
+                tty: client.tty.clone(),
+            })
+            .collect();
+
+        Self { sessions, clients }
+    }
+
     pub fn tree_rows(&self) -> Vec<TreeRow> {
-        self.tree_rows_for_client(None)
+        self.to_domain_state().tree_rows()
     }
 
     pub fn tree_rows_for_client(&self, target_client: Option<&ClientName>) -> Vec<TreeRow> {
-        let visible_window = self.visible_window_key(target_client);
-        let mut rows = Vec::new();
-
-        for session in &self.sessions {
-            rows.push(TreeRow::session(session));
-
-            for window in &session.windows {
-                let window_key = window.winlink_key(session.id.clone());
-                rows.push(TreeRow::window(
-                    session.id.clone(),
-                    window,
-                    visible_window.as_ref() == Some(&window_key),
-                ));
-            }
-
-            rows.push(TreeRow::create_window(session.id.clone()));
-        }
-
-        rows.push(TreeRow::create_session());
-        rows
+        self.to_domain_state().tree_rows_for_client(target_client)
     }
 
     pub fn visible_window(
         &self,
         target_client: Option<&ClientName>,
     ) -> Option<(&Session, &Window)> {
-        let client = self.visible_client(target_client)?;
+        let key = self.visible_window_key(target_client)?;
         let session = self
             .sessions
             .iter()
-            .find(|session| session.id == client.session_id)?;
-        let window_id = client
-            .current_window_id
-            .as_deref()
-            .or(session.active_window_id.as_deref())?;
+            .find(|session| session.id == key.session_id)?;
         let window = session
             .windows
             .iter()
-            .find(|window| window.id == window_id)?;
-
+            .find(|window| window.id == key.window_id)?;
         Some((session, window))
     }
 
     pub fn visible_window_key(&self, target_client: Option<&ClientName>) -> Option<WinlinkKey> {
-        self.visible_window(target_client)
-            .map(|(session, window)| window.winlink_key(session.id.clone()))
+        self.to_domain_state().visible_window_key(target_client)
     }
 
     pub fn session_states(&self) -> BTreeMap<SessionId, SessionState> {
-        self.sessions
-            .iter()
-            .map(|session| (session.id.clone(), session.session_state()))
-            .collect()
+        self.to_domain_state().session_states()
     }
 
     pub fn visible_session(&self, target_client: Option<&ClientName>) -> Option<&Session> {
-        if let Some((session, _)) = self.visible_window(target_client) {
-            return Some(session);
-        }
-
-        let client = self.visible_client(target_client)?;
+        let session_id = self
+            .to_domain_state()
+            .visible_session(target_client)
+            .map(|session| session.id.clone())?;
         self.sessions
             .iter()
-            .find(|session| session.id == client.session_id)
+            .find(|session| session.id == session_id)
     }
+}
 
-    fn visible_client(&self, target_client: Option<&ClientName>) -> Option<&Client> {
-        match target_client {
-            Some(name) => self.clients.iter().find(|client| &client.name == name),
-            None => self.clients.iter().max_by_key(|client| client.activity),
-        }
+impl From<DomainState> for TmuxState {
+    fn from(state: DomainState) -> Self {
+        Self::from_domain_state(state)
     }
 }
 
@@ -171,31 +163,6 @@ impl Session {
                 .map(|window| (window.winlink_key(self.id.clone()), window.window_state()))
                 .collect(),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WindowAlert {
-    #[default]
-    None,
-    Bell,
-}
-
-impl WindowAlert {
-    pub fn from_indicators(_has_activity: bool, has_bell: bool, _has_silence: bool) -> Self {
-        if has_bell { Self::Bell } else { Self::None }
-    }
-
-    pub fn from_flags(flags: &str) -> Self {
-        Self::from_indicators(
-            flags.contains('#'),
-            flags.contains('!'),
-            flags.contains('~'),
-        )
-    }
-
-    pub fn is_alerting(self) -> bool {
-        matches!(self, Self::Bell)
     }
 }
 
@@ -233,6 +200,34 @@ impl Window {
         }
     }
 
+    fn from_window_state(window: &WindowState) -> Self {
+        let mut flags = String::new();
+        if window.active {
+            flags.push('*');
+        }
+        if window.activity_flag {
+            flags.push('#');
+        }
+        if window.bell_flag {
+            flags.push('!');
+        }
+        if window.silence_flag {
+            flags.push('~');
+        }
+
+        Self {
+            id: window.id.clone(),
+            index: window.index,
+            name: window.name.clone(),
+            active: window.active,
+            flags,
+            alert: window.alert(),
+            activity: window.activity,
+            activity_flag: window.activity_flag,
+            silence_flag: window.silence_flag,
+        }
+    }
+
     pub fn set_flags(&mut self, flags: impl Into<String>) {
         self.flags = flags.into();
         self.activity_flag = self.flags.contains('#');
@@ -246,43 +241,12 @@ impl Window {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientName(pub String);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
     pub name: ClientName,
     pub session_id: SessionId,
     pub current_window_id: Option<WindowId>,
     pub activity: u64,
     pub tty: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub enum Focus {
-    #[default]
-    CreateSession,
-    Session(SessionId),
-    Window {
-        session_id: SessionId,
-        window_id: WindowId,
-    },
-    CreateWindow(SessionId),
-}
-
-impl Focus {
-    pub fn window(session_id: impl Into<SessionId>, window_id: impl Into<WindowId>) -> Self {
-        Self::Window {
-            session_id: session_id.into(),
-            window_id: window_id.into(),
-        }
-    }
-
-    pub fn winlink(key: WinlinkKey) -> Self {
-        Self::Window {
-            session_id: key.session_id,
-            window_id: key.window_id,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -392,95 +356,6 @@ pub struct FocusReconcile {
     pub recovery: FocusRecovery,
     pub row_index: usize,
     pub focus: Focus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TreeRowKind {
-    CreateSession,
-    Session {
-        id: SessionId,
-        name: String,
-        attached_count: u32,
-    },
-    Window {
-        session_id: SessionId,
-        id: WindowId,
-        index: u32,
-        name: String,
-        active: bool,
-        alert: WindowAlert,
-    },
-    CreateWindow {
-        session_id: SessionId,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeRow {
-    pub focus: Focus,
-    pub depth: u8,
-    pub kind: TreeRowKind,
-}
-
-impl TreeRow {
-    fn create_session() -> Self {
-        Self {
-            focus: Focus::CreateSession,
-            depth: 0,
-            kind: TreeRowKind::CreateSession,
-        }
-    }
-
-    fn session(session: &Session) -> Self {
-        Self {
-            focus: Focus::Session(session.id.clone()),
-            depth: 0,
-            kind: TreeRowKind::Session {
-                id: session.id.clone(),
-                name: session.name.clone(),
-                attached_count: session.attached_count,
-            },
-        }
-    }
-
-    fn window(session_id: SessionId, window: &Window, active: bool) -> Self {
-        Self {
-            focus: Focus::window(session_id.clone(), window.id.clone()),
-            depth: 1,
-            kind: TreeRowKind::Window {
-                session_id,
-                id: window.id.clone(),
-                index: window.index,
-                name: window.name.clone(),
-                active,
-                alert: window.alert,
-            },
-        }
-    }
-
-    fn create_window(session_id: SessionId) -> Self {
-        Self {
-            focus: Focus::CreateWindow(session_id.clone()),
-            depth: 1,
-            kind: TreeRowKind::CreateWindow { session_id },
-        }
-    }
-
-    pub fn active(&self) -> bool {
-        match &self.kind {
-            TreeRowKind::Window { active, .. } => *active,
-            TreeRowKind::CreateSession
-            | TreeRowKind::Session { .. }
-            | TreeRowKind::CreateWindow { .. } => false,
-        }
-    }
-
-    pub fn alert(&self) -> Option<WindowAlert> {
-        match &self.kind {
-            TreeRowKind::Window { alert, .. } if alert.is_alerting() => Some(*alert),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

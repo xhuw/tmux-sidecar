@@ -1,5 +1,7 @@
 # Hook/server rewrite plan
 
+> Historical note: this file records the staged rewrite plan that produced the current architecture. For the live command surface and runtime behavior, prefer `README.md` and `ARCHITECTURE.md`.
+
 This plan replaces the polling-centered MVP with the architecture in `ARCHITECTURE.md`. Treat the existing implementation as reference material and a source of reusable tests, not as the structure to preserve. Reuse small pieces only when they still fit the new server/client design, such as tmux format parsers, safe command execution, input editing, tree rendering, and focus reconciliation.
 
 ## Phase 0: confirm baseline and preserve behavior

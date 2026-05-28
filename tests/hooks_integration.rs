@@ -314,6 +314,73 @@ fn alert_bell_hook_marks_unattached_session_alerts_for_subscribers()
 
 #[test]
 #[serial]
+fn alert_bell_hook_broadcasts_to_multiple_subscribers() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    unsafe {
+        env::set_var(
+            "CARGO_BIN_EXE_tmux-sidecar",
+            env!("CARGO_BIN_EXE_tmux-sidecar"),
+        );
+    }
+
+    let server = AlertServer::start()?;
+    let socket_path = server.socket_path()?;
+    let program =
+        hooks::HookCommandProgram::new(vec![env!("CARGO_BIN_EXE_tmux-sidecar").to_owned()]);
+    server.tmux_cli().install_hooks(&program)?;
+
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let mut first = client::subscribe(&socket_path, None)?;
+        let mut second = client::subscribe(&socket_path, None)?;
+        first.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        second.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+        let _ = next_state(&mut first)?;
+        let _ = next_state(&mut second)?;
+        first.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
+        second.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
+
+        run_tmux(
+            &server.socket_name,
+            &[
+                "send-keys",
+                "-t",
+                "it-detached:0",
+                "printf \"\\a\"",
+                "Enter",
+            ],
+        )?;
+
+        let mut first_seen = false;
+        let mut second_seen = false;
+        for _ in 0..10 {
+            if !first_seen {
+                if let Some(state) = next_state(&mut first)? {
+                    first_seen = state_has_detached_bell(&state);
+                }
+            }
+            if !second_seen {
+                if let Some(state) = next_state(&mut second)? {
+                    second_seen = state_has_detached_bell(&state);
+                }
+            }
+            if first_seen && second_seen {
+                return Ok(());
+            }
+        }
+
+        Err("detached session bell alert was not pushed to both sidecar subscribers".into())
+    })();
+
+    let _ = client::shutdown_server(&socket_path);
+    result
+}
+
+#[test]
+#[serial]
 fn alert_bell_hook_is_visible_to_late_subscribers_after_auto_spawn()
 -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {

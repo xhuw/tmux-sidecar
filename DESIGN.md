@@ -9,7 +9,7 @@ Design principles:
 - **Sidecar, not shell replacement:** the UI should expose tmux structure without hiding tmux concepts.
 - **Keyboard-first, mouse-capable:** every workflow must be fast from the keyboard; mouse support should map to the same focus and activation model.
 - **State over decoration:** focused row, active tmux target, edit mode, and failed/reverted actions must be visually distinct.
-- **Minimal chrome:** use one tree, one footer, one help modal, and avoid secondary panels for the MVP.
+- **Minimal chrome:** use one tree, one footer, and one help modal; avoid secondary panels.
 - **Modern terminal-native glyphs:** default to Nerd Font/Powerline glyphs with straight-line geometry; provide an ASCII fallback mode for terminals without patched fonts.
 
 ## Layout
@@ -30,7 +30,7 @@ Use the alternate screen with a single full-screen view:
  󰐕 new session
 
  ────────────────────────────────────────────────────────
- Enter switch/create  s new session  c new window  r rename  x close window  ? help  q quit
+ Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x close  ? help  q quit
 ```
 
 Regions:
@@ -39,10 +39,10 @@ Regions:
 | --- | --- |
 | Header | App name, target client, current active session/window. |
 | Tree | Sessions and windows, plus explicit creation rows. |
-| Footer | Contextual key hints; changes in rename/create mode. |
+| Footer | Contextual key hints; changes in rename/create mode and error states. |
 | Modal | Centered help overlay opened with `?`. |
 
-The MVP should default to a Nerd Font/Powerline presentation using straight separators and box drawing. Avoid rounded borders, emoji, heavy ornamentation, and dense iconography. Provide an ASCII fallback profile for users whose terminal cannot render patched glyphs cleanly.
+The current build defaults to a Nerd Font/Powerline presentation using straight separators and box drawing. Avoid rounded borders, emoji, heavy ornamentation, and dense iconography. Provide an ASCII fallback profile for users whose terminal cannot render patched glyphs cleanly.
 
 ## Glyph system
 
@@ -92,27 +92,27 @@ The UI should not assume a dark background. Light and dark terminal themes must 
 | Inline edit | `[...]` | Warning prompt text; if also focused, combine with reverse-video emphasis. |
 | Disabled action | none | Muted foreground only. |
 
-The table shows ASCII markers for clarity; the default rendered UI should use the glyph system above.
+The table shows ASCII markers for clarity; the default rendered UI uses the glyph system above. Session rows do not render active badges; active state belongs to window rows only.
 
-Focus, active tmux state, and alert/notification state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, and alert owns the next right-side badge. A window can show active and alert states together.
+Focus, active tmux state, and alert state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, and alert owns the next right-side badge. A window can show active and alert states together.
 
-## Implementation plan
+## Implementation notes
 
-1. Replace the hard-coded RGB palette in `ui::theme` with terminal-default foreground/background handling and ANSI palette colors for semantic states.
-2. Render header, footer, help modal, and focused rows with terminal-native attributes such as reverse video and bold instead of custom surface fills.
-3. Keep semantic theme helpers in `ui::theme` so tree, header, and help rendering remain decoupled from palette choices.
-4. Add or update theme-focused tests and run the existing formatting, check, and test commands after the migration.
+- `ui::theme` uses terminal-native colors and attributes instead of custom RGB fills.
+- Rendering stays a pure `AppState -> frame` transform in `ui::*`.
+- The first paint can show a loading placeholder while the initial subscribed tree arrives from the sidecar daemon.
+- Snapshot-style UI tests cover the normal tree, help modal, jump labels, alerts, loading state, and startup toast.
 
 ## Alerts and notifications
 
-Window rows must show tmux bell alert state when tmux reports it. Sidecar configures tmux window monitoring with `monitor-bell on`; it does not change `monitor-activity` or `monitor-silence`. Alerts are visual only in the MVP; selecting or switching to a window lets tmux clear or preserve the alert according to normal tmux behavior.
+Window rows show tmux bell alert state when tmux reports it. tmux-sidecar configures `monitor-bell on`; it does not configure `monitor-activity` or `monitor-silence`. Alerts are visual only in the current build; selecting or switching to a window lets tmux clear or preserve the alert according to normal tmux behavior.
 
 Alert display rules:
 
-- Show alerts only on window rows, not session rows, unless a later phase adds aggregated session badges.
+- Show alerts only on window rows, not session rows.
 - Use the `alert` token and `󰂞` badge by default.
 - Do not replace the active marker with the alert marker; show all applicable badges.
-- Preserve alerts during external polling refreshes.
+- Preserve alerts across server reconciliation snapshots until tmux reports that they cleared.
 - Include the alert badge in the help modal legend.
 
 ## Interactions
@@ -122,45 +122,54 @@ Keyboard defaults:
 | Key | Behavior |
 | --- | --- |
 | `Up`/`Down`, `k`/`j` | Move focus by visible row. |
-| `Enter` | Activate focused session/window, or start creation from a `[+]` row. |
+| `gg` / `G` | Jump to the first / last visible row. |
+| `Enter` | Activate the focused session/window, or confirm the focused create flow. |
 | `s` | Start the new-session inline create flow. |
-| `c` | Start the new-window inline create flow for the focused session, or the focused window's session. |
-| `r` | Rename focused session/window. |
-| `x` | Close the focused window immediately. |
-| `Esc` | Cancel rename; for newly-created items, keep tmux's default name. |
+| `S` | Show jump labels for visible rows, then activate the chosen row immediately. |
+| `c` | Start the new-window inline create flow for the focused session. |
+| `r` | Rename the focused session or window. |
+| `x` | Close the focused session or window immediately. |
 | `?` | Open/close help modal. |
-| `q` | Quit. |
+| `q`, `Ctrl+c` | Quit. |
+
+Edit-mode defaults:
+
+| Key | Behavior |
+| --- | --- |
+| Type | Edit the name directly. |
+| `Enter` | Submit the rename or create request. |
+| `Esc` | Cancel the inline edit or pre-create prompt. |
+| `Ctrl+u` | Clear the input. |
+| `Left` / `Right` / `Home` / `End` / `Backspace` / `Delete` | Cursor editing. |
 
 Mouse defaults:
 
 | Gesture | Behavior |
 | --- | --- |
-| Click row | Move focus to row. |
-| Double-click session/window | Activate row. |
-| Click `[+]` row | Start create flow. |
-| Scroll | Move through the tree when content exceeds height. |
+| Left click | Focus and activate that row. |
+| Scroll wheel | Move focus up/down the visible tree. |
 
-Double-click rename is intentionally not used, because it conflicts with activation.
+Double-click actions are intentionally unused; single-click activation keeps mouse behavior aligned with keyboard `Enter`.
 
 ## Create and rename flow
 
-Creation is optimistic only for focus, not for naming:
+Creation is confirmed before tmux mutates state:
 
-1. Create the tmux object immediately and auto-switch to it.
-2. Focus the created row and enter inline edit mode.
-3. `Enter` submits the entered name through tmux.
-4. `Esc` leaves the tmux default name in place.
-5. If tmux rejects a submitted name, refresh from tmux and restore accurate state.
+1. Focus a `[+]` row or press `s` / `c`.
+2. Enter an optional name in the inline editor.
+3. `Enter` sends the create action through the sidecar daemon.
+4. The UI reconciles to the daemon's pushed result and focuses the created row.
+5. `Esc` cancels before any tmux object is created.
 
-Rename follows the same inline editor, except `Esc` restores the previous displayed name without issuing a tmux command.
+Rename uses the same inline editor, except the focused row already exists. `Enter` sends the rename action through the daemon, and `Esc` restores the previously displayed name without issuing a tmux command.
 
 ## Help modal
 
 The help modal should be centered, no wider than 72 columns, and include:
 
-- navigation keys
-- create/rename keys
-- active/focused/alert marker legend
+- navigation keys, including `gg` / `G`
+- create, rename, close, and jump keys
+- active / focused / alert marker legend
 - failure behavior summary: failed actions refresh from tmux
 
 The modal should not obscure terminal restoration or fatal errors; fatal startup errors are printed to stderr before the TUI starts.

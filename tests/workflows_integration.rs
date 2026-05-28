@@ -526,6 +526,164 @@ fn refresh_syncs_external_create_rename_close_reindex_and_active_changes()
 
 #[test]
 #[serial]
+fn syncs_hook_driven_active_window_and_client_session_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let mut app = server.app()?;
+    let snapshot = app.state().tmux.clone();
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_session_id = main_session.id.clone();
+    let main_window_id = main_session
+        .active_window_id
+        .clone()
+        .ok_or("missing active it-main window")?;
+    let extra_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+    let second_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .ok_or("missing it-second session")?;
+    let second_session_id = second_session.id.clone();
+    let second_window_id = second_session
+        .active_window_id
+        .clone()
+        .or_else(|| {
+            second_session
+                .windows
+                .first()
+                .map(|window| window.id.clone())
+        })
+        .ok_or("missing active it-second window")?;
+
+    run_tmux(
+        &server.socket_name,
+        &["select-window", "-t", &extra_window_id],
+    )?;
+    assert!(app.sync_with_server(Duration::from_secs(2))?);
+    assert_eq!(server.client_window_id()?, extra_window_id);
+
+    let rows = app.state().tree_rows();
+    let main_window = rows
+        .iter()
+        .find(|row| row.focus == window_focus(&main_session_id, &main_window_id))
+        .ok_or("missing original it-main window row")?;
+    let extra_window = rows
+        .iter()
+        .find(|row| row.focus == window_focus(&main_session_id, &extra_window_id))
+        .ok_or("missing it-extra window row")?;
+    assert!(!main_window.active());
+    assert!(extra_window.active());
+
+    run_tmux(
+        &server.socket_name,
+        &[
+            "switch-client",
+            "-c",
+            &server.client_name,
+            "-t",
+            &second_session_id,
+        ],
+    )?;
+    assert_eq!(server.client_session_id()?, second_session_id);
+
+    let mut switched = false;
+    for _ in 0..10 {
+        let _ = app.sync_with_server(Duration::from_millis(250))?;
+        let Some(client) = app
+            .state()
+            .tmux
+            .clients
+            .iter()
+            .find(|client| client.name.0 == server.client_name)
+        else {
+            continue;
+        };
+
+        if client.session_id == second_session_id
+            && client.current_window_id.as_deref() == Some(second_window_id.as_str())
+        {
+            switched = true;
+            break;
+        }
+    }
+    assert!(switched, "target client switch did not reach the UI state");
+
+    let rows = app.state().tree_rows();
+    let extra_window = rows
+        .iter()
+        .find(|row| row.focus == window_focus(&main_session_id, &extra_window_id))
+        .ok_or("missing it-extra window row after switch-client")?;
+    let second_window = rows
+        .iter()
+        .find(|row| row.focus == window_focus(&second_session_id, &second_window_id))
+        .ok_or("missing it-second window row after switch-client")?;
+    assert!(!extra_window.active());
+    assert!(second_window.active());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn syncs_external_session_close_without_manual_tmux_polling()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let mut app = server.app()?;
+    let second_session_id = app
+        .state()
+        .tmux
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-second session")?;
+
+    app.state_mut().focus = Focus::Session(second_session_id.clone());
+    run_tmux(
+        &server.socket_name,
+        &["kill-session", "-t", &second_session_id],
+    )?;
+
+    assert!(app.sync_with_server(Duration::from_secs(2))?);
+    assert!(
+        !app.state()
+            .tmux
+            .sessions
+            .iter()
+            .any(|session| session.id == second_session_id)
+    );
+    assert_ne!(app.state().focus, Focus::Session(second_session_id));
+    assert!(
+        app.state()
+            .tree_rows()
+            .iter()
+            .any(|row| row.focus == app.state().focus)
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn switches_session_from_keyboard_and_mouse_activation() -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {
         eprintln!("skipping integration test: tmux is unavailable");

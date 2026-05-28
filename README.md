@@ -49,8 +49,8 @@ Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x
 - **Instant context** — see all your sessions and windows at a glance in a UI subscribed to tmux-sidecar state updates
 - **One-keystroke everything** — switch, create, rename, or close without leaving the keyboard
 - **Mouse? Sure.** — click any row to jump straight to it
-- **Hook-driven sync** — tmux hooks feed a local per-socket sidecar server, so the UI stays current without querying tmux for every refresh
-- **Plugin-friendly setup** — install or refresh the hook wiring with one `run-shell -b 'tmux-sidecar install-hooks'`
+- **Hook-driven sync** — tmux hooks feed a local per-socket sidecar daemon, so the UI stays current without querying tmux for every refresh
+- **Plugin-friendly setup** — install or refresh the hook wiring with one `run-shell -b 'tmux-sidecar setup'`
 - **Bell alerts at a glance** — bell alerts stay visible so nothing gets lost in a busy session
 - **Inline rename** — rename sessions and windows without dropping to a tmux prompt, with full cursor editing
 - **Survives chaos** — if something changes in tmux behind your back, the sidecar refreshes state and focus recovers gracefully
@@ -91,7 +91,7 @@ cp target/release/tmux-sidecar ~/.local/bin/
 tmux-sidecar
 ```
 
-On startup, tmux-sidecar reuses or auto-starts a local sidecar for the current tmux socket, refreshes hooks with `install-hooks`, and subscribes the UI to server-pushed state updates.
+On startup, tmux-sidecar reuses or auto-starts a local sidecar daemon for the current tmux socket, refreshes hooks with `setup`, and subscribes the UI to server-pushed state updates. There is no persisted startup cache; the TUI shows a brief loading state until the initial sidecar snapshot arrives.
 
 For launcher-style behavior that exits as soon as you choose the destination:
 
@@ -107,14 +107,14 @@ tmux-sidecar --target-client <client-name>
 
 Not sure of the client name? `tmux list-clients` will tell you.
 
-The session tree opens full-screen and stays live through the local sidecar server.
+The session tree opens full-screen and stays live through the local sidecar daemon.
 
 ### Recommended tmux setup
 
-Add this to `~/.tmux.conf` so tmux installs or refreshes the hooks whenever the server starts or you reload the config:
+Add this to `~/.tmux.conf` so tmux installs or refreshes the hooks whenever the daemon starts or you reload the config:
 
 ```tmux
-run-shell -b 'tmux-sidecar install-hooks'
+run-shell -b 'tmux-sidecar setup'
 ```
 
 If you want the snippet generated for you:
@@ -130,7 +130,7 @@ Launching `tmux-sidecar` also refreshes the hooks automatically, but the tmux co
 For a dynamic tmux status line count of active bell alerts, install the hooks and add `query alerts` to a `#(...)` status command:
 
 ```tmux
-run-shell -b 'tmux-sidecar install-hooks'
+run-shell -b 'tmux-sidecar setup'
 set -g status-interval 1
 set -g status-right '#[fg=red]alerts #(tmux-sidecar query --socket-path #{q:socket_path} alerts)#[default] | %H:%M'
 ```
@@ -175,12 +175,14 @@ set -g status-right '#[fg=red]alerts #(tmux-sidecar query --socket-path #{q:sock
 
 | Command | Action |
 |---------|--------|
-| `install-hooks` | Install or refresh tmux-sidecar-managed hooks for the selected tmux socket |
-| `uninstall-hooks` | Remove tmux-sidecar-managed hooks from the selected tmux socket |
-| `init-plugin` | Print the recommended `run-shell -b 'tmux-sidecar install-hooks'` snippet |
-| `server` | Run the local per-socket sidecar server (normally auto-started); use `server --kill` to stop the running server for the selected tmux socket |
-| `hook` | Send one tmux hook event to the sidecar server (normally used by installed hooks) |
-| `query alerts` | Print the number of active bell alerts tracked by the sidecar server, suitable for tmux `#(...)` status lines |
+| `setup` | Install or refresh tmux-sidecar-managed hooks for the selected tmux socket |
+| `teardown` | Remove tmux-sidecar-managed hooks from the selected tmux socket |
+| `init-plugin` | Print the recommended `run-shell -b 'tmux-sidecar setup'` snippet |
+| `daemon` | Run the local per-socket sidecar daemon (normally auto-started); use `daemon --stop` to stop the running daemon for the selected tmux socket |
+| `hook` | Send one tmux hook event to the sidecar daemon (normally used by installed hooks) |
+| `query alerts` | Print the number of active bell alerts tracked by the sidecar daemon, suitable for tmux `#(...)` status lines |
+
+Compatibility aliases `install-hooks`, `uninstall-hooks`, `server`, and `daemon --kill` are still accepted for existing scripts, but `setup`, `teardown`, and `daemon --stop` are the documented names.
 
 ### Options
 
@@ -189,7 +191,6 @@ set -g status-right '#[fg=red]alerts #(tmux-sidecar query --socket-path #{q:sock
 | `--target-client <name>` | Use a specific tmux client for switching |
 | `--socket-name <name>` | Connect to a named tmux socket (`tmux -L`) |
 | `--socket-path <path>` | Connect to a socket by path (`tmux -S`) |
-| `--poll-interval-ms <ms>` | Control the UI render/input poll tick while the TUI is open (default: `500`) |
 | `--auto-quit` | Exit immediately after selecting a session or window |
 
 ### ASCII / font fallback

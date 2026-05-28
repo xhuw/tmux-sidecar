@@ -1,3 +1,5 @@
+#[path = "../src/domain/mod.rs"]
+mod domain;
 #[path = "../src/input.rs"]
 mod input;
 #[path = "../src/model.rs"]

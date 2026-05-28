@@ -231,13 +231,8 @@ impl HookCommandProgram {
         &self.argv
     }
 
-    pub fn install_hooks_shell_command(&self) -> String {
-        shell_join(
-            self.argv
-                .iter()
-                .cloned()
-                .chain([String::from("install-hooks")]),
-        )
+    pub fn setup_shell_command(&self) -> String {
+        shell_join(self.argv.iter().cloned().chain([String::from("setup")]))
     }
 }
 
@@ -346,7 +341,7 @@ pub fn configure_window_monitoring(
 }
 
 pub fn init_plugin_snippet(program: &HookCommandProgram) -> String {
-    let command = program.install_hooks_shell_command();
+    let command = program.setup_shell_command();
     let quoted = if command.contains('\'') {
         format!("\"{}\"", command.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
@@ -354,7 +349,7 @@ pub fn init_plugin_snippet(program: &HookCommandProgram) -> String {
     };
 
     format!(
-        "# tmux-sidecar hook/server rewrite\n# Installs or refreshes tmux-sidecar hooks for the current tmux server.\nrun-shell -b {quoted}\n"
+        "# tmux-sidecar setup\n# Installs or refreshes tmux-sidecar hooks for the current tmux server.\nrun-shell -b {quoted}\n"
     )
 }
 
@@ -582,12 +577,12 @@ mod tests {
     }
 
     #[test]
-    fn init_plugin_snippet_prints_run_shell_install_command() {
+    fn init_plugin_snippet_prints_run_shell_setup_command() {
         let snippet = init_plugin_snippet(&HookCommandProgram::default());
 
         assert_eq!(
             snippet,
-            "# tmux-sidecar hook/server rewrite\n# Installs or refreshes tmux-sidecar hooks for the current tmux server.\nrun-shell -b 'tmux-sidecar install-hooks'\n"
+            "# tmux-sidecar setup\n# Installs or refreshes tmux-sidecar hooks for the current tmux server.\nrun-shell -b 'tmux-sidecar setup'\n"
         );
     }
 

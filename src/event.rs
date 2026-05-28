@@ -22,9 +22,13 @@ impl From<CrosstermEvent> for AppEvent {
     }
 }
 
+pub fn read_next() -> Result<AppEvent> {
+    Ok(AppEvent::from(event::read()?))
+}
+
 pub fn poll_next(timeout: Duration) -> Result<AppEvent> {
     if event::poll(timeout)? {
-        Ok(AppEvent::from(event::read()?))
+        read_next()
     } else {
         Ok(AppEvent::Tick)
     }

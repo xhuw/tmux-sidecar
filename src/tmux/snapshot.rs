@@ -1,8 +1,14 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    path::PathBuf,
+};
 
-use crate::model::{
-    Client, ClientName, Session, SessionId, SessionState, TmuxState, Window, WindowAlert,
-    WindowState, WinlinkKey,
+use crate::{
+    domain::{
+        ClientName, ClientNode, DomainState, SessionId, SessionNode, SessionState, WindowState,
+        WinlinkKey,
+    },
+    model::TmuxState,
 };
 
 use super::{
@@ -41,47 +47,53 @@ pub struct SnapshotWindow {
 }
 
 impl SnapshotData {
-    pub fn into_state(self) -> TmuxState {
-        TmuxState {
-            sessions: self
-                .sessions
-                .into_iter()
-                .map(|session| Session {
+    pub fn into_domain_state(self, tmux_socket_path: impl Into<PathBuf>) -> DomainState {
+        let mut state = DomainState::empty(tmux_socket_path);
+
+        for (order, session) in self.sessions.into_iter().enumerate() {
+            let session_id = session.id.clone();
+            state.sessions.insert(
+                session_id.clone(),
+                SessionNode {
                     id: session.id,
                     name: session.name,
                     attached_count: session
                         .attached_count
                         .max(session.attached_clients.len() as u32),
                     active_window_id: session.active_window_id,
-                    windows: session
-                        .windows
-                        .into_iter()
-                        .map(SnapshotWindow::into_window)
-                        .collect(),
-                })
-                .collect(),
-            clients: self
-                .clients
-                .into_iter()
-                .map(|client| Client {
+                    order,
+                },
+            );
+
+            for window in session.windows {
+                let key = window.key.clone();
+                state.winlinks.insert(key, window.into_window_state());
+            }
+        }
+
+        for (order, client) in self.clients.into_iter().enumerate() {
+            state.clients.insert(
+                client.name.clone(),
+                ClientNode {
                     name: client.name,
                     session_id: client.session_id,
                     current_window_id: client.current_window_id,
                     activity: client.activity,
                     tty: client.tty,
-                })
-                .collect(),
+                    order,
+                },
+            );
         }
+
+        state
+    }
+
+    pub fn into_state(self) -> TmuxState {
+        TmuxState::from_domain_state(self.into_domain_state(PathBuf::new()))
     }
 
     pub fn into_session_states(self) -> BTreeMap<SessionId, SessionState> {
-        self.sessions
-            .into_iter()
-            .map(|session| {
-                let session_id = session.id.clone();
-                (session_id, session.into_session_state())
-            })
-            .collect()
+        self.into_domain_state(PathBuf::new()).session_states()
     }
 }
 
@@ -91,45 +103,9 @@ impl SnapshotSession {
             .as_ref()
             .map(|window_id| WinlinkKey::new(self.id.clone(), window_id.clone()))
     }
-
-    fn into_session_state(self) -> SessionState {
-        SessionState {
-            id: self.id,
-            name: self.name,
-            attached_count: self.attached_count.max(self.attached_clients.len() as u32),
-            active_window_id: self.active_window_id,
-            windows: self
-                .windows
-                .into_iter()
-                .map(|window| {
-                    let key = window.key.clone();
-                    (key, window.into_window_state())
-                })
-                .collect(),
-        }
-    }
 }
 
 impl SnapshotWindow {
-    pub fn into_window(self) -> Window {
-        let flags = self.flags.raw;
-        Window {
-            id: self.id,
-            index: self.index,
-            name: self.name,
-            active: self.active,
-            alert: WindowAlert::from_indicators(
-                self.alert_flags.has_activity,
-                self.alert_flags.has_bell,
-                self.alert_flags.has_silence,
-            ),
-            flags,
-            activity: self.activity,
-            activity_flag: self.alert_flags.has_activity,
-            silence_flag: self.alert_flags.has_silence,
-        }
-    }
-
     pub fn into_window_state(self) -> WindowState {
         WindowState {
             id: self.id,
@@ -145,7 +121,11 @@ impl SnapshotWindow {
 }
 
 pub fn collect_snapshot(socket: &SocketOptions) -> Result<TmuxState, TmuxError> {
-    Ok(collect_snapshot_data(socket)?.into_state())
+    Ok(TmuxState::from_domain_state(collect_domain_state(socket)?))
+}
+
+pub fn collect_domain_state(socket: &SocketOptions) -> Result<DomainState, TmuxError> {
+    Ok(collect_snapshot_data(socket)?.into_domain_state(socket.path.clone().unwrap_or_default()))
 }
 
 pub fn collect_snapshot_data(socket: &SocketOptions) -> Result<SnapshotData, TmuxError> {
