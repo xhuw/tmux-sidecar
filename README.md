@@ -27,7 +27,7 @@ Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequ
   work (1 attached)
   ├─ 0 shell
 ▶ ├─ 2 editor                                          ● active
-  ├─ 3 tests                                           󰂞 alert
+  ├─ 3 tests                                       [1] 󰂞 alert
   └─  new window
   notes
   ├─ 0 scratch
@@ -37,7 +37,7 @@ Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequ
   └─  new window
    new session
 ────────────────────────────────────────────────────────────────
-Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x close  ? help  q quit
+Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit
 ```
 
 > Nerd Font glyphs shown above. An ASCII fallback mode is available for any monospace font.
@@ -146,13 +146,16 @@ set -g status-right '#[fg=red]alerts #(tmux-sidecar query --socket-path #{q:sock
 | `↑` / `↓` or `k` / `j` | Move focus up/down the tree |
 | `gg` / `G` | Jump to the first / last visible row |
 | `Enter` | Switch to focused session/window, or create from a `[+]` row |
-| `s` | Start the new-session inline create flow |
-| `S` | Show jump labels for visible rows, then switch immediately after choosing one |
+| `1`-`9`, `0` | Jump directly to the numbered alert window (`0` is the tenth alert) |
+| `n` | Start the new-session inline create flow |
+| `s` | Show jump labels for visible rows, then switch immediately after choosing one |
 | `c` | Start the new-window inline create flow for the focused session, or for the focused window's session |
 | `r` | Rename the focused session or window (inline, no prompts) |
 | `x` | Close the focused session or window immediately |
 | `?` | Open/close the help modal |
 | `q` or `Ctrl+c` | Quit |
+
+The first 10 alert rows in visible tree order are numbered `1`-`9`, then `0`, and the number is rendered beside the alert badge.
 
 **In rename/create mode:**
 

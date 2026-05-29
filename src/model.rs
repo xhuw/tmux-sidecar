@@ -7,6 +7,7 @@ pub use crate::domain::{
 use crate::input::InputBuffer;
 
 const JUMP_LABELS: &[u8] = b"asdfghjklqwertyuiopzxcvbnmASDFGHJKLQWERTYUIOPZXCVBNM";
+const ALERT_JUMP_LABELS: &[u8] = b"1234567890";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TmuxState {
@@ -491,16 +492,15 @@ impl AppState {
     }
 
     pub fn focus_jump_label(&mut self, label: char) -> bool {
-        let Some(target) = self
-            .jump_targets()
-            .into_iter()
-            .find(|target| target.label == label)
-        else {
-            return false;
-        };
+        self.focus_target_with_label(self.jump_targets(), label)
+    }
 
-        self.focus = target.focus;
-        true
+    pub fn alert_jump_targets(&self) -> Vec<JumpTarget> {
+        alert_jump_targets_for_rows(&self.tree_rows())
+    }
+
+    pub fn focus_alert_jump_label(&mut self, label: char) -> bool {
+        self.focus_target_with_label(self.alert_jump_targets(), label)
     }
 
     pub fn reconcile_tmux(&mut self, tmux: TmuxState) -> FocusReconcile {
@@ -605,11 +605,31 @@ impl AppState {
         self.focus = next_focus;
         true
     }
+
+    fn focus_target_with_label(&mut self, targets: Vec<JumpTarget>, label: char) -> bool {
+        let Some(target) = targets.into_iter().find(|target| target.label == label) else {
+            return false;
+        };
+
+        self.focus = target.focus;
+        true
+    }
 }
 
 fn jump_targets_for_rows(rows: &[TreeRow]) -> Vec<JumpTarget> {
     rows.iter()
         .zip(JUMP_LABELS.iter().copied())
+        .map(|(row, label)| JumpTarget {
+            focus: row.focus.clone(),
+            label: char::from(label),
+        })
+        .collect()
+}
+
+fn alert_jump_targets_for_rows(rows: &[TreeRow]) -> Vec<JumpTarget> {
+    rows.iter()
+        .filter(|row| row.alert().is_some())
+        .zip(ALERT_JUMP_LABELS.iter().copied())
         .map(|(row, label)| JumpTarget {
             focus: row.focus.clone(),
             label: char::from(label),

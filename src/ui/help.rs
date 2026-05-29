@@ -18,7 +18,7 @@ pub fn key_hints(state: &AppState) -> &'static str {
 
     match &state.mode {
         Mode::Normal => {
-            "Enter switch  s session  S jump  c window  gg top  G bottom  r rename  x close  ? help  q quit"
+            "Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit"
         }
         Mode::Help => "Esc close help  ? close help  q quit",
         Mode::RenameSession { .. } | Mode::RenameWindow { .. } => {
@@ -38,8 +38,9 @@ pub fn modal_lines(glyph_mode: GlyphMode, theme: Theme) -> Vec<Line<'static>> {
         Line::from("gg / G          first / last row"),
         Line::from("Up/Down or j/k  move focus"),
         Line::from("Enter           switch or create"),
-        Line::from("s               start new session"),
-        Line::from("S               jump to row label"),
+        Line::from("1-9,0           jump to numbered alert"),
+        Line::from("n               start new session"),
+        Line::from("s               jump to row label"),
         Line::from("c               new window in focused session"),
         Line::from("r               rename focused session/window"),
         Line::from("x               close focused session/window"),

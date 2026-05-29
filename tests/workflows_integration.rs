@@ -857,12 +857,12 @@ fn navigation_hotkeys_start_expected_flows_from_focused_context()
         .ok_or("missing it-second window")?;
 
     app.state_mut().focus = window_focus(&second_session_id, &second_window_id);
-    app.on_key_event(key(KeyCode::Char('s')))?;
+    app.on_key_event(key(KeyCode::Char('n')))?;
     assert_eq!(app.state().focus, Focus::CreateSession);
     assert!(matches!(app.state().mode, Mode::CreateSessionName { .. }));
     app.on_key_event(key(KeyCode::Esc))?;
 
-    app.on_key_event(key(KeyCode::Char('S')))?;
+    app.on_key_event(key(KeyCode::Char('s')))?;
     let jump_targets = app.state().jump_targets();
     assert!(!jump_targets.is_empty());
     app.on_key_event(key(KeyCode::Char('!')))?;
@@ -916,7 +916,7 @@ fn navigation_hotkeys_start_expected_flows_from_focused_context()
             .map(|window| window.id.clone())
             .ok_or("missing it-second window for jump hotkey")?,
     );
-    app.on_key_event(key(KeyCode::Char('S')))?;
+    app.on_key_event(key(KeyCode::Char('s')))?;
     let jump_targets = app.state().jump_targets();
     let target_label = jump_targets
         .iter()
@@ -926,6 +926,93 @@ fn navigation_hotkeys_start_expected_flows_from_focused_context()
     app.on_key_event(key(KeyCode::Char(target_label)))?;
     assert_eq!(server.client_session_id()?, second_session_id);
     assert_eq!(app.state().focus, Focus::Session(second_session_id.clone()));
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn numbered_alert_hotkeys_switch_to_alerted_windows() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_session_id = main_session.id.clone();
+    let extra_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+    let second_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .ok_or("missing it-second session")?;
+    let second_session_id = second_session.id.clone();
+    let second_window_id = second_session
+        .windows
+        .first()
+        .map(|window| window.id.clone())
+        .ok_or("missing it-second window")?;
+
+    run_tmux(
+        &server.socket_name,
+        &["set", "-w", "-t", "it-main:1", "monitor-bell", "on"],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &["send-keys", "-t", "it-main:1", "printf \"\\a\"", "Enter"],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &["set", "-w", "-t", "it-second:0", "monitor-bell", "on"],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &["send-keys", "-t", "it-second:0", "printf \"\\a\"", "Enter"],
+    )?;
+
+    let mut alert_targets = Vec::new();
+    for _ in 0..20 {
+        let _ = app.sync_with_server(Duration::from_millis(250))?;
+        alert_targets = app.state().alert_jump_targets();
+        if alert_targets.len() == 2 {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    assert_eq!(alert_targets.len(), 2, "alert shortcuts did not refresh");
+    assert_eq!(alert_targets[0].label, '1');
+    assert_eq!(
+        alert_targets[0].focus,
+        window_focus(&main_session_id, &extra_window_id)
+    );
+    assert_eq!(alert_targets[1].label, '2');
+    assert_eq!(
+        alert_targets[1].focus,
+        window_focus(&second_session_id, &second_window_id)
+    );
+
+    app.on_key_event(key(KeyCode::Char('2')))?;
+
+    assert_eq!(server.client_session_id()?, second_session_id);
+    assert_eq!(server.client_window_id()?, second_window_id);
+    assert_eq!(
+        app.state().focus,
+        window_focus(&second_session_id, &second_window_id)
+    );
 
     Ok(())
 }
@@ -974,7 +1061,7 @@ fn gg_g_and_flash_jump_follow_visible_rows_and_auto_quit() -> Result<(), Box<dyn
 
     let mut auto_quit_app = server.app_with_auto_quit(true)?;
     auto_quit_app.state_mut().focus = Focus::CreateSession;
-    auto_quit_app.on_key_event(key(KeyCode::Char('S')))?;
+    auto_quit_app.on_key_event(key(KeyCode::Char('s')))?;
     let jump_targets = auto_quit_app.state().jump_targets();
     let jump_label = jump_targets
         .iter()

@@ -22,7 +22,7 @@ Use the alternate screen with a single full-screen view:
    work
  ├─ 0 shell
  ├─ 2 editor                            ● active
- ├─ 3 tests                             󰂞 alert
+ ├─ 3 tests                         [1] 󰂞 alert
  └─ 󰐕 new window
  ▶ notes
    ├─ 0 scratch
@@ -30,7 +30,7 @@ Use the alternate screen with a single full-screen view:
  󰐕 new session
 
  ────────────────────────────────────────────────────────
- Enter switch  s new session  S jump  c new window  gg top  G bottom  r rename  x close  ? help  q quit
+ Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit
 ```
 
 Regions:
@@ -88,13 +88,13 @@ The UI should not assume a dark background. Light and dark terminal themes must 
 | Focused row | `>` | Accent marker and reverse-video row emphasis. |
 | Active tmux window | `*` | `active` foreground; label remains readable if also focused. |
 | Creation row | `[+]` | Muted label, accent plus sign. |
-| Alerted window | `!` | `alert` foreground badge on the right side of the window row. |
+| Alerted window | `[1] !` | `alert` foreground badge on the right side of the window row, with a numbered shortcut marker on the first 10 alert rows. |
 | Inline edit | `[...]` | Warning prompt text; if also focused, combine with reverse-video emphasis. |
 | Disabled action | none | Muted foreground only. |
 
 The table shows ASCII markers for clarity; the default rendered UI uses the glyph system above. Session rows do not render active badges; active state belongs to window rows only.
 
-Focus, active tmux state, and alert state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, and alert owns the next right-side badge. A window can show active and alert states together.
+Focus, active tmux state, and alert state are different concepts. If a row has multiple states, focus owns the background, active owns the first right-side badge, and the alert shortcut marker (when present) sits immediately before the alert badge. A window can show active and alert states together.
 
 ## Implementation notes
 
@@ -110,6 +110,8 @@ Window rows show tmux bell alert state when tmux reports it. tmux-sidecar config
 Alert display rules:
 
 - Show alerts only on window rows, not session rows.
+- Number the first 10 alert rows in visible tree order as `1`-`9`, then `0`.
+- Render the alert shortcut marker immediately before the alert badge.
 - Use the `alert` token and `󰂞` badge by default.
 - Do not replace the active marker with the alert marker; show all applicable badges.
 - Preserve alerts across server reconciliation snapshots until tmux reports that they cleared.
@@ -124,8 +126,9 @@ Keyboard defaults:
 | `Up`/`Down`, `k`/`j` | Move focus by visible row. |
 | `gg` / `G` | Jump to the first / last visible row. |
 | `Enter` | Activate the focused session/window, or confirm the focused create flow. |
-| `s` | Start the new-session inline create flow. |
-| `S` | Show jump labels for visible rows, then activate the chosen row immediately. |
+| `1`-`9`, `0` | Activate the numbered alert window from the first 10 alert rows in visible order (`0` is the tenth alert). |
+| `n` | Start the new-session inline create flow. |
+| `s` | Show jump labels for visible rows, then activate the chosen row immediately. |
 | `c` | Start the new-window inline create flow for the focused session. |
 | `r` | Rename the focused session or window. |
 | `x` | Close the focused session or window immediately. |
@@ -155,7 +158,7 @@ Double-click actions are intentionally unused; single-click activation keeps mou
 
 Creation is confirmed before tmux mutates state:
 
-1. Focus a `[+]` row or press `s` / `c`.
+1. Focus a `[+]` row or press `n` / `c`.
 2. Enter an optional name in the inline editor.
 3. `Enter` sends the create action through the sidecar daemon.
 4. The UI reconciles to the daemon's pushed result and focuses the created row.
@@ -168,7 +171,7 @@ Rename uses the same inline editor, except the focused row already exists. `Ente
 The help modal should be centered, no wider than 72 columns, and include:
 
 - navigation keys, including `gg` / `G`
-- create, rename, close, and jump keys
+- create, rename, close, jump, and alert shortcut keys
 - active / focused / alert marker legend
 - failure behavior summary: failed actions refresh from tmux
 

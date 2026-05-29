@@ -205,9 +205,9 @@ mod tests {
 
         assert!(output.contains("tmux-sidecar"));
         assert!(output.contains("> [+] new session"));
-        assert!(output.contains("* active ! alert"));
+        assert!(output.contains("* active [1] ! alert"));
         assert!(output.contains(
-            "Enter switch  s session  S jump  c window  gg top  G bottom  r rename  x close  ? help  q quit"
+            "Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit"
         ));
     }
 
@@ -253,8 +253,9 @@ mod tests {
         assert!(!output.contains("activity"));
         assert!(output.contains("! alert"));
         assert!(output.contains("gg / G          first / last row"));
-        assert!(output.contains("s               start new session"));
-        assert!(output.contains("S               jump to row label"));
+        assert!(output.contains("n               start new session"));
+        assert!(output.contains("1-9,0           jump to numbered alert"));
+        assert!(output.contains("s               jump to row label"));
         assert!(output.contains("c               new window in focused session"));
         assert!(output.contains("x               close focused session/window"));
         assert!(output.contains("Failed actions refresh from tmux."));
@@ -351,6 +352,22 @@ mod tests {
             .expect("expected editor row");
 
         assert!(alert_line.contains("* active"));
+        assert!(alert_line.contains("[1]"));
+        assert!(alert_line.contains("! alert"));
+    }
+
+    #[test]
+    fn jump_render_hides_alert_shortcuts_while_row_jump_mode_is_active() {
+        let mut state = sample_state();
+        state.navigation.jumping = true;
+
+        let output = render_ascii(&state, 96, 16);
+        let alert_line = output
+            .lines()
+            .find(|line| line.contains("! alert"))
+            .expect("expected editor row");
+
+        assert!(!alert_line.contains("[1]"));
         assert!(alert_line.contains("! alert"));
     }
 

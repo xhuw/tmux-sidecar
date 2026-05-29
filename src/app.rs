@@ -467,16 +467,20 @@ impl App {
                 self.state.clear_navigation();
                 self.state.focus_last_row();
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('n') => {
                 self.state.clear_navigation();
                 self.begin_create_session_naming()?;
             }
-            KeyCode::Char('S') => {
+            KeyCode::Char('s') => {
                 self.state.start_jump();
             }
             KeyCode::Char('c') => {
                 self.state.clear_navigation();
                 self.begin_create_window_from_focus()?;
+            }
+            KeyCode::Char(label) if label.is_ascii_digit() => {
+                self.state.clear_navigation();
+                self.activate_alert_jump_label(label)?;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 self.state.clear_navigation();
@@ -530,6 +534,14 @@ impl App {
 
         self.state.cancel_jump();
         if selected {
+            self.activate_focused_target()?;
+        }
+
+        Ok(())
+    }
+
+    fn activate_alert_jump_label(&mut self, label: char) -> Result<()> {
+        if self.state.focus_alert_jump_label(label) {
             self.activate_focused_target()?;
         }
 

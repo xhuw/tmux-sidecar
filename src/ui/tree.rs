@@ -91,6 +91,15 @@ impl TreeView {
             .into_iter()
             .map(|target| (target.focus, target.label))
             .collect();
+        let alert_jump_labels: HashMap<_, _> = if jump_labels.is_empty() {
+            state
+                .alert_jump_targets()
+                .into_iter()
+                .map(|target| (target.focus, target.label))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         let mut lines = Vec::with_capacity(rows.len());
 
         for (index, row) in rows.iter().enumerate() {
@@ -162,6 +171,10 @@ impl TreeView {
                 ));
             }
             if let Some(alert) = row.alert() {
+                if let Some(label) = alert_jump_labels.get(&row.focus) {
+                    badges.push(Span::raw(" "));
+                    badges.push(Span::styled(format!("[{label}]"), theme.jump_label()));
+                }
                 badges.push(Span::styled(
                     format!(" {} {}", glyphs.alert, alert_label(alert)),
                     theme.badge_alert(),

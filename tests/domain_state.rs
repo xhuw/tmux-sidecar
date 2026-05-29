@@ -499,6 +499,101 @@ fn vim_and_jump_navigation_follow_visible_row_order() {
 }
 
 #[test]
+fn alert_jump_targets_follow_visible_alert_row_order_and_cap_at_ten() {
+    let windows = (0..11u32)
+        .map(|index| {
+            let id = format!("@{index}");
+            let name = format!("win-{index}");
+            window(&id, index, &name, index == 0, WindowAlert::Bell)
+        })
+        .collect();
+    let mut app = AppState::from_tmux(TmuxState {
+        sessions: vec![session("$1", "work", Some("@0"), windows)],
+        clients: vec![client("client-1", "$1", Some("@0"), 10)],
+    });
+
+    let targets = app.alert_jump_targets();
+    assert_eq!(targets.len(), 10);
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| target.label)
+            .collect::<String>(),
+        "1234567890"
+    );
+    assert_eq!(targets[0].focus, window_focus("$1", "@0"));
+    assert_eq!(targets[9].focus, window_focus("$1", "@9"));
+    assert!(
+        !targets
+            .iter()
+            .any(|target| target.focus == window_focus("$1", "@10"))
+    );
+
+    app.focus = Focus::CreateSession;
+    assert!(app.focus_alert_jump_label('0'));
+    assert_eq!(app.focus, window_focus("$1", "@9"));
+
+    let focused_before_invalid = app.focus.clone();
+    assert!(!app.focus_alert_jump_label('!'));
+    assert_eq!(app.focus, focused_before_invalid);
+}
+
+#[test]
+fn alert_jump_targets_refresh_when_alerts_change() {
+    let mut app = AppState::from_tmux(TmuxState {
+        sessions: vec![
+            session(
+                "$1",
+                "work",
+                Some("@10"),
+                vec![
+                    window("@10", 0, "shell", true, WindowAlert::Bell),
+                    window("@11", 1, "editor", false, WindowAlert::None),
+                ],
+            ),
+            session(
+                "$2",
+                "notes",
+                Some("@20"),
+                vec![window("@20", 0, "scratch", true, WindowAlert::None)],
+            ),
+        ],
+        clients: vec![client("client-1", "$1", Some("@10"), 10)],
+    });
+
+    let initial = app.alert_jump_targets();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(initial[0].label, '1');
+    assert_eq!(initial[0].focus, window_focus("$1", "@10"));
+
+    app.reconcile_tmux(TmuxState {
+        sessions: vec![
+            session(
+                "$1",
+                "work",
+                Some("@10"),
+                vec![
+                    window("@10", 0, "shell", true, WindowAlert::None),
+                    window("@11", 1, "editor", false, WindowAlert::None),
+                ],
+            ),
+            session(
+                "$2",
+                "notes",
+                Some("@20"),
+                vec![window("@20", 0, "scratch", true, WindowAlert::Bell)],
+            ),
+        ],
+        clients: vec![client("client-1", "$1", Some("@10"), 10)],
+    });
+
+    let refreshed = app.alert_jump_targets();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].label, '1');
+    assert_eq!(refreshed[0].focus, window_focus("$2", "@20"));
+}
+
+#[test]
 fn alert_kind_only_marks_bell_flags_as_alerts() {
     let mut activity = window("@1", 0, "activity", false, WindowAlert::None);
     activity.set_flags("#");
