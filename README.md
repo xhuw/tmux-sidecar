@@ -51,7 +51,7 @@ Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close 
 - **Mouse? Sure.** — click any row to jump straight to it
 - **Hook-driven sync** — tmux hooks feed a local per-socket sidecar daemon, so the UI stays current without querying tmux for every refresh
 - **Plugin-friendly setup** — install or refresh the hook wiring with one `run-shell -b 'tmux-sidecar setup'`
-- **Bell alerts at a glance** — bell alerts stay visible so nothing gets lost in a busy session
+- **Bell alerts at a glance** — bell alerts stay visible, and the daemon can ring attached tmux clients on new bell transitions even when the TUI is closed
 - **Inline rename** — rename sessions and windows without dropping to a tmux prompt, with full cursor editing
 - **Survives chaos** — if something changes in tmux behind your back, the sidecar refreshes state and focus recovers gracefully
 - **Fast** — written in Rust with lightweight local IPC and cheap renders
@@ -92,6 +92,10 @@ tmux-sidecar
 ```
 
 On startup, tmux-sidecar reuses or auto-starts a local sidecar daemon for the current tmux socket, refreshes hooks with `setup`, and subscribes the UI to server-pushed state updates. There is no persisted startup cache; the TUI shows a brief loading state until the initial sidecar snapshot arrives.
+
+That server/client architecture is more complicated than tmux `>= 3.2` strictly needs. It mainly exists to keep tmux-sidecar working on tmux `>= 3.0, < 3.2`, where the bug fixed by tmux commit [`d8b6560cbf`](https://github.com/tmux/tmux/commit/d8b6560cbfb5677223982e4b27be92b2fcd034df) ("Set alert flag for the current window if the session is unattached") was still unresolved.
+
+When tmux reports a new bell alert, the running daemon writes a BEL control character directly to each attached tmux client tty path (deduplicated by tty), so audible alerts still work without an open TUI.
 
 For launcher-style behavior that exits as soon as you choose the destination:
 

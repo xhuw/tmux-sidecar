@@ -5,7 +5,7 @@
 tmux-sidecar now runs as a hook-driven, per-tmux-socket sidecar daemon.
 
 - tmux is the durable source of truth.
-- The daemon owns only an in-memory projection, reconcile scheduling, subscriber fan-out, and per-session workdir hints.
+- The daemon owns only an in-memory projection, BEL notifications for new bell transitions, reconcile scheduling, subscriber fan-out, and per-session workdir hints.
 - The TUI subscribes to pushed state updates and routes all tmux mutations back through the daemon.
 - Startup does not restore a persisted cache. The TUI shows a short loading placeholder until the initial subscribed snapshot arrives.
 
@@ -34,6 +34,7 @@ tmux server
   │    ├─ one owner thread for DomainState
   │    ├─ reconciles full tmux snapshots
   │    ├─ applies urgent bell overlays immediately when possible
+  │    ├─ writes BEL to attached tmux client ttys on new bell transitions
   │    ├─ tracks per-session workdirs for create-window actions
   │    └─ broadcasts StateUpdated / ActionResult messages
   │
@@ -143,8 +144,9 @@ Hook handling:
 1. A tmux hook runs `tmux-sidecar hook ...`.
 2. The hook client connects to the daemon, sends one `HookEvent`, waits for `Ack`, and exits.
 3. Bell hooks patch the matching winlink immediately when enough identity is available.
-4. The daemon marks dirty scopes, debounces bursty hook traffic, then reconciles from a full tmux snapshot.
-5. Newly discovered windows get `monitor-bell on` before the updated projection is broadcast.
+4. New bell transitions emit BEL to the attached tmux client tty set, deduplicated by tty path.
+5. The daemon marks dirty scopes, debounces bursty hook traffic, then reconciles from a full tmux snapshot.
+6. Newly discovered windows get `monitor-bell on` before the updated projection is broadcast.
 
 Action handling:
 

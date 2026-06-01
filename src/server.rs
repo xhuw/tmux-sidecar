@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs,
-    io::BufReader,
+    fs::{self, OpenOptions},
+    io::{BufReader, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     sync::{
@@ -64,6 +64,7 @@ struct ServerCore {
     state: ServerCoreState,
     refresh_from_tmux: bool,
     tmux: Arc<dyn ServerTmuxOps>,
+    bell_notifier: Arc<dyn BellNotifier>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -129,6 +130,10 @@ trait ServerTmuxOps: Send + Sync {
     ) -> Result<ActionEffect>;
 }
 
+trait BellNotifier: Send + Sync {
+    fn notify(&self, tty_paths: &[PathBuf], repeat_count: usize) -> Result<()>;
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ActionExecutionOptions {
     create_window_path: Option<PathBuf>,
@@ -172,6 +177,9 @@ enum ActionEffect {
 
 #[derive(Debug, Default)]
 struct LiveServerTmuxOps;
+
+#[derive(Debug, Default)]
+struct TtyBellNotifier;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SessionWorkdirTracker {
@@ -261,6 +269,31 @@ impl ServerTmuxOps for LiveServerTmuxOps {
     }
 }
 
+impl BellNotifier for TtyBellNotifier {
+    fn notify(&self, tty_paths: &[PathBuf], repeat_count: usize) -> Result<()> {
+        if tty_paths.is_empty() || repeat_count == 0 {
+            return Ok(());
+        }
+
+        let payload = vec![b'\x07'; repeat_count];
+        let mut failures = Vec::new();
+        for tty_path in tty_paths {
+            if let Err(error) = write_bel_to_tty(tty_path, &payload) {
+                failures.push(format!("{}: {error:#}", tty_path.display()));
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "failed to emit BEL to one or more tmux client ttys: {}",
+                failures.join("; ")
+            );
+        }
+    }
+}
+
 impl ServerCoreHandle {
     fn subscribe(&self, writer: SharedWriter) -> Result<(u64, StateUpdated)> {
         self.call(|reply| ServerInput::Subscribe { writer, reply })
@@ -309,6 +342,7 @@ impl ServerCore {
         state: ServerCoreState,
         refresh_from_tmux: bool,
         tmux: Arc<dyn ServerTmuxOps>,
+        bell_notifier: Arc<dyn BellNotifier>,
         shutdown: Arc<AtomicBool>,
     ) -> (ServerCoreHandle, thread::JoinHandle<Result<()>>) {
         let (sender, receiver) = mpsc::channel();
@@ -318,6 +352,7 @@ impl ServerCore {
                 state,
                 refresh_from_tmux,
                 tmux,
+                bell_notifier,
                 shutdown,
             }
             .run(receiver)
@@ -646,6 +681,24 @@ impl Server {
         refresh_from_tmux: bool,
         tmux: Arc<dyn ServerTmuxOps>,
     ) -> Result<Self> {
+        Self::bind_with_dependencies(
+            sidecar_paths,
+            tmux_socket_path,
+            initial_state,
+            refresh_from_tmux,
+            tmux,
+            Arc::new(TtyBellNotifier),
+        )
+    }
+
+    fn bind_with_dependencies(
+        sidecar_paths: SidecarPaths,
+        tmux_socket_path: PathBuf,
+        initial_state: ProjectionState,
+        refresh_from_tmux: bool,
+        tmux: Arc<dyn ServerTmuxOps>,
+        bell_notifier: Arc<dyn BellNotifier>,
+    ) -> Result<Self> {
         let initial_domain = initial_state.clone().into_domain_state();
         let server_id = format!("tmux-sidecar-{}", std::process::id());
         fs::create_dir_all(&sidecar_paths.runtime_dir)
@@ -683,6 +736,7 @@ impl Server {
             },
             refresh_from_tmux,
             tmux,
+            bell_notifier,
             Arc::clone(&shutdown),
         );
 
@@ -872,7 +926,7 @@ impl ServerCore {
             .take_pending_reconcile()
             .map(|pending| pending.clear_bell_hints)
             .unwrap_or_default();
-        self.reconcile_from_snapshot(&clear_bell_hints, true)
+        self.reconcile_from_snapshot(&clear_bell_hints, true, false)
             .map(|result| result.update)
     }
 
@@ -881,7 +935,7 @@ impl ServerCore {
             .take_pending_reconcile()
             .map(|pending| pending.clear_bell_hints)
             .unwrap_or_default();
-        self.reconcile_from_snapshot(&clear_bell_hints, false)
+        self.reconcile_from_snapshot(&clear_bell_hints, false, false)
             .map(|result| result.update)
     }
 
@@ -890,7 +944,7 @@ impl ServerCore {
             return Ok(());
         };
 
-        let result = self.reconcile_from_snapshot(&pending.clear_bell_hints, true)?;
+        let result = self.reconcile_from_snapshot(&pending.clear_bell_hints, true, true)?;
         if !result.changed
             && !result.snapshot_changed
             && pending.dirty_scopes.requires_confirmation()
@@ -917,7 +971,7 @@ impl ServerCore {
                 thread::sleep(ACTION_RECONCILE_RETRY_DELAY);
             }
 
-            let result = self.reconcile_from_snapshot(&clear_bell_hints, true)?;
+            let result = self.reconcile_from_snapshot(&clear_bell_hints, true, false)?;
             if effect.is_satisfied(&self.state.state) {
                 return Ok(result.update);
             }
@@ -930,6 +984,7 @@ impl ServerCore {
         &mut self,
         clear_bell_hints: &BTreeSet<BellClearHint>,
         broadcast_update: bool,
+        notify_bells: bool,
     ) -> Result<ReconcileResult> {
         if !self.refresh_from_tmux {
             return Ok(ReconcileResult {
@@ -947,7 +1002,8 @@ impl ServerCore {
             .into_domain_state();
         let snapshot_changed = next_state != previous_state;
         preserve_cached_bell_overlays(&previous_state, &mut next_state, clear_bell_hints);
-        let (update, changed) = self.publish_state_update(next_state, broadcast_update);
+        let (update, changed) =
+            self.publish_state_update(next_state, broadcast_update, notify_bells);
         Ok(ReconcileResult {
             update,
             changed,
@@ -964,7 +1020,7 @@ impl ServerCore {
         if !apply_hook_event_overlay(&mut next_state, event) {
             return;
         }
-        let _ = self.publish_state_update(next_state, true);
+        let _ = self.publish_state_update(next_state, true, true);
     }
 
     fn schedule_hook_reconciliation(&mut self, event: &HookEvent) {
@@ -1001,9 +1057,14 @@ impl ServerCore {
         &mut self,
         next_state: DomainState,
         broadcast_update: bool,
+        notify_bells: bool,
     ) -> (StateUpdated, bool) {
         if next_state == self.state.state {
             return (self.current_state_update(), false);
+        }
+
+        if notify_bells {
+            self.notify_new_bell_transitions(&self.state.state, &next_state);
         }
 
         self.state.generation += 1;
@@ -1018,6 +1079,22 @@ impl ServerCore {
             self.broadcast(ServerMessage::StateUpdated(update.clone()));
         }
         (update, true)
+    }
+
+    fn notify_new_bell_transitions(&self, previous_state: &DomainState, next_state: &DomainState) {
+        let repeat_count = count_new_bell_transitions(previous_state, next_state);
+        if repeat_count == 0 {
+            return;
+        }
+
+        let tty_paths = bell_notification_ttys(next_state);
+        if tty_paths.is_empty() {
+            return;
+        }
+
+        if let Err(error) = self.bell_notifier.notify(&tty_paths, repeat_count) {
+            eprintln!("{error:#}");
+        }
     }
 
     fn broadcast(&mut self, message: ServerMessage) {
@@ -1382,6 +1459,32 @@ impl ActionEffect {
     }
 }
 
+fn count_new_bell_transitions(previous_state: &DomainState, next_state: &DomainState) -> usize {
+    next_state
+        .winlinks
+        .iter()
+        .filter(|(key, next_window)| {
+            next_window.bell_flag
+                && previous_state
+                    .winlinks
+                    .get(*key)
+                    .map(|window| window.bell_flag)
+                    .unwrap_or(false)
+                    == false
+        })
+        .count()
+}
+
+fn bell_notification_ttys(state: &DomainState) -> Vec<PathBuf> {
+    state
+        .clients
+        .values()
+        .filter_map(|client| non_empty(Some(client.tty.as_str())).map(PathBuf::from))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
 fn preserve_cached_bell_overlays(
     previous_state: &DomainState,
     next_state: &mut DomainState,
@@ -1458,6 +1561,25 @@ fn update_activity_timestamp(window: &mut crate::domain::WindowState, event: &Ho
         }
     }
     false
+}
+
+fn write_bel_to_tty(tty_path: &Path, payload: &[u8]) -> Result<()> {
+    let mut tty = OpenOptions::new()
+        .write(true)
+        .open(tty_path)
+        .with_context(|| format!("failed to open tmux client tty `{}`", tty_path.display()))?;
+    tty.write_all(payload).with_context(|| {
+        format!(
+            "failed to write BEL to tmux client tty `{}`",
+            tty_path.display()
+        )
+    })?;
+    tty.flush().with_context(|| {
+        format!(
+            "failed to flush BEL to tmux client tty `{}`",
+            tty_path.display()
+        )
+    })
 }
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
@@ -1621,7 +1743,8 @@ mod tests {
     use anyhow::{Context, Result, anyhow};
 
     use super::{
-        ActionEffect, ActionExecutionOptions, Server, ServerTmuxOps, execute_action_request,
+        ActionEffect, ActionExecutionOptions, BellNotifier, Server, ServerTmuxOps,
+        execute_action_request,
     };
     use crate::ipc::{
         Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
@@ -1980,6 +2103,56 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedBellNotification {
+        tty_paths: Vec<PathBuf>,
+        repeat_count: usize,
+    }
+
+    #[derive(Debug, Default)]
+    struct MockBellNotifier {
+        calls: Mutex<Vec<RecordedBellNotification>>,
+        failures: Mutex<VecDeque<String>>,
+    }
+
+    impl MockBellNotifier {
+        fn calls(&self) -> Vec<RecordedBellNotification> {
+            self.calls
+                .lock()
+                .expect("bell notifier calls poisoned")
+                .clone()
+        }
+
+        fn push_failure(&self, message: &str) {
+            self.failures
+                .lock()
+                .expect("bell notifier failures poisoned")
+                .push_back(message.to_owned());
+        }
+    }
+
+    impl BellNotifier for MockBellNotifier {
+        fn notify(&self, tty_paths: &[PathBuf], repeat_count: usize) -> Result<()> {
+            self.calls
+                .lock()
+                .expect("bell notifier calls poisoned")
+                .push(RecordedBellNotification {
+                    tty_paths: tty_paths.to_vec(),
+                    repeat_count,
+                });
+
+            match self
+                .failures
+                .lock()
+                .expect("bell notifier failures poisoned")
+                .pop_front()
+            {
+                Some(message) => Err(anyhow!(message)),
+                None => Ok(()),
+            }
+        }
+    }
+
     fn projection_state_with_session(
         tmux_socket_path: &Path,
         session_id: &str,
@@ -2064,6 +2237,16 @@ mod tests {
         session_id: &str,
         window_id: &str,
     ) {
+        add_projection_client_with_tty(state, name, session_id, window_id, "/dev/pts/1");
+    }
+
+    fn add_projection_client_with_tty(
+        state: &mut ProjectionState,
+        name: &str,
+        session_id: &str,
+        window_id: &str,
+        tty: &str,
+    ) {
         if let Some(session) = state
             .sessions
             .iter_mut()
@@ -2076,7 +2259,7 @@ mod tests {
             session_id: session_id.to_owned(),
             current_window_id: Some(window_id.to_owned()),
             activity: 1,
-            tty: String::from("/dev/pts/1"),
+            tty: tty.to_owned(),
         });
     }
 
@@ -2103,6 +2286,310 @@ mod tests {
                 kind: AckKind::Shutdown,
             })
         );
+        Ok(())
+    }
+
+    #[test]
+    fn alert_hook_rings_all_unique_client_ttys_on_new_bell_transition() -> Result<()> {
+        let sandbox = TestDir::new("server-bell-notify-alert-hook")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        add_projection_client_with_tty(&mut initial_state, "client-1", "$1", "@1", "/dev/pts/1");
+        add_projection_client_with_tty(&mut initial_state, "client-2", "$1", "@1", "/dev/pts/1");
+        add_projection_client_with_tty(&mut initial_state, "client-3", "$1", "@1", "/dev/pts/2");
+        let bell_notifier = std::sync::Arc::new(MockBellNotifier::default());
+        let server = Server::bind_with_dependencies(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state.clone(),
+            false,
+            std::sync::Arc::new(MockServerTmux::new(Vec::<ProjectionState>::new(), vec![])),
+            bell_notifier.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::AlertBell,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_index: Some(0),
+            pane_id: Some(String::from("%1")),
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        let mut alerted_state = initial_state;
+        alerted_state.sessions[0].windows[0].bell_flag = true;
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: alerted_state,
+            })
+        );
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(
+            bell_notifier.calls(),
+            vec![RecordedBellNotification {
+                tty_paths: vec![PathBuf::from("/dev/pts/1"), PathBuf::from("/dev/pts/2")],
+                repeat_count: 1,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn alert_hook_does_not_ring_for_already_latched_bell() -> Result<()> {
+        let sandbox = TestDir::new("server-bell-notify-latched")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        initial_state.sessions[0].windows[0].bell_flag = true;
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let bell_notifier = std::sync::Arc::new(MockBellNotifier::default());
+        let server = Server::bind_with_dependencies(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            false,
+            std::sync::Arc::new(MockServerTmux::new(Vec::<ProjectionState>::new(), vec![])),
+            bell_notifier.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::AlertBell,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_index: Some(0),
+            pane_id: Some(String::from("%1")),
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(subscriber.recv_timeout(Duration::from_millis(150))?, None);
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+        assert!(bell_notifier.calls().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_request_does_not_ring_for_snapshot_discovered_bells() -> Result<()> {
+        let sandbox = TestDir::new("server-bell-notify-snapshot-query")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let mut refreshed_state = initial_state.clone();
+        refreshed_state.sessions[0].windows[0].bell_flag = true;
+        let bell_notifier = std::sync::Arc::new(MockBellNotifier::default());
+        let server = Server::bind_with_dependencies(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            std::sync::Arc::new(MockServerTmux::new(vec![refreshed_state.clone()], vec![])),
+            bell_notifier.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut query = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Control)?;
+        query.send(&ClientMessage::SnapshotRequest)?;
+        assert_eq!(
+            query.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+
+        drop(query);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+        assert!(bell_notifier.calls().is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn hook_reconcile_rings_once_per_newly_alerted_window() -> Result<()> {
+        let sandbox = TestDir::new("server-bell-notify-reconcile")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        add_projection_window(&mut initial_state, "$1", "@2", "tests", 1, false);
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let mut refreshed_state = initial_state.clone();
+        refreshed_state.sessions[0].windows[0].bell_flag = true;
+        refreshed_state.sessions[0].windows[1].bell_flag = true;
+        let bell_notifier = std::sync::Arc::new(MockBellNotifier::default());
+        let server = Server::bind_with_dependencies(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            std::sync::Arc::new(MockServerTmux::new(vec![refreshed_state.clone()], vec![])),
+            bell_notifier.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::SessionRenamed,
+            session_id: Some(String::from("$1")),
+            window_id: None,
+            window_index: None,
+            pane_id: None,
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(
+            bell_notifier.calls(),
+            vec![RecordedBellNotification {
+                tty_paths: vec![PathBuf::from("/dev/pts/1")],
+                repeat_count: 2,
+            }]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn bell_notifier_failures_do_not_block_hook_updates() -> Result<()> {
+        let sandbox = TestDir::new("server-bell-notify-failure")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "build");
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let bell_notifier = std::sync::Arc::new(MockBellNotifier::default());
+        bell_notifier.push_failure("tty write failed");
+        let server = Server::bind_with_dependencies(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state.clone(),
+            false,
+            std::sync::Arc::new(MockServerTmux::new(Vec::<ProjectionState>::new(), vec![])),
+            bell_notifier.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut subscriber = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        subscriber.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = subscriber.recv()?;
+
+        let mut hook = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Hook)?;
+        hook.send(&ClientMessage::HookEvent(HookEvent {
+            tmux_socket_path: tmux_socket_path.clone(),
+            event: HookName::AlertBell,
+            session_id: Some(String::from("$1")),
+            window_id: Some(String::from("@1")),
+            window_index: Some(0),
+            pane_id: Some(String::from("%1")),
+            pane_current_path: None,
+            client_name: None,
+            timestamp_ms: None,
+        }))?;
+
+        let mut alerted_state = initial_state;
+        alerted_state.sessions[0].windows[0].bell_flag = true;
+        assert_eq!(
+            subscriber.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: alerted_state,
+            })
+        );
+        assert_eq!(
+            hook.recv()?,
+            ServerMessage::Ack(Ack {
+                kind: AckKind::HookEvent,
+            })
+        );
+
+        drop(hook);
+        drop(subscriber);
+        shutdown_server(&sidecar_paths.socket_path)?;
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(
+            bell_notifier.calls(),
+            vec![RecordedBellNotification {
+                tty_paths: vec![PathBuf::from("/dev/pts/1")],
+                repeat_count: 1,
+            }]
+        );
+
         Ok(())
     }
 
