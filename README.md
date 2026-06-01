@@ -9,6 +9,7 @@
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![tmux](https://img.shields.io/badge/requires-tmux-green?style=flat-square)](https://github.com/tmux/tmux)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/xhuw/tmux-sidecar)
 
 </div>
 
