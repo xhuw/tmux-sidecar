@@ -1631,6 +1631,46 @@ fn closes_focused_session_with_x_without_confirmation() -> Result<(), Box<dyn st
 
 #[test]
 #[serial]
+fn closes_active_session_with_x_and_switches_client_before_close()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let doomed_session_id = server.client_session_id()?;
+    let fallback_session_id = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.id != doomed_session_id)
+        .map(|session| session.id.clone())
+        .ok_or("missing fallback session")?;
+    let initial_session_count = snapshot.sessions.len();
+
+    app.state_mut().focus = Focus::Session(doomed_session_id.clone());
+    app.on_key_event(key(KeyCode::Char('x')))?;
+
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(app.state().last_error.is_none());
+
+    let refreshed_sessions = tmux.snapshot()?.sessions;
+    assert_eq!(refreshed_sessions.len(), initial_session_count - 1);
+    assert!(
+        !refreshed_sessions
+            .iter()
+            .any(|session| session.id == doomed_session_id)
+    );
+    assert_eq!(server.client_session_id()?, fallback_session_id);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn renames_with_r_and_refreshes_on_failed_rename() -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {
         eprintln!("skipping integration test: tmux is unavailable");

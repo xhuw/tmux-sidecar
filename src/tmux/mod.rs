@@ -40,6 +40,7 @@ pub enum TmuxError {
 pub trait Tmux {
     fn snapshot(&self) -> Result<TmuxState, TmuxError>;
     fn resolve_target_client(&self, cli_override: Option<&str>) -> Result<ClientName, TmuxError>;
+    fn switch_client_to_last_session(&self, client: &ClientName) -> Result<(), TmuxError>;
     fn switch_to(&self, client: &ClientName, target: WindowTarget) -> Result<(), TmuxError>;
     fn create_session(&self, name: Option<&str>) -> Result<SessionId, TmuxError>;
     fn create_window(
@@ -236,6 +237,12 @@ impl Tmux for TmuxCli {
                 Ok(())
             }
         }
+    }
+
+    fn switch_client_to_last_session(&self, client: &ClientName) -> Result<(), TmuxError> {
+        let socket = self.socket_options();
+        command::run_tmux(&socket, ["switch-client", "-c", client.0.as_str(), "-l"])?;
+        Ok(())
     }
 
     fn create_session(&self, name: Option<&str>) -> Result<SessionId, TmuxError> {

@@ -374,8 +374,7 @@ fn hook_command(program: &HookCommandProgram, definition: &HookDefinition) -> St
     words.push(shell_quote(definition.name));
 
     for arg in definition.args {
-        words.push(arg.flag.to_owned());
-        words.push(arg.quoted_tmux_format.to_owned());
+        words.push(format!("{}={}", arg.flag, arg.quoted_tmux_format));
     }
 
     format!("run-shell -b \"{}\"", words.join(" "))
@@ -572,6 +571,16 @@ mod tests {
 
         assert!(client_hook.command.contains(CLIENT_NAME_FORMAT));
         assert!(client_hook.command.contains(PANE_CURRENT_PATH_FORMAT));
+        assert!(
+            client_hook
+                .command
+                .contains("--client-name=#{q:client_name}")
+        );
+        assert!(
+            client_hook
+                .command
+                .contains("--pane-current-path=#{q:pane_current_path}")
+        );
         assert!(!client_hook.command.contains("#{client_name}"));
         assert!(!client_hook.command.contains("#{pane_current_path}"));
     }

@@ -718,19 +718,28 @@ impl App {
     }
 
     fn close_focused_target(&mut self) -> Result<()> {
-        let action = match self.state.focus.clone() {
-            Focus::Session(session_id) => Action::CloseSession { session_id },
+        let (action, target_client) = match self.state.focus.clone() {
+            Focus::Session(session_id) => (
+                Action::CloseSession { session_id },
+                self.state
+                    .target_client
+                    .as_ref()
+                    .map(|client| client.0.clone()),
+            ),
             Focus::Window {
                 session_id,
                 window_id,
-            } => Action::CloseWindow {
-                session_id,
-                window_id,
-            },
+            } => (
+                Action::CloseWindow {
+                    session_id,
+                    window_id,
+                },
+                None,
+            ),
             Focus::CreateSession | Focus::CreateWindow(_) => return Ok(()),
         };
 
-        let _ = self.try_server_action(None, action)?;
+        let _ = self.try_server_action(target_client, action)?;
         Ok(())
     }
 

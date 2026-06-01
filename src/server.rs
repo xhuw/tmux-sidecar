@@ -22,7 +22,7 @@ use crate::{
         ClientMessage, ErrorMessage, HelloAck, HookEvent, HookName, ProjectionState, ServerMessage,
         SidecarPaths, StateUpdated,
     },
-    model::WindowTarget,
+    model::{ClientName, WindowTarget},
     tmux::{Tmux, TmuxCli, WindowWorkdir},
 };
 
@@ -137,6 +137,12 @@ trait BellNotifier: Send + Sync {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ActionExecutionOptions {
     create_window_path: Option<PathBuf>,
+    close_session_client_switch: Option<CloseSessionClientSwitch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloseSessionClientSwitch {
+    fallback_session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1118,12 +1124,27 @@ impl ServerCore {
                     Ok(create_window_path) => self.handle_action_request_with_options(
                         request,
                         tmux_socket_path,
-                        ActionExecutionOptions { create_window_path },
+                        ActionExecutionOptions {
+                            create_window_path,
+                            ..ActionExecutionOptions::default()
+                        },
                     ),
                     Err(error) => ActionResultKind::Error {
                         message: format!("failed to resolve working directory: {error:#}"),
                     },
                 }
+            }
+            Action::CloseSession { session_id } => {
+                let close_session_client_switch =
+                    self.resolve_close_session_client_switch(request, session_id);
+                self.handle_action_request_with_options(
+                    request,
+                    tmux_socket_path,
+                    ActionExecutionOptions {
+                        create_window_path: None,
+                        close_session_client_switch,
+                    },
+                )
             }
             _ => self.handle_action_request_with_options(
                 request,
@@ -1196,6 +1217,42 @@ impl ServerCore {
             .state
             .workdirs
             .resolve_session_path(&self.state.state, session_id, &live_workdirs))
+    }
+
+    fn resolve_close_session_client_switch(
+        &self,
+        request: &ActionRequest,
+        closing_session_id: &str,
+    ) -> Option<CloseSessionClientSwitch> {
+        let target_client = request
+            .target_client
+            .as_ref()
+            .map(|name| ClientName(name.clone()))?;
+        let target_client_state = self.state.state.visible_client(Some(&target_client))?;
+        if target_client_state.session_id != closing_session_id {
+            return None;
+        }
+
+        let fallback_session_id = self
+            .state
+            .state
+            .clients
+            .values()
+            .filter(|client| client.session_id != closing_session_id)
+            .max_by_key(|client| (client.activity, client.order))
+            .map(|client| client.session_id.clone())
+            .or_else(|| {
+                self.state
+                    .state
+                    .ordered_sessions()
+                    .into_iter()
+                    .find(|session| session.id != closing_session_id)
+                    .map(|session| session.id.clone())
+            });
+
+        Some(CloseSessionClientSwitch {
+            fallback_session_id,
+        })
     }
 }
 
@@ -1704,6 +1761,24 @@ fn execute_action_request(
             }
         }
         Action::CloseSession { session_id } => {
+            if let Some(close_session_client_switch) = &options.close_session_client_switch {
+                let client = tmux
+                    .resolve_target_client(request.target_client.as_deref())
+                    .context("failed to resolve target tmux client")?;
+                if tmux.switch_client_to_last_session(&client).is_err() {
+                    if let Some(fallback_session_id) =
+                        close_session_client_switch.fallback_session_id.as_deref()
+                    {
+                        tmux.switch_to(&client, WindowTarget::Session(fallback_session_id.to_owned()))
+                            .with_context(|| {
+                                format!(
+                                    "failed to switch client `{}` away from closing session `{session_id}`",
+                                    client.0
+                                )
+                            })?;
+                    }
+                }
+            }
             tmux.close_session(session_id)
                 .with_context(|| format!("failed to close session `{session_id}`"))?;
             ActionEffect::ClosedSession {
@@ -1743,8 +1818,8 @@ mod tests {
     use anyhow::{Context, Result, anyhow};
 
     use super::{
-        ActionEffect, ActionExecutionOptions, BellNotifier, Server, ServerTmuxOps,
-        execute_action_request,
+        ActionEffect, ActionExecutionOptions, BellNotifier, CloseSessionClientSwitch, Server,
+        ServerTmuxOps, execute_action_request,
     };
     use crate::ipc::{
         Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
@@ -1861,6 +1936,9 @@ mod tests {
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RecordedTmuxCall {
         ResolveTargetClient(Option<String>),
+        SwitchClientToLastSession {
+            client: String,
+        },
         SwitchTo {
             client: String,
             target: WindowTarget,
@@ -1924,6 +2002,15 @@ mod tests {
                     client: client.0.clone(),
                     target,
                 });
+            Ok(())
+        }
+
+        fn switch_client_to_last_session(&self, client: &ClientName) -> Result<(), TmuxError> {
+            self.calls.lock().expect("tmux call log poisoned").push(
+                RecordedTmuxCall::SwitchClientToLastSession {
+                    client: client.0.clone(),
+                },
+            );
             Ok(())
         }
 
@@ -3295,6 +3382,50 @@ mod tests {
     }
 
     #[test]
+    fn execute_action_request_switches_target_client_before_closing_session() -> Result<()> {
+        let tmux = RecordingTmux::default();
+        let request = ActionRequest {
+            request_id: String::from("req-close-active"),
+            target_client: Some(String::from("client-1")),
+            action: Action::CloseSession {
+                session_id: String::from("$1"),
+            },
+        };
+
+        let effect = execute_action_request(
+            &tmux,
+            &request,
+            &ActionExecutionOptions {
+                create_window_path: None,
+                close_session_client_switch: Some(CloseSessionClientSwitch {
+                    fallback_session_id: Some(String::from("$2")),
+                }),
+            },
+        )?;
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                RecordedTmuxCall::ResolveTargetClient(Some(String::from("client-1"))),
+                RecordedTmuxCall::SwitchClientToLastSession {
+                    client: String::from("resolved-client"),
+                },
+                RecordedTmuxCall::CloseSession {
+                    session_id: String::from("$1"),
+                },
+            ]
+        );
+        assert_eq!(
+            effect,
+            ActionEffect::ClosedSession {
+                session_id: String::from("$1"),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn tracked_session_workdirs_prefer_active_window_paths() {
         let tmux_socket_path = Path::new("/tmp/tmux.sock");
         let mut tracker = super::SessionWorkdirTracker::default();
@@ -3405,6 +3536,7 @@ mod tests {
             tmux.action_options(),
             vec![ActionExecutionOptions {
                 create_window_path: Some(Path::new("/tmp/active").to_path_buf()),
+                close_session_client_switch: None,
             }]
         );
 
