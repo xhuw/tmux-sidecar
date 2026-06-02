@@ -57,6 +57,7 @@ Run one daemon per tmux socket. The sidecar socket path is derived deterministic
 | `tmux-sidecar daemon --stop [--socket-name/--socket-path]` | Ask the running daemon for the selected tmux socket to shut down without spawning a replacement. |
 | `tmux-sidecar hook --socket-path <path> --event <event> ...` | Internal hook entry point used by installed tmux hooks. |
 | `tmux-sidecar query alerts [--socket-name/--socket-path]` | Print the number of active bell alerts tracked by the daemon. |
+| `tmux-sidecar query all [--socket-name/--socket-path]` | Print the current `ProjectionState` snapshot as JSON. |
 
 Compatibility aliases `install-hooks`, `uninstall-hooks`, `server`, and `daemon --kill` are still accepted for existing scripts, but `setup`, `teardown`, and `daemon --stop` are the documented names. The old `--poll-interval-ms` flag is no longer part of the documented interface.
 

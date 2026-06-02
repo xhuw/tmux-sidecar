@@ -93,6 +93,8 @@ impl QueryArgs {
 pub enum QueryCommand {
     /// Print the number of active bell alerts.
     Alerts,
+    /// Print the current sidecar projection as JSON.
+    All,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -230,7 +232,7 @@ mod tests {
     }
 
     #[test]
-    fn query_defaults_to_alerts_and_accepts_explicit_alerts_command() {
+    fn query_defaults_to_alerts_and_accepts_explicit_subcommands() {
         let cli = Cli::try_parse_from(["tmux-sidecar", "query"]).unwrap();
 
         let Some(CliCommand::Query(args)) = cli.command else {
@@ -244,6 +246,13 @@ mod tests {
             panic!("expected query alerts command");
         };
         assert_eq!(args.command_or_default(), QueryCommand::Alerts);
+
+        let cli = Cli::try_parse_from(["tmux-sidecar", "query", "all"]).unwrap();
+
+        let Some(CliCommand::Query(args)) = cli.command else {
+            panic!("expected query all command");
+        };
+        assert_eq!(args.command_or_default(), QueryCommand::All);
     }
 
     #[test]

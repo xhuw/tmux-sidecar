@@ -189,6 +189,7 @@ The first 10 alert rows in visible tree order are numbered `1`-`9`, then `0`, an
 | `daemon` | Run the local per-socket sidecar daemon (normally auto-started); use `daemon --stop` to stop the running daemon for the selected tmux socket |
 | `hook` | Send one tmux hook event to the sidecar daemon (normally used by installed hooks) |
 | `query alerts` | Print the number of active bell alerts tracked by the sidecar daemon, suitable for tmux `#(...)` status lines |
+| `query all` | Print the current sidecar projection snapshot as JSON, including sessions, windows, and clients |
 
 Compatibility aliases `install-hooks`, `uninstall-hooks`, `server`, and `daemon --kill` are still accepted for existing scripts, but `setup`, `teardown`, and `daemon --stop` are the documented names.
 

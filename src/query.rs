@@ -15,6 +15,11 @@ pub fn write_result(
     match args.command_or_default() {
         QueryCommand::Alerts => writeln!(writer, "{}", state.active_alert_count())
             .context("failed to write query output"),
+        QueryCommand::All => {
+            serde_json::to_writer(&mut *writer, state)
+                .context("failed to serialize query output")?;
+            writeln!(writer).context("failed to write query output")
+        }
     }
 }
 
@@ -71,5 +76,60 @@ mod tests {
         write_result(&args, &state, &mut output).expect("write query result");
 
         assert_eq!(String::from_utf8(output).expect("utf8 output"), "1\n");
+    }
+
+    #[test]
+    fn query_all_writes_projection_snapshot_as_json() {
+        let args = QueryArgs {
+            command: Some(QueryCommand::All),
+            ..QueryArgs::default()
+        };
+        let state = ProjectionState {
+            tmux_socket_path: Path::new("/tmp/tmux/default").to_path_buf(),
+            sessions: vec![ProjectionSession {
+                id: String::from("$1"),
+                name: String::from("work"),
+                attached_count: 1,
+                active_window_id: Some(String::from("@1")),
+                windows: vec![
+                    ProjectionWindow {
+                        id: String::from("@1"),
+                        index: 0,
+                        name: String::from("shell"),
+                        active: true,
+                        activity: 10,
+                        activity_flag: false,
+                        bell_flag: false,
+                        silence_flag: false,
+                    },
+                    ProjectionWindow {
+                        id: String::from("@2"),
+                        index: 1,
+                        name: String::from("tests"),
+                        active: false,
+                        activity: 20,
+                        activity_flag: false,
+                        bell_flag: true,
+                        silence_flag: false,
+                    },
+                ],
+            }],
+            clients: vec![crate::ipc::ProjectionClient {
+                name: String::from("client-1"),
+                session_id: String::from("$1"),
+                current_window_id: Some(String::from("@1")),
+                activity: 20,
+                tty: String::from("/dev/pts/1"),
+            }],
+        };
+        let mut output = Vec::new();
+
+        write_result(&args, &state, &mut output).expect("write query result");
+
+        let output = String::from_utf8(output).expect("utf8 output");
+        let decoded: ProjectionState =
+            serde_json::from_str(output.trim_end()).expect("decode query json");
+        assert_eq!(decoded, state);
+        assert!(output.ends_with('\n'));
     }
 }
