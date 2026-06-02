@@ -138,12 +138,16 @@ trait BellNotifier: Send + Sync {
 struct ActionExecutionOptions {
     create_window_path: Option<PathBuf>,
     close_session_client_switch: Option<CloseSessionClientSwitch>,
+    close_window_client_switch: Option<CloseWindowClientSwitch>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CloseSessionClientSwitch {
     fallback_session_id: Option<String>,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CloseWindowClientSwitch;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ActionEffect {
@@ -1143,6 +1147,23 @@ impl ServerCore {
                     ActionExecutionOptions {
                         create_window_path: None,
                         close_session_client_switch,
+                        close_window_client_switch: None,
+                    },
+                )
+            }
+            Action::CloseWindow {
+                session_id,
+                window_id,
+            } => {
+                let close_window_client_switch =
+                    self.resolve_close_window_client_switch(request, session_id, window_id);
+                self.handle_action_request_with_options(
+                    request,
+                    tmux_socket_path,
+                    ActionExecutionOptions {
+                        create_window_path: None,
+                        close_session_client_switch: None,
+                        close_window_client_switch,
                     },
                 )
             }
@@ -1253,6 +1274,25 @@ impl ServerCore {
         Some(CloseSessionClientSwitch {
             fallback_session_id,
         })
+    }
+
+    fn resolve_close_window_client_switch(
+        &self,
+        request: &ActionRequest,
+        closing_session_id: &str,
+        closing_window_id: &str,
+    ) -> Option<CloseWindowClientSwitch> {
+        let target_client = request
+            .target_client
+            .as_ref()
+            .map(|name| ClientName(name.clone()))?;
+        let visible_window = self.state.state.visible_window_key(Some(&target_client))?;
+        if visible_window.session_id != closing_session_id
+            || visible_window.window_id != closing_window_id
+        {
+            return None;
+        }
+        Some(CloseWindowClientSwitch)
     }
 }
 
@@ -1789,6 +1829,12 @@ fn execute_action_request(
             session_id,
             window_id,
         } => {
+            if options.close_window_client_switch.is_some() {
+                let client = tmux
+                    .resolve_target_client(request.target_client.as_deref())
+                    .context("failed to resolve target tmux client")?;
+                let _ = tmux.switch_client_to_previous_window(&client);
+            }
             tmux.close_window(session_id, window_id).with_context(|| {
                 format!("failed to close window `{window_id}` in session `{session_id}`")
             })?;
@@ -1818,8 +1864,8 @@ mod tests {
     use anyhow::{Context, Result, anyhow};
 
     use super::{
-        ActionEffect, ActionExecutionOptions, BellNotifier, CloseSessionClientSwitch, Server,
-        ServerTmuxOps, execute_action_request,
+        ActionEffect, ActionExecutionOptions, BellNotifier, CloseSessionClientSwitch,
+        CloseWindowClientSwitch, Server, ServerTmuxOps, execute_action_request,
     };
     use crate::ipc::{
         Ack, AckKind, Action, ActionOutcome, ActionRequest, ActionResult, ActionResultKind,
@@ -1939,6 +1985,9 @@ mod tests {
         SwitchClientToLastSession {
             client: String,
         },
+        SwitchClientToPreviousWindow {
+            client: String,
+        },
         SwitchTo {
             client: String,
             target: WindowTarget,
@@ -2008,6 +2057,15 @@ mod tests {
         fn switch_client_to_last_session(&self, client: &ClientName) -> Result<(), TmuxError> {
             self.calls.lock().expect("tmux call log poisoned").push(
                 RecordedTmuxCall::SwitchClientToLastSession {
+                    client: client.0.clone(),
+                },
+            );
+            Ok(())
+        }
+
+        fn switch_client_to_previous_window(&self, client: &ClientName) -> Result<(), TmuxError> {
+            self.calls.lock().expect("tmux call log poisoned").push(
+                RecordedTmuxCall::SwitchClientToPreviousWindow {
                     client: client.0.clone(),
                 },
             );
@@ -3400,6 +3458,7 @@ mod tests {
                 close_session_client_switch: Some(CloseSessionClientSwitch {
                     fallback_session_id: Some(String::from("$2")),
                 }),
+                close_window_client_switch: None,
             },
         )?;
 
@@ -3420,6 +3479,81 @@ mod tests {
             ActionEffect::ClosedSession {
                 session_id: String::from("$1"),
             }
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn close_window_actions_resolve_target_client_switch_for_active_window() -> Result<()> {
+        let sandbox = TestDir::new("server-close-window-active-switch")?;
+        let tmux_socket_path = sandbox.path.join("tmux.sock");
+        let sidecar_paths = SidecarPaths::from_runtime_dir(&tmux_socket_path, Some(&sandbox.path));
+        let mut initial_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@1", "shell");
+        add_projection_window(&mut initial_state, "$1", "@2", "editor", 1, false);
+        add_projection_client(&mut initial_state, "client-1", "$1", "@1");
+        let mut refreshed_state =
+            projection_state_with_window(&tmux_socket_path, "$1", "work", "@2", "editor");
+        add_projection_client(&mut refreshed_state, "client-1", "$1", "@2");
+        let tmux = std::sync::Arc::new(MockServerTmux::new(
+            vec![refreshed_state.clone()],
+            vec![Ok(ActionEffect::ClosedWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            })],
+        ));
+        let server = Server::bind_with_tmux(
+            sidecar_paths.clone(),
+            tmux_socket_path.clone(),
+            initial_state,
+            true,
+            tmux.clone(),
+        )?;
+
+        let server_thread = thread::spawn(move || server.run());
+
+        let mut client = RawClient::connect(&sidecar_paths.socket_path, ClientKind::Ui)?;
+        client.send(&ClientMessage::Subscribe(Default::default()))?;
+        let _ = client.recv()?;
+
+        let request = ActionRequest {
+            request_id: String::from("req-close-active-window"),
+            target_client: Some(String::from("client-1")),
+            action: Action::CloseWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            },
+        };
+        client.send(&ClientMessage::ActionRequest(request.clone()))?;
+
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::StateUpdated(StateUpdated {
+                generation: 2,
+                state: refreshed_state,
+            })
+        );
+        assert_eq!(
+            client.recv()?,
+            ServerMessage::ActionResult(ActionResult {
+                request_id: request.request_id.clone(),
+                generation: 2,
+                result: ActionResultKind::Ok { outcome: None },
+            })
+        );
+
+        shutdown_server(&sidecar_paths.socket_path)?;
+        drop(client);
+        server_thread.join().expect("server thread panicked")?;
+        assert_eq!(tmux.requests(), vec![request]);
+        assert_eq!(
+            tmux.action_options(),
+            vec![ActionExecutionOptions {
+                create_window_path: None,
+                close_session_client_switch: None,
+                close_window_client_switch: Some(CloseWindowClientSwitch),
+            }]
         );
 
         Ok(())
@@ -3460,6 +3594,52 @@ mod tests {
             tracker.resolve_session_path(&domain, "$1", &[]),
             Some(Path::new("/tmp/two").to_path_buf())
         );
+    }
+
+    #[test]
+    fn execute_action_request_switches_target_client_before_closing_active_window() -> Result<()> {
+        let tmux = RecordingTmux::default();
+        let request = ActionRequest {
+            request_id: String::from("req-close-active-window"),
+            target_client: Some(String::from("client-1")),
+            action: Action::CloseWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            },
+        };
+
+        let effect = execute_action_request(
+            &tmux,
+            &request,
+            &ActionExecutionOptions {
+                create_window_path: None,
+                close_session_client_switch: None,
+                close_window_client_switch: Some(CloseWindowClientSwitch),
+            },
+        )?;
+
+        assert_eq!(
+            tmux.calls(),
+            vec![
+                RecordedTmuxCall::ResolveTargetClient(Some(String::from("client-1"))),
+                RecordedTmuxCall::SwitchClientToPreviousWindow {
+                    client: String::from("resolved-client"),
+                },
+                RecordedTmuxCall::CloseWindow {
+                    session_id: String::from("$1"),
+                    window_id: String::from("@1"),
+                },
+            ]
+        );
+        assert_eq!(
+            effect,
+            ActionEffect::ClosedWindow {
+                session_id: String::from("$1"),
+                window_id: String::from("@1"),
+            }
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -3537,6 +3717,7 @@ mod tests {
             vec![ActionExecutionOptions {
                 create_window_path: Some(Path::new("/tmp/active").to_path_buf()),
                 close_session_client_switch: None,
+                close_window_client_switch: None,
             }]
         );
 
