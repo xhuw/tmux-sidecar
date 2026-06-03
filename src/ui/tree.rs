@@ -108,7 +108,8 @@ impl TreeView {
                 .as_ref()
                 .map(|edit| edit.focus == row.focus)
                 .unwrap_or(false);
-            let disabled = !matches!(state.mode, Mode::Normal) && !is_inline_edit;
+            let disabled = !matches!(state.mode, Mode::Normal | Mode::FilterSessions { .. })
+                && !is_inline_edit;
 
             let mut row_style = theme.row_base();
             if disabled {
@@ -223,7 +224,7 @@ fn inline_edit_target(mode: &Mode) -> Option<InlineEdit<'_>> {
             input,
             create: true,
         }),
-        Mode::Normal | Mode::Help => None,
+        Mode::Normal | Mode::Help | Mode::FilterSessions { .. } => None,
     }
 }
 

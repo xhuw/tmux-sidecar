@@ -30,7 +30,7 @@ Use the alternate screen with a single full-screen view:
  󰐕 new session
 
  ────────────────────────────────────────────────────────
- Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit
+ Enter switch  1-9/0 alert  n session  / filter  s jump  c window  gg/G  r rename  x close  ? help  q quit
 ```
 
 Regions:

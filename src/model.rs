@@ -273,6 +273,11 @@ pub enum Mode {
         session_id: SessionId,
         input: InputBuffer,
     },
+    FilterSessions {
+        input: InputBuffer,
+        previous_filter: Option<String>,
+        previous_focus: Focus,
+    },
 }
 
 impl Mode {
@@ -281,7 +286,8 @@ impl Mode {
             Mode::RenameSession { input, .. }
             | Mode::RenameWindow { input, .. }
             | Mode::CreateSessionName { input, .. }
-            | Mode::CreateWindowName { input, .. } => Some(input),
+            | Mode::CreateWindowName { input, .. }
+            | Mode::FilterSessions { input, .. } => Some(input),
             Mode::Normal | Mode::Help => None,
         }
     }
@@ -291,7 +297,8 @@ impl Mode {
             Mode::RenameSession { input, .. }
             | Mode::RenameWindow { input, .. }
             | Mode::CreateSessionName { input, .. }
-            | Mode::CreateWindowName { input, .. } => Some(input),
+            | Mode::CreateWindowName { input, .. }
+            | Mode::FilterSessions { input, .. } => Some(input),
             Mode::Normal | Mode::Help => None,
         }
     }
@@ -364,6 +371,7 @@ pub struct AppState {
     pub tmux: TmuxState,
     pub focus: Focus,
     pub mode: Mode,
+    pub active_session_filter: Option<String>,
     pub navigation: NavigationState,
     pub target_client: Option<ClientName>,
     pub last_error: Option<ActionError>,
@@ -377,6 +385,7 @@ impl Default for AppState {
             tmux: TmuxState::default(),
             focus: Focus::default(),
             mode: Mode::default(),
+            active_session_filter: None,
             navigation: NavigationState::default(),
             target_client: None,
             last_error: None,
@@ -399,7 +408,10 @@ impl AppState {
     }
 
     pub fn tree_rows(&self) -> Vec<TreeRow> {
-        self.tmux.tree_rows_for_client(self.target_client.as_ref())
+        filter_tree_rows(
+            self.tmux.tree_rows_for_client(self.target_client.as_ref()),
+            self.active_session_filter.as_deref(),
+        )
     }
 
     pub fn focused_row_index(&self) -> Option<usize> {
@@ -588,6 +600,24 @@ impl AppState {
         }
     }
 
+    pub fn reconcile_focus_to_visible_rows(&mut self) -> bool {
+        let rows = self.tree_rows();
+        if rows.iter().any(|row| row.focus == self.focus) {
+            return false;
+        }
+
+        let Some(next_focus) = rows.first().map(|row| row.focus.clone()) else {
+            return false;
+        };
+
+        if next_focus == self.focus {
+            return false;
+        }
+
+        self.focus = next_focus;
+        true
+    }
+
     fn focused_row_index_in(&self, rows: &[TreeRow]) -> Option<usize> {
         rows.iter().position(|row| row.focus == self.focus)
     }
@@ -635,4 +665,41 @@ fn alert_jump_targets_for_rows(rows: &[TreeRow]) -> Vec<JumpTarget> {
             label: char::from(label),
         })
         .collect()
+}
+
+fn filter_tree_rows(rows: Vec<TreeRow>, filter: Option<&str>) -> Vec<TreeRow> {
+    let Some(filter_text) = filter.map(str::trim).filter(|value| !value.is_empty()) else {
+        return rows;
+    };
+    let needle = filter_text.to_lowercase();
+    let mut filtered = Vec::new();
+    let mut index = 0usize;
+
+    while index < rows.len() {
+        match &rows[index].kind {
+            TreeRowKind::Session { name, .. } => {
+                let include_session = name.to_lowercase().contains(&needle);
+                if include_session {
+                    filtered.push(rows[index].clone());
+                }
+
+                index += 1;
+                while index < rows.len()
+                    && !matches!(
+                        rows[index].kind,
+                        TreeRowKind::Session { .. } | TreeRowKind::CreateSession
+                    )
+                {
+                    if include_session {
+                        filtered.push(rows[index].clone());
+                    }
+                    index += 1;
+                }
+            }
+            TreeRowKind::CreateSession => break,
+            TreeRowKind::Window { .. } | TreeRowKind::CreateWindow { .. } => index += 1,
+        }
+    }
+
+    filtered
 }

@@ -1121,6 +1121,134 @@ fn gg_g_and_flash_jump_follow_visible_rows_and_auto_quit() -> Result<(), Box<dyn
 
 #[test]
 #[serial]
+fn slash_filter_supports_live_filter_accept_clear_restore_and_navigation()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux = server.tmux_cli();
+    let mut app = server.app()?;
+    let snapshot = tmux.snapshot()?;
+    let main_session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-main")
+        .ok_or("missing it-main session")?;
+    let main_session_id = main_session.id.clone();
+    let main_extra_window_id = main_session
+        .windows
+        .iter()
+        .find(|window| window.name == "it-extra")
+        .map(|window| window.id.clone())
+        .ok_or("missing it-extra window")?;
+    let second_session_id = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.name == "it-second")
+        .map(|session| session.id.clone())
+        .ok_or("missing it-second session")?;
+
+    app.state_mut().focus = Focus::Session(second_session_id.clone());
+    app.on_key_event(key(KeyCode::Char('/')))?;
+    assert!(matches!(app.state().mode, Mode::FilterSessions { .. }));
+    assert!(app.state().active_session_filter.is_none());
+
+    type_text(&mut app, "main")?;
+    assert_eq!(
+        app.state().active_session_filter.as_deref(),
+        Some("main"),
+        "expected live filter while typing"
+    );
+    assert!(
+        app.state()
+            .tree_rows()
+            .iter()
+            .all(|row| row.focus != Focus::Session(second_session_id.clone()))
+    );
+    assert_eq!(app.state().focus, Focus::Session(main_session_id.clone()));
+
+    app.on_key_event(key(KeyCode::Enter))?;
+    assert_eq!(app.state().mode, Mode::Normal);
+    app.on_key_event(key(KeyCode::Char('s')))?;
+    let jump_targets = app.state().jump_targets();
+    assert!(
+        !jump_targets.is_empty(),
+        "jump targets should work after filter accept"
+    );
+    assert!(
+        jump_targets
+            .iter()
+            .all(|target| target.focus != Focus::Session(second_session_id.clone()))
+    );
+    app.on_key_event(key(KeyCode::Esc))?;
+
+    run_tmux(
+        &server.socket_name,
+        &["set", "-w", "-t", "it-main:1", "monitor-bell", "on"],
+    )?;
+    run_tmux(
+        &server.socket_name,
+        &["send-keys", "-t", "it-main:1", "printf \"\\a\"", "Enter"],
+    )?;
+    for _ in 0..20 {
+        let _ = app.sync_with_server(Duration::from_millis(250))?;
+        if !app.state().alert_jump_targets().is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    app.on_key_event(key(KeyCode::Char('1')))?;
+    assert_eq!(server.client_session_id()?, main_session_id);
+    assert_eq!(server.client_window_id()?, main_extra_window_id);
+
+    app.on_key_event(key(KeyCode::Char('/')))?;
+    type_text(&mut app, "second")?;
+    app.on_key_event(key(KeyCode::Esc))?;
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert_eq!(
+        app.state().active_session_filter.as_deref(),
+        Some("main"),
+        "Esc should restore pre-/ filter"
+    );
+
+    app.on_key_event(key(KeyCode::Char('/')))?;
+    type_text(&mut app, "zzzz")?;
+    assert!(
+        app.state().tree_rows().is_empty(),
+        "zero-match filter should show empty tree while typing"
+    );
+    app.on_key_event(key(KeyCode::Enter))?;
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert_eq!(
+        app.state().active_session_filter.as_deref(),
+        Some("main"),
+        "Enter on zero-match should restore pre-/ filter"
+    );
+    assert!(!app.state().tree_rows().is_empty());
+
+    app.on_key_event(key(KeyCode::Char('/')))?;
+    app.on_key_event(key(KeyCode::Enter))?;
+    assert_eq!(app.state().mode, Mode::Normal);
+    assert!(
+        app.state().active_session_filter.is_none(),
+        "Enter on empty filter should clear active filter"
+    );
+    assert!(
+        app.state()
+            .tree_rows()
+            .iter()
+            .any(|row| row.focus == Focus::Session(second_session_id.clone())),
+        "clearing filter should restore hidden sessions"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn creates_window_with_inline_naming_accept_and_cancel() -> Result<(), Box<dyn std::error::Error>> {
     if !tmux_available() {
         eprintln!("skipping integration test: tmux is unavailable");

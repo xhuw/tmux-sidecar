@@ -459,6 +459,10 @@ impl App {
             return self.handle_help_key(key);
         }
 
+        if matches!(self.state.mode, Mode::FilterSessions { .. }) {
+            return self.handle_filter_key(key);
+        }
+
         if self.state.mode != Mode::Normal {
             return self.handle_edit_key(key);
         }
@@ -491,6 +495,10 @@ impl App {
             KeyCode::Char('n') => {
                 self.state.clear_navigation();
                 self.begin_create_session_naming()?;
+            }
+            KeyCode::Char('/') => {
+                self.state.clear_navigation();
+                self.start_session_filter();
             }
             KeyCode::Char('s') => {
                 self.state.start_jump();
@@ -620,6 +628,68 @@ impl App {
         Ok(())
     }
 
+    fn handle_filter_key(&mut self, key: KeyEvent) -> Result<()> {
+        let (previous_filter, previous_focus) = match &self.state.mode {
+            Mode::FilterSessions {
+                previous_filter,
+                previous_focus,
+                ..
+            } => (previous_filter.clone(), previous_focus.clone()),
+            _ => return Ok(()),
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.state.active_session_filter = previous_filter;
+                self.state.mode = Mode::Normal;
+                self.state.focus = previous_focus;
+                self.state.reconcile_focus_to_visible_rows();
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                if self.state.tree_rows().is_empty() {
+                    self.state.active_session_filter = previous_filter;
+                    self.state.focus = previous_focus;
+                }
+                self.state.mode = Mode::Normal;
+                self.state.reconcile_focus_to_visible_rows();
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                self.apply_edit_action(EditAction::Backspace);
+            }
+            KeyCode::Delete => {
+                self.apply_edit_action(EditAction::Delete);
+            }
+            KeyCode::Left => {
+                self.apply_edit_action(EditAction::MoveLeft);
+            }
+            KeyCode::Right => {
+                self.apply_edit_action(EditAction::MoveRight);
+            }
+            KeyCode::Home => {
+                self.apply_edit_action(EditAction::MoveHome);
+            }
+            KeyCode::End => {
+                self.apply_edit_action(EditAction::MoveEnd);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.apply_edit_action(EditAction::Clear);
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.apply_edit_action(EditAction::Insert(ch));
+            }
+            _ => {}
+        }
+
+        self.sync_session_filter_from_input();
+        Ok(())
+    }
+
     fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.state.mode != Mode::Normal {
             return Ok(());
@@ -719,6 +789,32 @@ impl App {
             input: InputBuffer::new(),
         };
         Ok(())
+    }
+
+    fn start_session_filter(&mut self) {
+        let previous_filter = self.state.active_session_filter.clone();
+        let previous_focus = self.state.focus.clone();
+        self.state.active_session_filter = None;
+        self.state.mode = Mode::FilterSessions {
+            input: InputBuffer::new(),
+            previous_filter,
+            previous_focus,
+        };
+        self.state.reconcile_focus_to_visible_rows();
+    }
+
+    fn sync_session_filter_from_input(&mut self) {
+        let filter_text = match &self.state.mode {
+            Mode::FilterSessions { input, .. } => input.as_str(),
+            _ => return,
+        };
+
+        self.state.active_session_filter = if filter_text.is_empty() {
+            None
+        } else {
+            Some(filter_text.to_string())
+        };
+        self.state.reconcile_focus_to_visible_rows();
     }
 
     fn begin_create_window_naming(&mut self, session_id: String) -> Result<()> {
@@ -899,7 +995,7 @@ impl App {
                     self.state.focus = Focus::window(session_id, window_id);
                 }
             }
-            Mode::Normal | Mode::Help => {}
+            Mode::Normal | Mode::Help | Mode::FilterSessions { .. } => {}
         }
 
         Ok(())
@@ -1217,6 +1313,8 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use super::{App, StartupContext};
     use crate::{
         cli::Cli,
@@ -1279,6 +1377,17 @@ mod tests {
                 activity: 1,
                 tty: String::from("/dev/pts/1"),
             }],
+        }
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            app.on_key_event(key(KeyCode::Char(ch)))
+                .expect("type filter text");
         }
     }
 
@@ -1516,5 +1625,53 @@ mod tests {
         app.handle_event(AppEvent::Tick).expect("handle tick");
 
         assert!(app.state().toast.is_none());
+    }
+
+    #[test]
+    fn slash_filter_accept_clear_and_restore_flow() {
+        let mut app = App::new(test_cli());
+        app.state_mut().target_client = Some(ClientName(String::from("client-1")));
+        app.handle_server_message(ServerMessage::StateUpdated(StateUpdated {
+            generation: 1,
+            state: projection_state(&[
+                ("$1", "main", &[("@1", "win-1", true)]),
+                ("$2", "other", &[("@2", "win-2", false)]),
+            ]),
+        }))
+        .expect("apply initial state");
+        app.state_mut().focus = Focus::Session(String::from("$2"));
+
+        app.on_key_event(key(KeyCode::Char('/')))
+            .expect("start filter mode");
+        type_text(&mut app, "main");
+        assert_eq!(app.state().active_session_filter.as_deref(), Some("main"));
+        assert_eq!(app.state().focus, Focus::Session(String::from("$1")));
+
+        app.on_key_event(key(KeyCode::Enter))
+            .expect("accept filter mode");
+        assert_eq!(app.state().mode, crate::model::Mode::Normal);
+        assert_eq!(app.state().active_session_filter.as_deref(), Some("main"));
+
+        app.on_key_event(key(KeyCode::Char('/')))
+            .expect("restart filter mode");
+        type_text(&mut app, "zzzz");
+        assert!(app.state().tree_rows().is_empty());
+        app.on_key_event(key(KeyCode::Enter))
+            .expect("restore from zero-match enter");
+        assert_eq!(app.state().active_session_filter.as_deref(), Some("main"));
+        assert!(!app.state().tree_rows().is_empty());
+
+        app.on_key_event(key(KeyCode::Char('/')))
+            .expect("start filter clear");
+        app.on_key_event(key(KeyCode::Enter))
+            .expect("clear on empty enter");
+        assert!(app.state().active_session_filter.is_none());
+
+        app.on_key_event(key(KeyCode::Char('/')))
+            .expect("start filter restore");
+        type_text(&mut app, "other");
+        app.on_key_event(key(KeyCode::Esc))
+            .expect("restore previous filter with esc");
+        assert!(app.state().active_session_filter.is_none());
     }
 }

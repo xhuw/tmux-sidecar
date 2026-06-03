@@ -38,7 +38,7 @@ Stop fumbling with `tmux ls`, `tmux switch-client`, and half-remembered key sequ
   └─  new window
    new session
 ────────────────────────────────────────────────────────────────
-Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit
+Enter switch  1-9/0 alert  n session  / filter  s jump  c window  gg/G  r rename  x close  ? help  q quit
 ```
 
 > Nerd Font glyphs shown above. An ASCII fallback mode is available for any monospace font.

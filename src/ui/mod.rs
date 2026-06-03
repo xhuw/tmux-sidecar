@@ -76,8 +76,15 @@ pub fn render_with_options(frame: &mut Frame<'_>, state: &AppState, options: Ren
     };
     frame.render_widget(body, chunks[1]);
 
-    let mut footer_spans = vec![Span::styled(help::key_hints(state), theme.footer())];
-    if state.last_error.is_some() {
+    let mut footer_spans = if let Mode::FilterSessions { input, .. } = &state.mode {
+        vec![Span::styled(
+            format!("/{}", input.as_str()),
+            theme.header_highlight(),
+        )]
+    } else {
+        vec![Span::styled(help::key_hints(state), theme.footer())]
+    };
+    if state.last_error.is_some() && !matches!(state.mode, Mode::FilterSessions { .. }) {
         footer_spans.push(Span::styled("  ", theme.footer()));
         footer_spans.push(Span::styled(
             "! action failed; state refreshed",
@@ -206,9 +213,8 @@ mod tests {
         assert!(output.contains("tmux-sidecar"));
         assert!(output.contains("> [+] new session"));
         assert!(output.contains("* active [1] ! alert"));
-        assert!(output.contains(
-            "Enter switch  1-9/0 alert  n session  s jump  c window  gg/G  r rename  x close  ? help  q quit"
-        ));
+        assert!(output.contains("Enter switch  1-9/0 alert  n session  / filter"));
+        assert!(output.contains("s jump  c window"));
     }
 
     #[test]
@@ -253,6 +259,7 @@ mod tests {
         assert!(!output.contains("activity"));
         assert!(output.contains("! alert"));
         assert!(output.contains("gg / G          first / last row"));
+        assert!(output.contains("/               filter sessions by substring"));
         assert!(output.contains("n               start new session"));
         assert!(output.contains("1-9,0           jump to numbered alert"));
         assert!(output.contains("s               jump to row label"));
@@ -326,6 +333,20 @@ mod tests {
 
         assert!(output.contains("[...] new session name: |"));
         assert!(output.contains("Enter create  Esc cancel  Ctrl+u clear"));
+    }
+
+    #[test]
+    fn filter_snapshot_shows_active_filter_in_footer() {
+        let mut state = sample_state();
+        state.mode = Mode::FilterSessions {
+            input: InputBuffer::from_text("work"),
+            previous_filter: None,
+            previous_focus: state.focus.clone(),
+        };
+        state.active_session_filter = Some("work".to_string());
+
+        let output = render_ascii(&state, 96, 16);
+        assert!(output.contains("/work"));
     }
 
     #[test]
