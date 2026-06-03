@@ -1,5 +1,8 @@
 use std::{
-    process::Command,
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -45,12 +48,49 @@ impl IsolatedServer {
 
         Ok(Self { socket_name })
     }
+
+    fn socket_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let output = Command::new("tmux")
+            .args([
+                "-L",
+                &self.socket_name,
+                "display-message",
+                "-p",
+                "#{socket_path}",
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Err("failed to resolve tmux socket path".into());
+        }
+
+        let socket_path = String::from_utf8(output.stdout)?.trim().to_owned();
+        if socket_path.is_empty() {
+            return Err("tmux returned an empty socket path".into());
+        }
+
+        Ok(PathBuf::from(socket_path))
+    }
+
+    fn kill(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let status = Command::new("tmux")
+            .args(["-L", &self.socket_name, "kill-server"])
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("failed to kill isolated tmux server".into())
+        }
+    }
 }
 
 impl Drop for IsolatedServer {
     fn drop(&mut self) {
         let _ = Command::new("tmux")
             .args(["-L", &self.socket_name, "kill-server"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 }
@@ -81,4 +121,63 @@ fn startup_fatal_errors_are_reported_before_raw_mode() -> Result<(), Box<dyn std
     );
 
     Ok(())
+}
+
+#[test]
+#[serial]
+fn daemon_exits_when_tmux_server_stops() -> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let socket_path = server.socket_path()?;
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_tmux-sidecar"))
+        .args(["daemon", "--socket-path"])
+        .arg(&socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+
+    wait_for_socket_path(&socket_path, Duration::from_secs(2))?;
+    server.kill()?;
+    wait_for_process_exit(&mut daemon, Duration::from_secs(6))?;
+
+    Ok(())
+}
+
+fn wait_for_socket_path(
+    path: &PathBuf,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    Err(format!("timed out waiting for socket path `{}`", path.display()).into())
+}
+
+fn wait_for_process_exit(
+    child: &mut Child,
+    timeout: Duration,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + timeout;
+
+    while std::time::Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let _ = child.kill();
+    let _ = child.wait();
+    Err("timed out waiting for daemon to exit".into())
 }

@@ -93,6 +93,7 @@ tmux-sidecar
 ```
 
 On startup, tmux-sidecar reuses or auto-starts a local sidecar daemon for the current tmux socket, refreshes hooks with `setup`, and subscribes the UI to server-pushed state updates. There is no persisted startup cache; the TUI shows a brief loading state until the initial sidecar snapshot arrives.
+If the backing tmux server for that socket exits, the sidecar daemon now exits automatically as well.
 
 That server/client architecture is more complicated than tmux `>= 3.2` strictly needs. It mainly exists to keep tmux-sidecar working on tmux `>= 3.0, < 3.2`, where the bug fixed by tmux commit [`d8b6560cbf`](https://github.com/tmux/tmux/commit/d8b6560cbfb5677223982e4b27be92b2fcd034df) ("Set alert flag for the current window if the session is unattached") was still unresolved.
 

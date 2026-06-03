@@ -27,6 +27,8 @@ use crate::{
 };
 
 const IPC_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+const TMUX_LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const TMUX_LIVENESS_FAILURE_THRESHOLD: usize = 3;
 const ACTION_RECONCILE_ATTEMPTS: usize = 10;
 const ACTION_RECONCILE_RETRY_DELAY: Duration = Duration::from_millis(25);
 const HOOK_RECONCILE_ATTEMPTS: usize = 6;
@@ -43,7 +45,9 @@ pub fn run(options: ServerOptions) -> Result<()> {
     let initial_state = tmux.snapshot_projection(&tmux_socket_path)?;
     let sidecar_paths = SidecarPaths::from_tmux_socket_path(&tmux_socket_path);
 
-    Server::bind(sidecar_paths, tmux_socket_path, initial_state, true)?.run()
+    Server::bind(sidecar_paths, tmux_socket_path, initial_state, true)?
+        .shutdown_when_tmux_stops()
+        .run()
 }
 
 type SharedWriter = Arc<Mutex<UnixStream>>;
@@ -108,6 +112,7 @@ struct Server {
     core_thread: thread::JoinHandle<Result<()>>,
     shutdown: Arc<AtomicBool>,
     cleanup: CleanupPaths,
+    shutdown_on_tmux_exit: bool,
 }
 
 struct CleanupPaths {
@@ -761,7 +766,13 @@ impl Server {
                 socket_path: sidecar_paths.socket_path,
                 pid_path: sidecar_paths.pid_path,
             },
+            shutdown_on_tmux_exit: false,
         })
+    }
+
+    fn shutdown_when_tmux_stops(mut self) -> Self {
+        self.shutdown_on_tmux_exit = true;
+        self
     }
 
     fn run(self) -> Result<()> {
@@ -773,7 +784,10 @@ impl Server {
             core_thread,
             shutdown,
             cleanup,
+            shutdown_on_tmux_exit,
         } = self;
+        let mut next_tmux_liveness_check = Instant::now() + TMUX_LIVENESS_CHECK_INTERVAL;
+        let mut tmux_liveness_failures = 0usize;
 
         while !shutdown.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -786,6 +800,18 @@ impl Server {
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if shutdown_on_tmux_exit && Instant::now() >= next_tmux_liveness_check {
+                        next_tmux_liveness_check = Instant::now() + TMUX_LIVENESS_CHECK_INTERVAL;
+                        if Self::tmux_server_is_alive(&tmux_socket_path) {
+                            tmux_liveness_failures = 0;
+                        } else {
+                            tmux_liveness_failures += 1;
+                            if tmux_liveness_failures >= TMUX_LIVENESS_FAILURE_THRESHOLD {
+                                shutdown.store(true, Ordering::SeqCst);
+                                continue;
+                            }
+                        }
+                    }
                     thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) => return Err(error).context("failed while accepting sidecar client"),
@@ -798,6 +824,12 @@ impl Server {
             .map_err(|_| anyhow::anyhow!("server core thread panicked"))??;
         drop(cleanup);
         Ok(())
+    }
+
+    fn tmux_server_is_alive(tmux_socket_path: &Path) -> bool {
+        let socket =
+            crate::tmux::command::SocketOptions::from_parts(None, Some(tmux_socket_path.into()));
+        crate::tmux::command::run_tmux(&socket, ["list-sessions", "-F", "#{session_id}"]).is_ok()
     }
 }
 
