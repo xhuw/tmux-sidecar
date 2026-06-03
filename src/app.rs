@@ -3,6 +3,7 @@ use std::{
     env, io, panic,
     path::PathBuf,
     sync::Once,
+    thread,
     time::{Duration, Instant},
 };
 
@@ -179,13 +180,13 @@ impl App {
         terminal
             .terminal
             .draw(|frame| ui::render(frame, &self.state))?;
-        self.finish_startup(startup)?;
+        self.finish_startup(startup, true)?;
         self.event_loop(&mut terminal.terminal)
     }
 
     pub fn startup(&mut self) -> Result<()> {
         let startup = self.startup_preflight()?;
-        self.finish_startup(startup)
+        self.finish_startup(startup, false)
     }
 
     fn startup_preflight(&self) -> Result<StartupContext> {
@@ -200,22 +201,31 @@ impl App {
         })
     }
 
-    fn finish_startup(&mut self, startup: StartupContext) -> Result<()> {
+    fn finish_startup(&mut self, startup: StartupContext, defer_hook_repair: bool) -> Result<()> {
         let StartupContext {
             target_client,
             tmux_socket_path,
         } = startup;
         self.tmux_socket_path = Some(tmux_socket_path.clone());
-        let started_server = client::ensure_server_running(&tmux_socket_path)?;
-        self.install_hooks()?;
-
-        let mut subscription = client::subscribe(&tmux_socket_path, Some(target_client.0.clone()))?;
+        let (mut subscription, started_server) =
+            client::subscribe_with_status(&tmux_socket_path, Some(target_client.0.clone()))?;
         self.state.target_client = Some(target_client);
         self.apply_initial_state(&mut subscription)?;
         if started_server {
             self.show_toast(STARTUP_TOAST_MESSAGE);
         }
         self.subscription = Some(subscription);
+        if defer_hook_repair {
+            self.start_hook_repair_after_initial_state();
+        } else {
+            self.install_hooks()?;
+        }
+        Ok(())
+    }
+
+    fn install_hooks(&self) -> Result<()> {
+        let program = HookCommandProgram::new(vec![hook_program_path()?.display().to_string()]);
+        self.tmux.install_hooks(&program)?;
         Ok(())
     }
 
@@ -344,10 +354,21 @@ impl App {
         Ok(received_server_message)
     }
 
-    fn install_hooks(&self) -> Result<()> {
-        let program = HookCommandProgram::new(vec![hook_program_path()?.display().to_string()]);
-        self.tmux.install_hooks(&program)?;
-        Ok(())
+    fn start_hook_repair_after_initial_state(&self) {
+        let tmux = self.tmux.clone();
+        thread::spawn(move || {
+            let program = match hook_program_path() {
+                Ok(path) => HookCommandProgram::new(vec![path.display().to_string()]),
+                Err(error) => {
+                    eprintln!("failed to resolve hook program path: {error:#}");
+                    return;
+                }
+            };
+
+            if let Err(error) = tmux.install_hooks(&program) {
+                eprintln!("failed to install tmux hooks after startup: {error:#}");
+            }
+        });
     }
 
     fn handle_server_message(&mut self, message: ServerMessage) -> Result<()> {

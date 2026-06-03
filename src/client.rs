@@ -189,6 +189,16 @@ pub fn subscribe(tmux_socket_path: &Path, target_client: Option<String>) -> Resu
     Ok(client)
 }
 
+pub fn subscribe_with_status(
+    tmux_socket_path: &Path,
+    target_client: Option<String>,
+) -> Result<(IpcClient, bool)> {
+    let (mut client, started_server) =
+        IpcClient::connect_or_spawn_with_status(tmux_socket_path, ClientKind::Ui)?;
+    client.send(&ClientMessage::Subscribe(Subscribe { target_client }))?;
+    Ok((client, started_server))
+}
+
 pub fn request_snapshot(tmux_socket_path: &Path) -> Result<ProjectionState> {
     let mut client = IpcClient::connect_or_spawn(tmux_socket_path, ClientKind::Control)?;
     client.send(&ClientMessage::SnapshotRequest)?;

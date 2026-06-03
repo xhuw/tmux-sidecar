@@ -11,6 +11,7 @@ use serial_test::serial;
 use tmux_sidecar::{
     app::App,
     cli::Cli,
+    ipc::SidecarPaths,
     model::{Focus, Mode},
     tmux::{Tmux, TmuxCli},
     ui::TREE_START_ROW,
@@ -142,6 +143,18 @@ impl IsolatedServer {
                 (name == self.client_name).then(|| window.to_owned())
             })
             .ok_or_else(|| "failed to resolve client window".into())
+    }
+
+    fn tmux_socket_path(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let output = run_tmux(
+            &self.socket_name,
+            &["display-message", "-p", "#{socket_path}"],
+        )?;
+        let socket_path = output.lines().next().map(str::trim).unwrap_or_default();
+        if socket_path.is_empty() {
+            return Err("failed to resolve tmux socket path".into());
+        }
+        Ok(PathBuf::from(socket_path))
     }
 }
 
@@ -390,6 +403,36 @@ fn startup_shows_toast_when_sidecar_server_auto_starts() -> Result<(), Box<dyn s
             .as_ref()
             .map(|toast| toast.message.as_str()),
         Some("Started tmux-sidecar server")
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn startup_uses_cached_state_when_sidecar_server_is_already_running()
+-> Result<(), Box<dyn std::error::Error>> {
+    if !tmux_available() {
+        eprintln!("skipping integration test: tmux is unavailable");
+        return Ok(());
+    }
+
+    let server = IsolatedServer::start()?;
+    let tmux_socket_path = server.tmux_socket_path()?;
+    let sidecar_paths = SidecarPaths::from_tmux_socket_path(&tmux_socket_path);
+
+    let _first_app = server.app()?;
+    assert!(sidecar_paths.socket_path.exists());
+
+    let app = server.app()?;
+    let focused_session_id = server.client_session_id()?;
+    let focused_window_id = server.client_window_id()?;
+
+    assert!(app.state().toast.is_none());
+    assert!(!app.state().is_tree_loading());
+    assert_eq!(
+        app.state().focus,
+        window_focus(&focused_session_id, &focused_window_id)
     );
 
     Ok(())
